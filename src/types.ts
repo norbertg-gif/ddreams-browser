@@ -7,12 +7,12 @@ export type Asset = {
   isDirectory?: boolean; offline?: boolean;
   hasCategories?: boolean;
 };
-export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special"; id?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
+export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special"; id?: number; rootId?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
 export type ViewFilters = { ratingMode?: "equal" | "atLeast" | "atMost" | "unrated"; ratingValue?: number; labelFilter?: string; taggedOnly?: boolean; fileGroup?: "images" | "raw" | "video" | "other" };
 export type Page = { items: Asset[]; total: number; totalSize: number };
 export type Folder = { id: number; parentId: number | null; rootId: number | null; name: string; path: string | null; count: number; folderIds: number[]; virtualNode?: string | null; offline?: boolean };
 export type Node = { id: number; parentId: number | null; rootId: number | null; name: string; count: number };
-export type Root = { id: number; name: string };
+export type Root = { id: number; name: string; count: number };
 export type ValueCount = { value: string; count: number };
 export type MetadataRow = { group: string; name: string; value: string };
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };

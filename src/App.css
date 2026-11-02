@@ -17,3 +17,5 @@
 .search-box{min-width:130px;width:min(30vw,330px);flex:0 1 330px}
 .zoom-control{margin-left:3px;flex:0 0 auto}.zoom-control input{width:clamp(48px,6vw,82px)}
 .hover-card{width:min(300px,calc(100vw - 16px));box-sizing:border-box}
+
+.category-heading{display:flex;align-items:center;justify-content:space-between;gap:6px}.category-heading label{display:flex;align-items:center;gap:4px;font-size:9px;letter-spacing:0;text-transform:none;white-space:nowrap;color:#aeb6c0;font-weight:450}.category-heading input{accent-color:#6994c0;margin:0}

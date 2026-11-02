@@ -29,11 +29,12 @@ type Props = {
   filters?: ViewFilters;
   overlayMode?: number;
   hoverMode?: "off"|"hover"|"shift";
+  includeChildren: boolean;
   formats: FormatTable;
   refreshToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", refreshToken=0, formats }: Props) {
+export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, formats }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const cache = useRef(new Map<number, Asset>());
   const pages = useRef(new Set<number>());
@@ -45,7 +46,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const [columns, setColumns] = useState(5);
   const [rubber,setRubber]=useState<{x1:number;y1:number;x2:number;y2:number;add:boolean}|null>(null);
   const rubberRef=useRef<typeof rubber>(null);
-  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending, ratingMode:filters.ratingMode??null,ratingValue:filters.ratingValue??null,labelFilter:filters.labelFilter??null,taggedOnly:filters.taggedOnly??false,fileGroup:filters.fileGroup??null,refreshToken }), [view, query, sort, descending, filters,refreshToken]);
+  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, rootId: view.rootId ?? null, includeChildren: (view.kind === "category" || view.kind === "keyword") && includeChildren, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending, ratingMode:filters.ratingMode??null,ratingValue:filters.ratingValue??null,labelFilter:filters.labelFilter??null,taggedOnly:filters.taggedOnly??false,fileGroup:filters.fileGroup??null,refreshToken }), [view, query, sort, descending, filters, includeChildren,refreshToken]);
   const paramsKey = JSON.stringify(params);
   const tileWidth = zoom + 26;
   const rowHeight = zoom + 58;

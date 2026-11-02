@@ -89,7 +89,7 @@ pub fn get_folder_children(
     if let Some(parent)=parent_id.filter(|id| *id != -2) {
         let path=listing.0.asset(parent).and_then(|a|a.path).or_else(||db::folder_ancestors(&state.0,parent).ok()?.last().and_then(|f|f.path.clone()));
         if let Some(path)=path {
-            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None};
+            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),root_id:None,include_children:false,folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None};
             let page=listing.0.page(&filter)?;
             let mut dirs=Vec::new();
             for asset in page.items.into_iter().filter(|a|a.is_directory) {
@@ -127,10 +127,11 @@ pub fn get_folder_ancestors(
 #[tauri::command]
 pub fn get_category_roots(
     state: State<'_, DatabaseState>,
+    include_children: bool,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<db::Root>, String> {
-    db::roots_page(&state.0, offset, limit).map_err(|e| e.to_string())
+    db::roots_page(&state.0, offset, limit, include_children).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn get_catalog_nodes(
@@ -138,10 +139,11 @@ pub fn get_catalog_nodes(
     kind: String,
     parent_id: Option<i64>,
     root_id: Option<i64>,
+    include_children: bool,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<db::CatalogNode>, String> {
-    db::nodes_page(&state.0, &kind, parent_id, root_id, offset, limit).map_err(|e| e.to_string())
+    db::nodes_page(&state.0, &kind, parent_id, root_id, offset, limit, include_children).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn search_keywords(
@@ -153,8 +155,8 @@ pub fn search_keywords(
     db::keyword_search_page(&state.0, &query, offset, limit).map_err(|e| e.to_string())
 }
 #[tauri::command]
-pub fn search_catalog_tree(state: State<'_, DatabaseState>, kind:String, query:String, offset:i64, limit:i64)->Result<Vec<db::CatalogNode>,String>{
-    db::catalog_tree_search(&state.0,&kind,&query,offset,limit).map_err(|e|e.to_string())
+pub fn search_catalog_tree(state: State<'_, DatabaseState>, kind:String, query:String, include_children:bool, offset:i64, limit:i64)->Result<Vec<db::CatalogNode>,String>{
+    db::catalog_tree_search(&state.0,&kind,&query,offset,limit,include_children).map_err(|e|e.to_string())
 }
 #[tauri::command]
 pub fn get_catalog_values(
