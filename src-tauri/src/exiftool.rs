@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
         Arc, Mutex,
     },
@@ -13,6 +13,8 @@ use std::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(8);
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 struct Process {
     child: Child,
@@ -24,12 +26,15 @@ struct Process {
 
 impl Process {
     fn start(executable: &Path) -> std::io::Result<Self> {
-        let mut child = Command::new(executable)
+        let mut command = Command::new(executable);
+        command
             .args(["-stay_open", "True", "-@", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
+        let mut child = command.spawn()?;
         let mut output = child.stdout.take().unwrap();
         let (send, chunks) = mpsc::channel();
         thread::Builder::new()
@@ -121,19 +126,28 @@ fn io_error(kind: std::io::ErrorKind, message: &str) -> std::io::Error {
     std::io::Error::new(kind, message.to_owned())
 }
 
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = writeln!(self.input, "-stay_open\nFalse");
-        let _ = self.input.flush();
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+fn kill_child_bounded(child: &mut Child) {
+    // Never wait for ExifTool's protocol on shutdown: it may be stuck in a
+    // request. Kill directly, then reap only for a short bounded interval.
+    let _ = child.kill();
+    let deadline = std::time::Instant::now() + Duration::from_millis(300);
+    while std::time::Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+        }
     }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) { kill_child_bounded(&mut self.child); }
 }
 
 pub struct ExifTool {
     executable: PathBuf,
     pool: [Mutex<Option<Process>>; 2],
     next: AtomicUsize,
+    shutting_down: AtomicBool,
 }
 
 impl ExifTool {
@@ -142,12 +156,26 @@ impl ExifTool {
             executable,
             pool: [Mutex::new(None), Mutex::new(None)],
             next: AtomicUsize::new(0),
+            shutting_down: AtomicBool::new(false),
         })
     }
 
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        for slot in &self.pool {
+            if let Ok(mut process) = slot.lock() { *process = None; }
+        }
+    }
+
     fn with_process<T>(&self, f: impl FnOnce(&mut Process) -> std::io::Result<T>) -> std::io::Result<T> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(io_error(std::io::ErrorKind::BrokenPipe, "ExifTool pool is shut down"));
+        }
         let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.pool.len();
         let mut slot = self.pool[idx].lock().map_err(|_| io_error(std::io::ErrorKind::Other, "ExifTool pool poisoned"))?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err(io_error(std::io::ErrorKind::BrokenPipe, "ExifTool pool is shut down"));
+        }
         let dead = match slot.as_mut() { None => true, Some(p) => p.child.try_wait()?.is_some() };
         if dead { *slot = Some(Process::start(&self.executable)?); }
         let result = f(slot.as_mut().unwrap());
@@ -209,7 +237,7 @@ fn largest_preview_key(object: &serde_json::Map<String, Value>) -> Option<String
 
 #[cfg(test)]
 mod tests {
-    use super::{largest_preview_key, take_frame};
+    use super::{kill_child_bounded, largest_preview_key, take_frame, ExifTool};
     use serde_json::json;
 
     #[test]
@@ -224,9 +252,32 @@ mod tests {
         assert!(buffer.is_empty());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn bounded_shutdown_kills_a_stuck_child() {
+        use std::process::{Command, Stdio};
+        let mut child=Command::new("ping.exe").args(["-n","30","127.0.0.1"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let started=std::time::Instant::now();
+        kill_child_bounded(&mut child);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn shutdown_is_idempotent_and_prevents_restart() {
+        let tool = ExifTool::new(std::path::PathBuf::from("missing-exiftool"));
+        tool.shutdown();
+        tool.shutdown();
+        assert!(tool.metadata(std::path::Path::new("ignored.jpg")).is_err());
+    }
+
     #[test]
     fn preview_selection_uses_largest_grouped_duplicate() {
         let value=json!({"SubIFD1:PreviewImage":"(Binary data 2600000 bytes, use -b option to extract)","Pentax:PreviewImage":"(Binary data 54000 bytes, use -b option to extract)","IFD0:ThumbnailImage":"(Binary data 12000 bytes, use -b option to extract)"});
         assert_eq!(largest_preview_key(value.as_object().unwrap()).as_deref(),Some("SubIFD1:PreviewImage"));
     }
+}
+
+impl Drop for ExifTool {
+    fn drop(&mut self) { self.shutdown(); }
 }

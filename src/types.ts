@@ -5,8 +5,10 @@ export type Asset = {
   label: string | null; fileModified: string | null; exifDate: string | null;
   acdseeDate: string | null; mdDirty: number | null; isOrphan: number | null; path: string | null;
   isDirectory?: boolean; offline?: boolean;
+  hasCategories?: boolean;
 };
-export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label"; id?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
+export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special"; id?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
+export type ViewFilters = { ratingMode?: "equal" | "atLeast" | "atMost" | "unrated"; ratingValue?: number; labelFilter?: string; taggedOnly?: boolean; fileGroup?: "images" | "raw" | "video" | "other" };
 export type Page = { items: Asset[]; total: number; totalSize: number };
 export type Folder = { id: number; parentId: number | null; rootId: number | null; name: string; path: string | null; count: number; folderIds: number[]; virtualNode?: string | null; offline?: boolean };
 export type Node = { id: number; parentId: number | null; rootId: number | null; name: string; count: number };
@@ -14,3 +16,4 @@ export type Root = { id: number; name: string };
 export type ValueCount = { value: string; count: number };
 export type MetadataRow = { group: string; name: string; value: string };
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
+export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };

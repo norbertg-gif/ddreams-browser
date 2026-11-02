@@ -29,6 +29,7 @@ pub fn run() {
     let listing = listing::ListingService::new(db.clone());
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone());
     let protocol_thumbs = thumbs.clone();
+    let shutdown_exif = exif.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(DatabaseState(db))
@@ -90,6 +91,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_assets,
+            commands::refresh_folder_listing,
+            commands::get_asset_paths,
+            commands::asset_action,
             commands::get_asset_ids,
             commands::get_folder_children,
             commands::find_folder_path,
@@ -97,11 +101,18 @@ pub fn run() {
             commands::get_category_roots,
             commands::get_catalog_nodes,
             commands::search_keywords,
+            commands::search_catalog_tree,
             commands::get_catalog_values,
             commands::get_metadata,
+            commands::get_catalog_asset_metadata,
             commands::set_thumbnail_epoch,
             commands::get_thumbnail_state
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running DDreams browser");
+        .build(tauri::generate_context!())
+        .expect("error while building DDreams browser")
+        .run(move |_app_handle, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                shutdown_exif.shutdown();
+            }
+        });
 }

@@ -6,9 +6,9 @@ const shortcuts = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
-type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[] };
+type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; refreshToken?:number };
 
-export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [] }: Props) {
+export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], refreshToken=0 }: Props) {
   const [tab, setTab] = useState<"folders" | "calendar">("folders");
   const [roots, setRoots] = useState<Folder[]>([]);
   const [expanded, setExpanded] = useState(new Set<number>());
@@ -20,6 +20,7 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
   useEffect(() => { childrenRef.current = children; }, [children]);
 
   useEffect(() => { void invoke<Folder[]>("get_folder_children", { parentId: null, parentIds: null, offset: 0, limit: 500 }).then(setRoots).catch(e => setError(String(e))); }, []);
+  useEffect(()=>{if(!refreshToken)return;setChildren(new Map());childrenRef.current=new Map();void invoke<Folder[]>("get_folder_children",{parentId:null,parentIds:null,offset:0,limit:500}).then(setRoots);},[refreshToken]);
   const navigate = (folder: Folder) => {
     if (folder.virtualNode) return;
     const ids = folder.folderIds?.length ? folder.folderIds : [folder.id];
@@ -65,7 +66,7 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
       window.requestAnimationFrame(() => window.requestAnimationFrame(() => rowRefs.current.get(activeFolderId)?.scrollIntoView({ block: "nearest" })));
     })();
     return () => { cancelled = true; };
-  }, [activeFolderId, roots]);
+  }, [activeFolderId, roots, refreshToken]);
 
   const activeSet = new Set([activeFolderId, ...activeFolderIds].filter((v): v is number => v != null));
   return <aside className="left-pane">

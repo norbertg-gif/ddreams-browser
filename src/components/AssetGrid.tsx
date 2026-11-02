@@ -1,15 +1,19 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
-import type { Asset, Page, View } from "../types";
+import { createPortal } from "react-dom";
+import type { Asset, CatalogAssetMetadata, Page, View, ViewFilters } from "../types";
 
 const PAGE_SIZE = 120;
-const IMAGE_TYPES = new Set(["jpg", "jpeg", "png", "webp", "tif", "tiff", "arw", "dng", "cr2", "nef", "raf", "orf", "rw2", "pef", "acr", "raw"]);
+declare global { interface Window { __ddreamsShift?: boolean } }
+const IMAGE_TYPES = new Set(["jpg", "jpeg", "png", "webp", "tif", "tiff", "heic", "jp2", "gif", "bmp", "psd", "arw", "dng", "cr2", "nef", "raf", "orf", "rw2", "pef", "raw"]);
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes)) return "—";
   if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toLocaleString("sk-SK", { maximumFractionDigits: 0 })} KB`;
+  const units = [[1024 ** 4, "TB"], [1024 ** 3, "GB"], [1024 ** 2, "MB"]] as const;
+  const [divisor, unit] = units.find(([scale]) => bytes >= scale)!;
+  return `${(bytes / divisor).toLocaleString("sk-SK", { maximumFractionDigits: 1, minimumFractionDigits: 1 })} ${unit}`;
 }
 export function isImage(asset: Asset): boolean { return IMAGE_TYPES.has(asset.ext.toLowerCase()); }
 
@@ -22,9 +26,13 @@ type Props = {
   onOpen: (asset: Asset, index: number) => void;
   onCounts: (total: number, size: number) => void;
   onViewport: () => void;
+  filters?: ViewFilters;
+  overlayMode?: number;
+  hoverMode?: "off"|"hover"|"shift";
+  refreshToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport }: Props) {
+export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", refreshToken=0 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const cache = useRef(new Map<number, Asset>());
   const pages = useRef(new Set<number>());
@@ -34,7 +42,9 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const [total, setTotal] = useState(0);
   const [itemsVersion, setItemsVersion] = useState(0);
   const [columns, setColumns] = useState(5);
-  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending }), [view, query, sort, descending]);
+  const [rubber,setRubber]=useState<{x1:number;y1:number;x2:number;y2:number;add:boolean}|null>(null);
+  const rubberRef=useRef<typeof rubber>(null);
+  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending, ratingMode:filters.ratingMode??null,ratingValue:filters.ratingValue??null,labelFilter:filters.labelFilter??null,taggedOnly:filters.taggedOnly??false,fileGroup:filters.fileGroup??null,refreshToken }), [view, query, sort, descending, filters,refreshToken]);
   const paramsKey = JSON.stringify(params);
   const tileWidth = zoom + 26;
   const rowHeight = zoom + 58;
@@ -76,6 +86,8 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   }, [virtualRows, columns, total, fetchPage, itemsVersion]);
 
   const getAt = (index: number) => cache.current.get(index);
+  const fetchIds = async (extra: Record<string,unknown> = {}) => { const ids:number[]=[];for(let offset=0;offset<total;offset+=500){const batch=await invoke<number[]>("get_asset_ids",{filter:{...params,...extra,offset:0,limit:500},offset,limit:500});ids.push(...batch);if(batch.length<500)break;}return ids; };
+  const fetchAssetsForIds = async (ids:number[]) => {const wanted=new Set(ids),files:number[]=[];for(let offset=0;offset<total&&wanted.size;offset+=500){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:500}});for(const a of p.items)if(wanted.has(a.id)){if(!a.isDirectory)files.push(a.id);wanted.delete(a.id)}if(p.items.length<500)break;}return files;};
   const handleTileClick = async (event: MouseEvent<HTMLDivElement>, asset: Asset, index: number) => {
     scrollRef.current?.focus();
     if (event.shiftKey) {
@@ -86,15 +98,21 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   };
   const onKeyDown = async (event: KeyboardEvent<HTMLDivElement>) => {
     if (document.activeElement !== event.currentTarget) return;
+    if (event.key === "Enter") {
+      event.preventDefault();
+      // The viewer listens on window and would close again on this same keypress.
+      event.stopPropagation();
+      const entry = [...cache.current.entries()].find(([, item]) => item.id === primaryId);
+      if (entry) onOpen(entry[1], entry[0]);
+      return;
+    }
+    if(event.ctrlKey&&event.shiftKey&&event.key.toLowerCase()==="d"){event.preventDefault();onSelectAll([]);return;}
+    if(event.ctrlKey&&event.shiftKey&&event.key.toLowerCase()==="a"){event.preventDefault();const ids=await fetchIds();onSelectAll(await fetchAssetsForIds(ids));return;}
+    if(event.ctrlKey&&event.shiftKey&&event.key.toLowerCase()==="i"){event.preventDefault();const ids=await fetchIds();onSelectAll(ids.filter(id=>!selectedIds.has(id)));return;}
+    if(event.ctrlKey&&!event.shiftKey&&event.key.toLowerCase()==="i"){event.preventDefault();const ids=await fetchIds({fileGroup:"images"});onSelectAll(await fetchAssetsForIds(ids));return;}
     if (event.ctrlKey && event.key.toLowerCase() === "a") {
       event.preventDefault();
-      const ids: number[] = [];
-      for (let offset = 0; offset < total; offset += 500) {
-        const page = await invoke<number[]>("get_asset_ids", { filter: { ...params, offset: 0, limit: 500 }, offset, limit: 500 });
-        ids.push(...page);
-        if (page.length < 500) break;
-      }
-      onSelectAll(ids);
+      onSelectAll(await fetchIds());
       return;
     }
     if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
@@ -112,15 +130,20 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     } else { anchorIndex.current=next; onSelect(asset, next, synthetic); }
     virtualizer.scrollToIndex(Math.floor(next / columns), { align: "auto" });
   };
+  const beginRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(e.button!==0||(e.target as HTMLElement).closest(".asset-tile"))return;const r=e.currentTarget.getBoundingClientRect();const v={x1:e.clientX-r.left,y1:e.clientY-r.top,x2:e.clientX-r.left,y2:e.clientY-r.top,add:e.ctrlKey||e.metaKey};rubberRef.current=v;setRubber(v);e.currentTarget.setPointerCapture(e.pointerId);e.preventDefault()};
+  const moveRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(!rubberRef.current)return;const r=e.currentTarget.getBoundingClientRect();const v={...rubberRef.current,x2:e.clientX-r.left,y2:e.clientY-r.top};rubberRef.current=v;setRubber(v);if(v.y2<30)e.currentTarget.scrollTop-=22;else if(v.y2>r.height-30)e.currentTarget.scrollTop+=22};
+  const endRubber=async()=>{const v=rubberRef.current;if(!v)return;rubberRef.current=null;setRubber(null);const el=scrollRef.current;if(!el)return;const xlo=Math.min(v.x1,v.x2),xhi=Math.max(v.x1,v.x2),ylo=Math.min(v.y1,v.y2)+el.scrollTop,yhi=Math.max(v.y1,v.y2)+el.scrollTop;const indexes:number[]=[];for(let row=Math.max(0,Math.floor((ylo-10)/rowHeight));row<=Math.min(rowCount-1,Math.floor((yhi-10)/rowHeight));row++){const cy=row*rowHeight+10+Math.min(zoom,rowHeight-24)/2;if(cy<ylo||cy>yhi)continue;for(let col=0;col<columns;col++){const cx=12+col*(tileWidth+9)+tileWidth/2;if(cx>=xlo&&cx<=xhi){const i=row*columns+col;if(i<total)indexes.push(i)}}}const needed=[...new Set(indexes.map(i=>Math.floor(i/PAGE_SIZE)*PAGE_SIZE))];for(const offset of needed){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:PAGE_SIZE}});p.items.forEach((a,j)=>cache.current.set(offset+j,a));}const ids=indexes.map(i=>getAt(i)?.id).filter((id):id is number=>id!=null);onSelectAll(v.add?[...new Set([...selectedIds,...ids])]:ids);};
+  useEffect(()=>{if(!rubber)return;const timer=window.setInterval(()=>{const el=scrollRef.current,v=rubberRef.current;if(!el||!v)return;if(v.y2<30)el.scrollTop-=14;else if(v.y2>el.clientHeight-30)el.scrollTop+=14},24);return()=>window.clearInterval(timer)},[!!rubber]);
 
   return <div className="grid-shell">
-    <div className="asset-scroll" ref={scrollRef} tabIndex={0} onKeyDown={onKeyDown} onScroll={() => { const now=Date.now();if(now-scrollPulse.current>220){scrollPulse.current=now;onViewport();} }}>
+    <div className="asset-scroll" ref={scrollRef} tabIndex={0} onPointerDown={beginRubber} onPointerMove={moveRubber} onPointerUp={()=>void endRubber()} onPointerCancel={()=>void endRubber()} onWheel={e=>{if(e.ctrlKey){e.preventDefault();window.dispatchEvent(new CustomEvent("ddreams-zoom",{detail:e.deltaY>0?-8:8}))}}} onKeyDown={onKeyDown} onScroll={() => { window.dispatchEvent(new Event("ddreams-scroll"));const now=Date.now();if(now-scrollPulse.current>220){scrollPulse.current=now;onViewport();} }}>
+      {rubber&&<div className="rubber-band" style={{left:Math.min(rubber.x1,rubber.x2),top:Math.min(rubber.y1,rubber.y2),width:Math.abs(rubber.x1-rubber.x2),height:Math.abs(rubber.y1-rubber.y2)}}/>}
       <div style={{ height: virtualizer.getTotalSize(), position: "relative", width: "100%" }}>
         {virtualRows.map(row => <div key={row.key} className="asset-row" style={{ position: "absolute", top: 0, transform: `translateY(${row.start}px)`, height: rowHeight, gridTemplateColumns: `repeat(${columns}, minmax(0, ${tileWidth}px))` } as CSSProperties}>
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} onViewport={onViewport} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -128,7 +151,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void }) {
+function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift" }) {
   const [broken, setBroken] = useState(false);
   const [offline, setOffline] = useState(false);
   const [retry, setRetry] = useState(0);
@@ -136,7 +159,18 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
   const ext = asset.ext.toUpperCase();
   const badge = ext === "DNG" ? "DNG" : ["ARW", "CR2", "NEF", "RAF", "ORF", "RW2", "PEF", "ACR", "RAW"].includes(ext) ? "RAW" : ["JPG", "JPEG"].includes(ext) ? "JPG" : ext || "FILE";
   const label = asset.label?.trim();
-  return <div className={`asset-tile ${selected ? "selected" : ""} ${primary ? "primary" : ""}`} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>
+  const [menu,setMenu]=useState<{x:number;y:number}|null>(null);
+  const [hoverMetadata,setHoverMetadata]=useState<CatalogAssetMetadata|null>(null);
+  const [hover,setHover]=useState(false);const [popup,setPopup]=useState(false);const timer=useRef<number|undefined>(undefined);
+  const [shiftDown,setShiftDown]=useState(!!window.__ddreamsShift);
+  const tileRef=useRef<HTMLDivElement>(null);const popupRef=useRef<HTMLDivElement>(null);
+  const [popupPosition,setPopupPosition]=useState<{left:number;top:number;maxHeight:number}|null>(null);
+  useEffect(()=>{const down=(e:globalThis.KeyboardEvent)=>{if(e.key==="Shift")setShiftDown(true)};const up=(e:globalThis.KeyboardEvent)=>{if(e.key==="Shift")setShiftDown(false)};window.addEventListener("keydown",down);window.addEventListener("keyup",up);return()=>{window.removeEventListener("keydown",down);window.removeEventListener("keyup",up)}},[]);
+  useEffect(()=>{if(!hover||hoverMode==="off"||(hoverMode==="shift"&&!shiftDown)){setPopup(false);return;}timer.current=window.setTimeout(()=>setPopup(true),500);return()=>{if(timer.current!==undefined)window.clearTimeout(timer.current)}},[hover,hoverMode,shiftDown]);
+  useLayoutEffect(()=>{if(!popup)return;const tile=tileRef.current?.getBoundingClientRect();const card=popupRef.current;if(!tile||!card)return;const gap=8,pad=8,w=card.offsetWidth,h=card.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;const candidates=[{left:tile.right+gap,top:tile.top},{left:tile.left-w-gap,top:tile.top},{left:tile.left,top:tile.bottom+gap},{left:tile.left,top:tile.top-h-gap}];const fits=candidates.find(p=>p.left>=pad&&p.top>=pad&&p.left+w<=vw-pad&&p.top+h<=vh-pad&&!(p.left<tile.right&&p.left+w>tile.left&&p.top<tile.bottom&&p.top+h>tile.top));const chosen=fits??{left:Math.min(Math.max(pad,tile.right+gap),Math.max(pad,vw-w-pad)),top:Math.min(Math.max(pad,tile.top),Math.max(pad,vh-Math.min(h,vh-pad*2)-pad))};setPopupPosition({left:chosen.left,top:chosen.top,maxHeight:Math.max(120,vh-pad*2)});},[popup,hoverMetadata]);
+  useEffect(()=>{if(!popup)return;let current=true;void invoke<CatalogAssetMetadata|null>("get_catalog_asset_metadata",{assetId:asset.id}).then(m=>{if(current)setHoverMetadata(m)}).catch(()=>{});return()=>{current=false}},[popup,asset.id]);
+  useEffect(()=>{const hide=()=>setPopup(false);window.addEventListener("ddreams-scroll",hide);window.addEventListener("resize",hide);return()=>{window.removeEventListener("ddreams-scroll",hide);window.removeEventListener("resize",hide)}},[]);
+  return <div ref={tileRef} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>
     <div className="thumb-wrap" style={{ height: size }}>
       {isImage(asset) && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, epoch, retry)} loading="lazy" draggable={false} onError={async () => {
         try {
@@ -146,13 +180,17 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
           else setBroken(true);
         } catch { setBroken(true); }
       }} /> : <div className="file-placeholder"><span>{asset.isDirectory ? "📁" : offline || asset.offline ? "OFFLINE" : badge}</span>{(offline || asset.offline) && <small>Odpojené</small>}</div>}
-      {!asset.isDirectory && <span className="type-badge">{badge}</span>}
-      {!!asset.rating && <span className="rating-badge">{"★".repeat(Math.min(5, asset.rating))}</span>}
-      {!!asset.tagged && <span className="tagged-badge">✓</span>}
-      {label && <span className="label-badge" style={{ backgroundColor: labelColor(label) }}>{label}</span>}
+      {overlayMode>0&&!asset.isDirectory && <span className="type-badge">{badge}</span>}
+      {overlayMode>0&&!!asset.rating && <span className="rating-badge">{"★".repeat(Math.min(5, asset.rating))}</span>}
+      {overlayMode>0&&!!asset.tagged && <span className="tagged-badge">✓</span>}
+      {overlayMode>0&&asset.hasCategories && <span className="category-badge">◆</span>}
+      {overlayMode>0&&label && <span className="label-badge" style={{ backgroundColor: overlayMode===1?"#777":labelColor(label) }}>{labelText(label)}</span>}
+      {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge">OFFLINE</span>}
       {!asset.isDirectory && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
     <div className="tile-name">{asset.name}</div>
+    {menu&&<div className="tile-context-menu" style={{left:menu.x,top:menu.y}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected&&selectedIds.length?selectedIds:[asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button></div>}
+    {popup&&createPortal(<div ref={popupRef} className="hover-card" style={{position:"fixed",left:popupPosition?.left??-10000,top:popupPosition?.top??-10000,maxHeight:popupPosition?.maxHeight??"80vh",overflowY:"auto"}}><div className="hover-image">{isImage(asset)&&asset.path&&<img src={thumbUrl(asset,360,epoch)} />}</div><b title={asset.name}>{asset.name}</b><small>{formatBytes(asset.size)} {"\u00b7"} {asset.width&&asset.height?`${asset.width} \u00d7 ${asset.height}`:"\u2014"}</small><small>{asset.exifDate??asset.fileModified??"\u2014"}</small><small>{asset.rating?`\u2605 ${asset.rating}`:"Bez hodnotenia"} {label?labelText(label):""}</small><small>{hoverMetadata?.categories.length?`Kateg\u00f3rie: ${hoverMetadata.categories.join(", ")}`:"Bez kateg\u00f3ri\u00ed"}</small></div>,document.body)}
   </div>;
 }
 export function thumbUrl(asset: Asset, size: number, epoch: number, retry = 0): string {
@@ -162,6 +200,10 @@ export function thumbUrl(asset: Asset, size: number, epoch: number, retry = 0): 
   url.searchParams.set("v", String(epoch));
   url.searchParams.set("r", String(retry));
   return url.toString();
+}
+export function labelText(label: string): string {
+  const names: Record<string,string> = { red:"\u010cerven\u00e1", yellow:"\u017dlt\u00e1", green:"Zelen\u00e1", blue:"Modr\u00e1", purple:"Fialov\u00e1", "\u010derven\u00e1":"\u010cerven\u00e1", "\u017elt\u00e1":"\u017dlt\u00e1", "zelen\u00e1":"Zelen\u00e1", "modr\u00e1":"Modr\u00e1", "fialov\u00e1":"Fialov\u00e1" };
+  return names[label.toLocaleLowerCase("sk-SK")] ?? label;
 }
 export function labelColor(label: string): string {
   const colors: Record<string, string> = { red: "#c94c50", "\u010derven\u00e1": "#c94c50", yellow: "#c49b37", "\u017elt\u00e1": "#c49b37", green: "#4b9862", "zelen\u00e1": "#4b9862", blue: "#4e7db7", "modr\u00e1": "#4e7db7", purple: "#8866b4", "fialov\u00e1": "#8866b4" };

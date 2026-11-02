@@ -40,6 +40,29 @@ pub fn get_assets(
     db::assets_page(&state.0, &filter).map_err(|e| e.to_string())
 }
 #[tauri::command]
+pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) -> Result<(), String> {
+    listing.0.invalidate(folder_id)
+}
+#[tauri::command]
+pub fn get_asset_paths(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, ids: Vec<i64>) -> Result<Vec<String>, String> {
+    Ok(ids.into_iter().filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path))).collect())
+}
+#[tauri::command]
+pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_id: i64, action: String) -> Result<(), String> {
+    let path = listing.0.asset(asset_id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,asset_id).ok().flatten().and_then(|m|m.asset.path)).ok_or("Cesta súboru sa nenašla")?;
+    if !Path::new(&path).exists() { return Err("Súbor je offline".into()); }
+    let mut command=std::process::Command::new("explorer.exe");
+    match action.as_str() {
+        "open" => { command.arg(&path); }
+        "reveal" => {
+            use std::os::windows::process::CommandExt;
+            let escaped=path.replace('"',"\"\"");command.raw_arg(format!("/select,\"{escaped}\""));
+        }
+        _ => return Err("Neznáma akcia".into()),
+    }
+    command.spawn().map(|_|()).map_err(|e|e.to_string())
+}
+#[tauri::command]
 pub fn get_asset_ids(
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
@@ -62,7 +85,7 @@ pub fn get_folder_children(
     if let Some(parent)=parent_id.filter(|id| *id != -2) {
         let path=listing.0.asset(parent).and_then(|a|a.path).or_else(||db::folder_ancestors(&state.0,parent).ok()?.last().and_then(|f|f.path.clone()));
         if let Some(path)=path {
-            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500};
+            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None};
             let page=listing.0.page(&filter)?;
             let mut dirs=Vec::new();
             for asset in page.items.into_iter().filter(|a|a.is_directory) {
@@ -124,6 +147,10 @@ pub fn search_keywords(
     limit: i64,
 ) -> Result<Vec<db::CatalogNode>, String> {
     db::keyword_search_page(&state.0, &query, offset, limit).map_err(|e| e.to_string())
+}
+#[tauri::command]
+pub fn search_catalog_tree(state: State<'_, DatabaseState>, kind:String, query:String, offset:i64, limit:i64)->Result<Vec<db::CatalogNode>,String>{
+    db::catalog_tree_search(&state.0,&kind,&query,offset,limit).map_err(|e|e.to_string())
 }
 #[tauri::command]
 pub fn get_catalog_values(
@@ -272,4 +299,8 @@ pub fn get_metadata(
         offline: !online,
         rows,
     }))
+}
+#[tauri::command]
+pub fn get_catalog_asset_metadata(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<AssetMetadata>,String>{
+    db::asset_metadata(&state.0,asset_id).map_err(|e|e.to_string())
 }

@@ -20,6 +20,12 @@ impl ListingService {
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
 
+    pub fn invalidate(&self, folder_id: i64) -> Result<(), String> {
+        let path = self.asset(folder_id).and_then(|a| a.path).or_else(|| db::folder_ancestors(&self.db, folder_id).ok()?.last()?.path.clone()).ok_or("folder path unavailable")?;
+        self.listings.lock().map_err(|_| "listing cache poisoned")?.remove(&normalize(&path));
+        Ok(())
+    }
+
     fn list(&self, path: &str, folder_ids: &[i64]) -> (Vec<Asset>, bool) {
         let key = normalize(path);
         if let Ok(cache) = self.listings.lock() {
@@ -60,7 +66,7 @@ impl ListingService {
                 id: self.id(), folder_id: matched_folder, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,
                 label: None, file_modified: None, exif_date: None, acdsee_date: None, md_dirty: None, is_orphan: None,
-                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false,
+                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, has_categories: false,
             });
             asset.name = name;
             asset.ext = ext;
@@ -92,18 +98,14 @@ impl ListingService {
         let ids = filter.ids.clone().unwrap_or_else(|| filter.id.map(|id| match self.asset(id).filter(|a|a.is_directory) { Some(a)=>vec![a.folder_id.unwrap_or(id)],None=>vec![id] }).unwrap_or_default());
         let (mut rows, _) = self.list(&path, &ids);
         rows.retain(|a| a.is_directory || (!a.ext.is_empty() && a.ext.to_ascii_lowercase() != "xmp"));
-        if let Some(q) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) { let q=q.to_lowercase(); rows.retain(|a|a.name.to_lowercase().contains(&q)||a.caption.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))||a.notes.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))); }
+        if let Some(q) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) { let q=q.to_lowercase(); rows.retain(|a|a.is_directory||a.name.to_lowercase().contains(&q)||a.caption.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))||a.notes.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))); }
+        rows.retain(|a| a.is_directory || db::asset_filter_matches(a, filter));
         let dir_count = rows.iter().filter(|a| a.is_directory).count();
         let (dirs, files) = rows.split_at(dir_count);
         let mut dirs=dirs.to_vec(); let mut files=files.to_vec();
-        let ordering = |a: &Asset,b: &Asset| match filter.sort.as_str() {
-            "size" => a.size.partial_cmp(&b.size).unwrap_or(std::cmp::Ordering::Equal),
-            "date" => a.exif_date.as_ref().or(a.file_modified.as_ref()).cmp(&b.exif_date.as_ref().or(b.file_modified.as_ref())),
-            "type" => a.ext.to_lowercase().cmp(&b.ext.to_lowercase()),
-            _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
-        }.then(a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.id.cmp(&b.id));
+        let ordering = |a: &Asset,b: &Asset| db::compare_assets(a,b,&filter.sort,filter.descending);
         dirs.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        files.sort_by(ordering); if filter.descending { files.reverse(); }
+        files.sort_by(ordering);
         dirs.extend(files);
         let total = dirs.len() as i64; let total_size=dirs.iter().filter(|a|!a.is_directory).map(|a|a.size.unwrap_or(0.0)).sum();
         let offset=filter.offset.max(0) as usize; let limit=filter.limit.clamp(1,500) as usize;
@@ -124,7 +126,7 @@ impl ListingService {
         let parent=if let Some(parent_path)=parent_path.filter(|p|!p.is_empty()&&normalize(p)!=key){self.resolve_folder(&parent_path)?}else{None};
         let name=path_buf.file_name().map(|n|n.to_string_lossy().to_string()).unwrap_or_else(||path.to_string());
         let id=self.id(); let parent_id=parent.as_ref().map(|p|p.id); let root_id=parent.as_ref().and_then(|p|p.root_id);
-        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false};
+        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,has_categories:false};
         self.entries.lock().map_err(|_|"entry map poisoned")?.insert(id,asset);
         if let Some(parent_id)=parent_id{self.directory_parents.lock().map_err(|_|"folder map poisoned")?.insert(id,parent_id);}
         self.path_ids.lock().map_err(|_|"path map poisoned")?.insert(key,id);

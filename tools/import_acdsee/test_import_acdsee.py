@@ -116,6 +116,11 @@ class ImportTests(unittest.TestCase):
                 self.assertEqual(conn.execute("select count(*) from assets_fts").fetchone()[0], 1)
                 self.assertEqual(conn.execute("select ext_lower,is_listed from assets").fetchone(), ("jpg", 1))
                 self.assertEqual(conn.execute("select name,path from folder_roots").fetchone(), ("F:", "F:\\"))
+                indexes = {row[0] for row in conn.execute("select name from sqlite_master where type='index'")}
+                self.assertIn("idx_assets_listed_ext_name", indexes)
+                self.assertIn("idx_assets_listed_tagged_name", indexes)
+                self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_ext_name')")])
+                self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_name')")])
             self.assertIn("Asset: 1 / 1", report)
             self.assertIn("missing asset=1, missing category=1", report)
             self.assertIn("MDDIRTY in folder path containing 2019-poltár", report)
