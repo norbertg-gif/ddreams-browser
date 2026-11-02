@@ -1,4 +1,4 @@
-use crate::db::{self, Asset, AssetFilter, AssetPage, Db};
+use crate::{db::{self, Asset, AssetFilter, AssetPage, Db}, formats::FormatTable};
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::{atomic::{AtomicI64, Ordering}, mpsc}, time::Duration};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
@@ -6,6 +6,7 @@ const OFFLINE_RETRY: Duration = Duration::from_secs(8);
 
 pub struct ListingService {
     db: Db,
+    formats: std::sync::Arc<FormatTable>,
     entries: std::sync::Mutex<HashMap<i64, Asset>>,
     directory_parents: std::sync::Mutex<HashMap<i64, i64>>,
     path_ids: std::sync::Mutex<HashMap<String,i64>>,
@@ -14,8 +15,8 @@ pub struct ListingService {
 }
 
 impl ListingService {
-    pub fn new(db: Db) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db, entries: std::sync::Mutex::new(HashMap::new()), directory_parents: std::sync::Mutex::new(HashMap::new()), path_ids:std::sync::Mutex::new(HashMap::new()), listings: std::sync::Mutex::new(HashMap::new()), next_id: AtomicI64::new(-10_000_000) })
+    pub fn new(db: Db, formats: std::sync::Arc<FormatTable>) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { db, formats, entries: std::sync::Mutex::new(HashMap::new()), directory_parents: std::sync::Mutex::new(HashMap::new()), path_ids:std::sync::Mutex::new(HashMap::new()), listings: std::sync::Mutex::new(HashMap::new()), next_id: AtomicI64::new(-10_000_000) })
     }
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
@@ -35,11 +36,12 @@ impl ListingService {
         }
         let (tx, rx) = mpsc::sync_channel(1);
         let root = PathBuf::from(path);
+        let formats = self.formats.clone();
         std::thread::spawn(move || {
             let result = std::fs::read_dir(&root).map(|items| {
                 items.filter_map(Result::ok).filter_map(|entry| {
                     let p = entry.path(); let name = entry.file_name().to_string_lossy().to_string();
-                    if hidden_or_ignored(&name, &entry.metadata().ok()?) { return None; }
+                    if hidden_or_ignored(&name, &entry.metadata().ok()?, &formats) { return None; }
                     let meta = entry.metadata().ok()?;
                     Some((p, name, meta))
                 }).collect::<Vec<_>>()
@@ -49,7 +51,7 @@ impl ListingService {
         let disk = match rx.recv_timeout(LIST_TIMEOUT) { Ok(Ok(v)) => v, _ => {
             let mut rows = Vec::new();
             if let Ok(context) = db::folder_disk_context(&self.db, folder_ids) {
-                for (_, _, assets) in context { rows.extend(assets.into_iter().filter(|a| a.ext != "" && a.ext.to_ascii_lowercase() != "xmp").map(|mut a| { a.offline = true; a })); }
+                for (_, _, assets) in context { rows.extend(assets.into_iter().filter(|a| !a.ext.is_empty() && !self.formats.is_hidden(&a.ext)).map(|mut a| { a.offline = true; a })); }
             }
             if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
             return (rows, true);
@@ -97,9 +99,9 @@ impl ListingService {
         }
         let ids = filter.ids.clone().unwrap_or_else(|| filter.id.map(|id| match self.asset(id).filter(|a|a.is_directory) { Some(a)=>vec![a.folder_id.unwrap_or(id)],None=>vec![id] }).unwrap_or_default());
         let (mut rows, _) = self.list(&path, &ids);
-        rows.retain(|a| a.is_directory || (!a.ext.is_empty() && a.ext.to_ascii_lowercase() != "xmp"));
+        rows.retain(|a| a.is_directory || (!a.ext.is_empty() && !self.formats.is_hidden(&a.ext)));
         if let Some(q) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) { let q=q.to_lowercase(); rows.retain(|a|a.is_directory||a.name.to_lowercase().contains(&q)||a.caption.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))||a.notes.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))); }
-        rows.retain(|a| a.is_directory || db::asset_filter_matches(a, filter));
+        rows.retain(|a| a.is_directory || db::asset_filter_matches(a, filter, &self.formats));
         let dir_count = rows.iter().filter(|a| a.is_directory).count();
         let (dirs, files) = rows.split_at(dir_count);
         let mut dirs=dirs.to_vec(); let mut files=files.to_vec();
@@ -145,9 +147,10 @@ impl ListingService {
 }
 
 fn normalize(path: &str) -> String { path.trim_end_matches(['\\','/']).replace('/',"\\").to_lowercase() }
-fn hidden_or_ignored(name: &str, metadata: &std::fs::Metadata) -> bool {
+fn hidden_or_ignored(name: &str, metadata: &std::fs::Metadata, formats: &FormatTable) -> bool {
     let lower=name.to_ascii_lowercase();
-    if name.starts_with('.') || ["desktop.ini",".picasa.ini"].contains(&lower.as_str()) || ["xmp","acr","thm"].contains(&Path::new(name).extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase().as_str()) { return true; }
+    let ext=Path::new(name).extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+    if name.starts_with('.') || ["desktop.ini",".picasa.ini"].contains(&lower.as_str()) || formats.is_hidden(&ext) { return true; }
     #[cfg(windows)] { use std::os::windows::fs::MetadataExt; if metadata.file_attributes() & (0x2 | 0x4) != 0 { return true; } }
     let _=metadata; false
 }

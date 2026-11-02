@@ -2,11 +2,10 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, typ
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
-import type { Asset, CatalogAssetMetadata, Page, View, ViewFilters } from "../types";
+import type { Asset, CatalogAssetMetadata, FormatTable, Page, View, ViewFilters } from "../types";
 
 const PAGE_SIZE = 120;
 declare global { interface Window { __ddreamsShift?: boolean } }
-const IMAGE_TYPES = new Set(["jpg", "jpeg", "png", "webp", "tif", "tiff", "heic", "jp2", "gif", "bmp", "psd", "arw", "dng", "cr2", "nef", "raf", "orf", "rw2", "pef", "raw"]);
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes)) return "—";
   if (bytes < 1024) return `${bytes} B`;
@@ -15,7 +14,8 @@ export function formatBytes(bytes: number | null | undefined): string {
   const [divisor, unit] = units.find(([scale]) => bytes >= scale)!;
   return `${(bytes / divisor).toLocaleString("sk-SK", { maximumFractionDigits: 1, minimumFractionDigits: 1 })} ${unit}`;
 }
-export function isImage(asset: Asset): boolean { return IMAGE_TYPES.has(asset.ext.toLowerCase()); }
+export function formatFor(asset: Asset, formats: FormatTable) { return formats.formats.find(format => format.ext === asset.ext.toLowerCase()); }
+export function isImage(asset: Asset, formats: FormatTable): boolean { const group=formatFor(asset,formats)?.group; return group === "image" || group === "raw"; }
 
 type Props = {
   view: View; query: string; sort: string; descending: boolean; zoom: number; epoch: number;
@@ -29,10 +29,11 @@ type Props = {
   filters?: ViewFilters;
   overlayMode?: number;
   hoverMode?: "off"|"hover"|"shift";
+  formats: FormatTable;
   refreshToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", refreshToken=0 }: Props) {
+export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", refreshToken=0, formats }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const cache = useRef(new Map<number, Asset>());
   const pages = useRef(new Set<number>());
@@ -143,7 +144,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -151,13 +152,14 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift" }) {
+function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable }) {
   const [broken, setBroken] = useState(false);
   const [offline, setOffline] = useState(false);
   const [retry, setRetry] = useState(0);
   useEffect(() => { setBroken(false); setOffline(false); }, [asset.id, epoch]);
   const ext = asset.ext.toUpperCase();
-  const badge = ext === "DNG" ? "DNG" : ["ARW", "CR2", "NEF", "RAF", "ORF", "RW2", "PEF", "ACR", "RAW"].includes(ext) ? "RAW" : ["JPG", "JPEG"].includes(ext) ? "JPG" : ext || "FILE";
+  const format = formatFor(asset, formats);
+  const badge = format?.group === "raw" ? ext.toUpperCase() : ext || "FILE";
   const label = asset.label?.trim();
   const [menu,setMenu]=useState<{x:number;y:number}|null>(null);
   const [hoverMetadata,setHoverMetadata]=useState<CatalogAssetMetadata|null>(null);
@@ -172,7 +174,7 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
   useEffect(()=>{const hide=()=>setPopup(false);window.addEventListener("ddreams-scroll",hide);window.addEventListener("resize",hide);return()=>{window.removeEventListener("ddreams-scroll",hide);window.removeEventListener("resize",hide)}},[]);
   return <div ref={tileRef} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>
     <div className="thumb-wrap" style={{ height: size }}>
-      {isImage(asset) && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, epoch, retry)} loading="lazy" draggable={false} onError={async () => {
+      {!asset.isDirectory && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, epoch, retry)} loading="lazy" draggable={false} onError={async () => {
         try {
           const state = await invoke<"ready" | "offline" | "stale" | "unavailable">("get_thumbnail_state", { assetId: asset.id, epoch });
           if (state === "stale") { onViewport(); setRetry(v => v + 1); }
@@ -190,7 +192,16 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
     </div>
     <div className="tile-name">{asset.name}</div>
     {menu&&<div className="tile-context-menu" style={{left:menu.x,top:menu.y}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected&&selectedIds.length?selectedIds:[asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button></div>}
-    {popup&&createPortal(<div ref={popupRef} className="hover-card" style={{position:"fixed",left:popupPosition?.left??-10000,top:popupPosition?.top??-10000,maxHeight:popupPosition?.maxHeight??"80vh",overflowY:"auto"}}><div className="hover-image">{isImage(asset)&&asset.path&&<img src={thumbUrl(asset,360,epoch)} />}</div><b title={asset.name}>{asset.name}</b><small>{formatBytes(asset.size)} {"\u00b7"} {asset.width&&asset.height?`${asset.width} \u00d7 ${asset.height}`:"\u2014"}</small><small>{asset.exifDate??asset.fileModified??"\u2014"}</small><small>{asset.rating?`\u2605 ${asset.rating}`:"Bez hodnotenia"} {label?labelText(label):""}</small><small>{hoverMetadata?.categories.length?`Kateg\u00f3rie: ${hoverMetadata.categories.join(", ")}`:"Bez kateg\u00f3ri\u00ed"}</small></div>,document.body)}
+    {popup && createPortal(
+      <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>
+        <div className="hover-image">{!asset.isDirectory && asset.path && <img src={thumbUrl(asset, 640, epoch)} />}</div>
+        <b title={asset.name}>{asset.name}</b>
+        <small>{formatBytes(asset.size)} {"\u00b7"} {asset.width && asset.height ? `${asset.width} \u00d7 ${asset.height}` : "\u2014"}</small>
+        <small>{asset.exifDate ?? asset.fileModified ?? "\u2014"}</small>
+        <small>{asset.rating ? `\u2605 ${asset.rating}` : "Bez hodnotenia"} {label ? labelText(label) : ""}</small>
+        <small>{hoverMetadata?.categories.length ? `Kateg\u00f3rie: ${hoverMetadata.categories.join(", ")}` : "Bez kateg\u00f3ri\u00ed"}</small>
+      </div>, document.body
+    )}
   </div>;
 }
 export function thumbUrl(asset: Asset, size: number, epoch: number, retry = 0): string {

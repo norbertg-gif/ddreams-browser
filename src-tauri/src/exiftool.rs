@@ -205,7 +205,7 @@ impl ExifTool {
         let data = self.with_process(|proc| proc.request(&[
             "-charset".into(), "filename=UTF8".into(), "-a".into(), "-G1".into(), "-j".into(),
             "-PreviewImage".into(), "-JpgFromRaw".into(), "-OtherImage".into(),
-            "-ThumbnailImage".into(), "-ThumbnailTIFF".into(), "-n".into(), "-Orientation".into(), p.clone(),
+            "-ThumbnailImage".into(), "-ThumbnailTIFF".into(), "-PhotoshopThumbnail".into(), "-n".into(), "-Orientation".into(), p.clone(),
         ]))?;
         let json: Value = serde_json::from_slice(&data).map_err(|e| io_error(std::io::ErrorKind::InvalidData, &e.to_string()))?;
         let object = json.as_array().and_then(|a| a.first()).and_then(Value::as_object)

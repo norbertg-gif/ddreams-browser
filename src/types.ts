@@ -17,3 +17,6 @@ export type ValueCount = { value: string; count: number };
 export type MetadataRow = { group: string; name: string; value: string };
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
 export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };
+
+export type FileFormat = { ext: string; group: "image" | "raw" | "video" | "document" | "other"; name: string; hidden?: boolean };
+export type FormatTable = { version: number; formats: FileFormat[] };

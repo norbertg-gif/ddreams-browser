@@ -1,6 +1,7 @@
 use crate::{
     db::{self, AssetFilter, AssetMetadata, Db},
     exiftool::ExifTool,
+    formats::FormatTable,
     listing::ListingService,
     thumbs::ThumbService,
 };
@@ -14,6 +15,7 @@ pub struct DatabaseState(pub Db);
 pub struct ExifState(pub Arc<ExifTool>);
 pub struct ThumbnailState(pub Arc<ThumbService>);
 pub struct ListingState(pub Arc<ListingService>);
+pub struct FormatsState(pub Arc<FormatTable>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,10 +36,11 @@ pub struct MetadataResponse {
 pub fn get_assets(
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
+    formats: State<'_, FormatsState>,
     filter: AssetFilter,
 ) -> Result<db::AssetPage, String> {
     if filter.kind == "folder" { return listing.0.page(&filter); }
-    db::assets_page(&state.0, &filter).map_err(|e| e.to_string())
+    db::assets_page(&state.0, &filter, &formats.0).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) -> Result<(), String> {
@@ -66,12 +69,13 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
 pub fn get_asset_ids(
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
+    formats: State<'_, FormatsState>,
     filter: AssetFilter,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<i64>, String> {
     if filter.kind == "folder" { let mut f=filter; f.offset=offset; f.limit=limit; return Ok(listing.0.page(&f)?.items.into_iter().map(|a|a.id).collect()); }
-    db::asset_ids_page(&state.0, &filter, offset, limit).map_err(|e| e.to_string())
+    db::asset_ids_page(&state.0, &filter, &formats.0, offset, limit).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn get_folder_children(
@@ -155,11 +159,12 @@ pub fn search_catalog_tree(state: State<'_, DatabaseState>, kind:String, query:S
 #[tauri::command]
 pub fn get_catalog_values(
     state: State<'_, DatabaseState>,
+    formats: State<'_, FormatsState>,
     kind: String,
     offset: i64,
     limit: i64,
 ) -> Result<Vec<db::ValueCount>, String> {
-    db::values_page(&state.0, &kind, offset, limit).map_err(|e| e.to_string())
+    db::values_page(&state.0, &kind, offset, limit, &formats.0).map_err(|e| e.to_string())
 }
 #[tauri::command]
 pub fn set_thumbnail_epoch(state: State<'_, ThumbnailState>, epoch: u64) {
@@ -303,4 +308,12 @@ pub fn get_metadata(
 #[tauri::command]
 pub fn get_catalog_asset_metadata(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<AssetMetadata>,String>{
     db::asset_metadata(&state.0,asset_id).map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+pub fn get_formats(state: State<'_, FormatsState>) -> FormatTable { state.0.as_ref().clone() }
+
+#[tauri::command]
+pub fn get_preview_source(state: State<'_, ThumbnailState>, asset_id: i64, epoch: u64) -> Result<String, String> {
+    state.0.render(asset_id, 0, epoch).map(|result| result.source).map_err(|e| format!("{e:?}"))
 }

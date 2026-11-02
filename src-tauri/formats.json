@@ -1,0 +1,448 @@
+{
+  "version": 1,
+  "formats": [
+    {
+      "ext": "3fr",
+      "group": "raw",
+      "name": "3FR RAW"
+    },
+    {
+      "ext": "arq",
+      "group": "raw",
+      "name": "ARQ RAW"
+    },
+    {
+      "ext": "arw",
+      "group": "raw",
+      "name": "ARW RAW"
+    },
+    {
+      "ext": "bay",
+      "group": "raw",
+      "name": "BAY RAW"
+    },
+    {
+      "ext": "cap",
+      "group": "raw",
+      "name": "CAP RAW"
+    },
+    {
+      "ext": "cr2",
+      "group": "raw",
+      "name": "CR2 RAW"
+    },
+    {
+      "ext": "cr3",
+      "group": "raw",
+      "name": "Canon RAW CR3"
+    },
+    {
+      "ext": "crw",
+      "group": "raw",
+      "name": "CRW RAW"
+    },
+    {
+      "ext": "cs1",
+      "group": "raw",
+      "name": "CS1 RAW"
+    },
+    {
+      "ext": "dcr",
+      "group": "raw",
+      "name": "DCR RAW"
+    },
+    {
+      "ext": "dcs",
+      "group": "raw",
+      "name": "DCS RAW"
+    },
+    {
+      "ext": "dng",
+      "group": "raw",
+      "name": "DNG RAW"
+    },
+    {
+      "ext": "drf",
+      "group": "raw",
+      "name": "DRF RAW"
+    },
+    {
+      "ext": "eip",
+      "group": "raw",
+      "name": "EIP RAW"
+    },
+    {
+      "ext": "erf",
+      "group": "raw",
+      "name": "ERF RAW"
+    },
+    {
+      "ext": "fff",
+      "group": "raw",
+      "name": "FFF RAW"
+    },
+    {
+      "ext": "gpr",
+      "group": "raw",
+      "name": "GPR RAW"
+    },
+    {
+      "ext": "iiq",
+      "group": "raw",
+      "name": "IIQ RAW"
+    },
+    {
+      "ext": "k25",
+      "group": "raw",
+      "name": "K25 RAW"
+    },
+    {
+      "ext": "kdc",
+      "group": "raw",
+      "name": "KDC RAW"
+    },
+    {
+      "ext": "mdc",
+      "group": "raw",
+      "name": "MDC RAW"
+    },
+    {
+      "ext": "mef",
+      "group": "raw",
+      "name": "MEF RAW"
+    },
+    {
+      "ext": "mos",
+      "group": "raw",
+      "name": "MOS RAW"
+    },
+    {
+      "ext": "mrw",
+      "group": "raw",
+      "name": "MRW RAW"
+    },
+    {
+      "ext": "nef",
+      "group": "raw",
+      "name": "NEF RAW"
+    },
+    {
+      "ext": "nrw",
+      "group": "raw",
+      "name": "NRW RAW"
+    },
+    {
+      "ext": "orf",
+      "group": "raw",
+      "name": "ORF RAW"
+    },
+    {
+      "ext": "ori",
+      "group": "raw",
+      "name": "ORI RAW"
+    },
+    {
+      "ext": "pef",
+      "group": "raw",
+      "name": "PEF RAW"
+    },
+    {
+      "ext": "ptx",
+      "group": "raw",
+      "name": "PTX RAW"
+    },
+    {
+      "ext": "pxn",
+      "group": "raw",
+      "name": "PXN RAW"
+    },
+    {
+      "ext": "r3d",
+      "group": "raw",
+      "name": "R3D RAW"
+    },
+    {
+      "ext": "raf",
+      "group": "raw",
+      "name": "RAF RAW"
+    },
+    {
+      "ext": "raw",
+      "group": "raw",
+      "name": "RAW RAW"
+    },
+    {
+      "ext": "rw2",
+      "group": "raw",
+      "name": "RW2 RAW"
+    },
+    {
+      "ext": "rwl",
+      "group": "raw",
+      "name": "RWL RAW"
+    },
+    {
+      "ext": "rwz",
+      "group": "raw",
+      "name": "RWZ RAW"
+    },
+    {
+      "ext": "sr2",
+      "group": "raw",
+      "name": "SR2 RAW"
+    },
+    {
+      "ext": "srf",
+      "group": "raw",
+      "name": "SRF RAW"
+    },
+    {
+      "ext": "srw",
+      "group": "raw",
+      "name": "SRW RAW"
+    },
+    {
+      "ext": "x3f",
+      "group": "raw",
+      "name": "X3F RAW"
+    },
+    {
+      "ext": "jpg",
+      "group": "image",
+      "name": "JPEG"
+    },
+    {
+      "ext": "jpeg",
+      "group": "image",
+      "name": "JPEG"
+    },
+    {
+      "ext": "jpe",
+      "group": "image",
+      "name": "JPEG"
+    },
+    {
+      "ext": "jfif",
+      "group": "image",
+      "name": "JPEG"
+    },
+    {
+      "ext": "png",
+      "group": "image",
+      "name": "PNG"
+    },
+    {
+      "ext": "webp",
+      "group": "image",
+      "name": "WEBP"
+    },
+    {
+      "ext": "tif",
+      "group": "image",
+      "name": "TIFF"
+    },
+    {
+      "ext": "tiff",
+      "group": "image",
+      "name": "TIFF"
+    },
+    {
+      "ext": "gif",
+      "group": "image",
+      "name": "GIF"
+    },
+    {
+      "ext": "bmp",
+      "group": "image",
+      "name": "BMP"
+    },
+    {
+      "ext": "heic",
+      "group": "image",
+      "name": "HEIC"
+    },
+    {
+      "ext": "heif",
+      "group": "image",
+      "name": "HEIF"
+    },
+    {
+      "ext": "hif",
+      "group": "image",
+      "name": "HEIF"
+    },
+    {
+      "ext": "avif",
+      "group": "image",
+      "name": "AVIF"
+    },
+    {
+      "ext": "jxl",
+      "group": "image",
+      "name": "JXL"
+    },
+    {
+      "ext": "jp2",
+      "group": "image",
+      "name": "JPEG 2000"
+    },
+    {
+      "ext": "jpc",
+      "group": "image",
+      "name": "JPEG 2000"
+    },
+    {
+      "ext": "j2k",
+      "group": "image",
+      "name": "JPEG 2000"
+    },
+    {
+      "ext": "psd",
+      "group": "image",
+      "name": "PSD"
+    },
+    {
+      "ext": "psb",
+      "group": "image",
+      "name": "PSB"
+    },
+    {
+      "ext": "tga",
+      "group": "image",
+      "name": "TGA"
+    },
+    {
+      "ext": "pcx",
+      "group": "image",
+      "name": "PCX"
+    },
+    {
+      "ext": "ico",
+      "group": "image",
+      "name": "ICO"
+    },
+    {
+      "ext": "svg",
+      "group": "image",
+      "name": "SVG"
+    },
+    {
+      "ext": "mp4",
+      "group": "video",
+      "name": "MPEG-4 video"
+    },
+    {
+      "ext": "mov",
+      "group": "video",
+      "name": "QuickTime video"
+    },
+    {
+      "ext": "avi",
+      "group": "video",
+      "name": "AVI"
+    },
+    {
+      "ext": "mkv",
+      "group": "video",
+      "name": "MKV"
+    },
+    {
+      "ext": "wmv",
+      "group": "video",
+      "name": "WMV"
+    },
+    {
+      "ext": "mpg",
+      "group": "video",
+      "name": "MPG"
+    },
+    {
+      "ext": "mpeg",
+      "group": "video",
+      "name": "MPEG"
+    },
+    {
+      "ext": "m4v",
+      "group": "video",
+      "name": "M4V"
+    },
+    {
+      "ext": "3gp",
+      "group": "video",
+      "name": "3GP"
+    },
+    {
+      "ext": "webm",
+      "group": "video",
+      "name": "WEBM"
+    },
+    {
+      "ext": "mts",
+      "group": "video",
+      "name": "MTS"
+    },
+    {
+      "ext": "m2ts",
+      "group": "video",
+      "name": "M2TS"
+    },
+    {
+      "ext": "pdf",
+      "group": "document",
+      "name": "PDF"
+    },
+    {
+      "ext": "doc",
+      "group": "document",
+      "name": "DOC"
+    },
+    {
+      "ext": "docx",
+      "group": "document",
+      "name": "DOCX"
+    },
+    {
+      "ext": "xls",
+      "group": "document",
+      "name": "XLS"
+    },
+    {
+      "ext": "xlsx",
+      "group": "document",
+      "name": "XLSX"
+    },
+    {
+      "ext": "ppt",
+      "group": "document",
+      "name": "PPT"
+    },
+    {
+      "ext": "pptx",
+      "group": "document",
+      "name": "PPTX"
+    },
+    {
+      "ext": "txt",
+      "group": "document",
+      "name": "TXT"
+    },
+    {
+      "ext": "acr",
+      "group": "other",
+      "name": "ACDSee edited-settings sidecar",
+      "hidden": true
+    },
+    {
+      "ext": "xmp",
+      "group": "other",
+      "name": "XMP sidecar",
+      "hidden": true
+    },
+    {
+      "ext": "thm",
+      "group": "other",
+      "name": "Thumbnail sidecar",
+      "hidden": true
+    }
+  ]
+}

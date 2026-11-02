@@ -1,10 +1,10 @@
 # DDreams browser
 
-Read-only katalóg fotografií pre Windows. Rozhranie je inšpirované správou katalógu v ACDSee.
+Read-only katalóg fotografií pre Windows, s rozhraním inšpirovaným režimom Manage v ACDSee.
 
 ## Spustenie
 
-V koreňovom priečinku projektu spustite `npm run tauri dev`. Predtým musí existovať `.local/catalog.sqlite`. Cestu možno zmeniť premennou `DDREAMS_CATALOG`.
+V koreňovom priečinku projektu spustite `npm run tauri dev`. Katalóg `.local/catalog.sqlite` musí byť vytvorený vopred; cestu možno zmeniť cez `DDREAMS_CATALOG`.
 
 ## Import katalógu
 
@@ -14,22 +14,12 @@ Importer používa iba štandardnú knižnicu Pythonu:
 G:\Programovanie\photosort\.venv\Scripts\python.exe tools\import_acdsee\import_acdsee.py --source G:\ddreams-work\acdsee-copy --out .local\catalog.sqlite
 ```
 
-Po zmene schémy alebo indexov import zopakujte nad kópiou databázy ACDSee.
+## Formáty a zdroje náhľadov
 
-## Funkcie alpha
+Zoznam prípon a ich skupín je v `src-tauri/formats.json`. Pridanie podporovanej prípony znamená pridať jej malú položku `{ "ext": "cr3", "group": "raw", "name": "Canon RAW CR3" }`. Súbor vedľa spustiteľného programu nahradí vstavaný zoznam; premenná `DDREAMS_FORMATS` určuje inú cestu. Neplatný súbor sa zaloguje a aplikácia použije vstavaný zoznam.
 
-Zobrazenie priečinka číta aktuálny obsah disku a databázu používa ako prekrytie metadát. Kategórie, keywordy, hodnotenia a označenia sú založené na katalógu. Súbory sa otvárajú iba na čítanie; SQLite sa otvára v režime `mode=ro`. Zápis je povolený len do cache náhľadov (predvolene `G:\ddreams-work\thumb-cache`, nastaviteľné cez `DDREAMS_CACHE`) a do lokálneho nastavenia rozhrania.
+Zdroj náhľadu pridajte implementáciou `PreviewSource` v `src-tauri/src/thumbs.rs` a zaraďte ho do `PreviewChain::new` v požadovanom poradí/skupinách. Reťazec pokračuje pri neúspešnom zdroji. RAW súbory zatiaľ používajú vložené náhľady z ExifTool; RAW dekódovanie nie je implementované.
 
-Náhľady RAW používajú najväčší vložený náhľad. Niektoré Huawei/Honor DNG, napríklad `IMG_20190517_114021.dng`, vložený náhľad nemajú a zobrazia typovú dlaždicu.
+## Režim iba na čítanie
 
-## Klávesové skratky
-
-- `Alt+←` / `Alt+→`: späť / vpred; `Backspace`: nadradený priečinok; `F5`: obnoviť
-- Šípky: pohyb výberu; `Shift+šípky`: rozšíriť výber; `Ctrl+klik`: prepínať výber
-- `Ctrl+A`: všetky položky; `Ctrl+Shift+A`: všetky súbory; `Ctrl+I`: fotografie
-- `Ctrl+Shift+I`: invertovať výber; `Ctrl+Shift+D`: zrušiť výber
-- `]`: prepínať prekrytia; `Ctrl+koliesko`: meniť veľkosť dlaždíc
-- `Ctrl+Shift+O`: otvoriť vybraný súbor v predvolenom programe; `Ctrl+G`: kopírovať zoznam výsledkov
-- V paneli metadát: `Ctrl+A` vyberie riadky, `Ctrl+C` ich skopíruje
-
-Úpravy metadát, hodnotenie, tagovanie, presúvanie a mazanie nie sú súčasťou tejto alpha verzie.
+Priečinkové zobrazenie číta obsah disku a katalóg používa ako prekrytie metadát. SQLite sa otvára cez `mode=ro`. Zápis je povolený iba do cache náhľadov (predvolene `G:\ddreams-work\thumb-cache`, nastaviteľné cez `DDREAMS_CACHE`) a do lokálneho nastavenia rozhrania. Niektoré Huawei/Honor DNG, napríklad `IMG_20190517_114021.dng`, nemajú vložený náhľad a zobrazia typovú dlaždicu.

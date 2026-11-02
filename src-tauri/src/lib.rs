@@ -1,10 +1,11 @@
 mod commands;
 mod db;
 mod exiftool;
+mod formats;
 mod listing;
 mod thumbs;
 
-use commands::{DatabaseState, ExifState, ListingState, ThumbnailState};
+use commands::{DatabaseState, ExifState, FormatsState, ListingState, ThumbnailState};
 use db::{catalog_path, open_read_only};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use tauri::http::{Response, StatusCode, header};
@@ -26,8 +27,9 @@ pub fn run() {
                 std::path::PathBuf::from(r"G:\Programovanie\photosort\tools\exiftool\exiftool.exe")
             }),
     );
-    let listing = listing::ListingService::new(db.clone());
-    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone());
+    let formats = formats::FormatTable::load();
+    let listing = listing::ListingService::new(db.clone(), formats.clone());
+    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone());
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
     tauri::Builder::default()
@@ -35,6 +37,7 @@ pub fn run() {
         .manage(DatabaseState(db))
         .manage(ExifState(exif))
         .manage(ListingState(listing))
+        .manage(FormatsState(formats))
         .manage(ThumbnailState(thumbs))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();
@@ -80,7 +83,7 @@ pub fn run() {
                 let result = tauri::async_runtime::spawn_blocking(move || worker.render(id, size, epoch)).await;
                 match result {
                     Ok(Ok(data)) => responder.respond(
-                        Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE,"image/jpeg").header(header::CACHE_CONTROL,"no-store").body(data).unwrap()),
+                        Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE,"image/jpeg").header(header::CACHE_CONTROL,"no-store").body(data.bytes).unwrap()),
                     Ok(Err(error)) => {
                         let status=match error { thumbs::ThumbnailError::Offline=>StatusCode::NOT_FOUND, thumbs::ThumbnailError::Stale=>StatusCode::CONFLICT, thumbs::ThumbnailError::Unsupported=>StatusCode::UNSUPPORTED_MEDIA_TYPE, thumbs::ThumbnailError::Decode=>StatusCode::UNPROCESSABLE_ENTITY, thumbs::ThumbnailError::Unavailable=>StatusCode::INTERNAL_SERVER_ERROR };
                         responder.respond(Response::builder().status(status).header(header::CACHE_CONTROL,"no-store").body(Vec::new()).unwrap());
@@ -91,6 +94,8 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_assets,
+            commands::get_formats,
+            commands::get_preview_source,
             commands::refresh_folder_listing,
             commands::get_asset_paths,
             commands::asset_action,
