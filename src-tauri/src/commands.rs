@@ -1,5 +1,6 @@
 use crate::{
     db::{self, AssetFilter, AssetMetadata, Db},
+    display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
     listing::ListingService,
@@ -9,7 +10,7 @@ use crate::{
 use crate::thumbs;
 use serde::Serialize;
 use serde_json::Value;
-use std::{path::Path, sync::Arc};
+use std::{path::{Path, PathBuf}, sync::Arc};
 use tauri::State;
 
 pub struct DatabaseState(pub Db);
@@ -18,6 +19,7 @@ pub struct ThumbnailState(pub Arc<ThumbService>);
 pub struct ListingState(pub Arc<ListingService>);
 pub struct FormatsState(pub Arc<FormatTable>);
 pub struct MetadataViewState(pub Arc<MetadataView>);
+pub struct DisplayMetadataState(pub Arc<DisplayMetadataCache>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -92,7 +94,7 @@ pub fn get_folder_children(
     if let Some(parent)=parent_id.filter(|id| *id != -2) {
         let path=listing.0.asset(parent).and_then(|a|a.path).or_else(||db::folder_ancestors(&state.0,parent).ok()?.last().and_then(|f|f.path.clone()));
         if let Some(path)=path {
-            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),root_id:None,include_children:false,folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None};
+            let filter=AssetFilter{kind:"folder".into(),id:Some(parent),root_id:None,include_children:false,folder_path:Some(path),ids:parent_ids.clone(),value:None,query:None,sort:"name".into(),descending:false,offset:0,limit:500,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,file_group:None};
             let page=listing.0.page(&filter)?;
             let mut dirs=Vec::new();
             for asset in page.items.into_iter().filter(|a|a.is_directory) {
@@ -251,6 +253,44 @@ pub fn get_metadata(
 #[tauri::command]
 pub fn get_catalog_asset_metadata(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<AssetMetadata>,String>{
     db::asset_metadata(&state.0,asset_id).map_err(|e|e.to_string())
+}
+
+#[tauri::command]
+pub fn get_thumbnail_metadata(
+    db: State<'_, DatabaseState>, listing: State<'_, ListingState>, exif: State<'_, ExifState>,
+    cache: State<'_, DisplayMetadataState>, asset_ids: Vec<i64>, fields: Vec<String>,
+) -> Result<Vec<TileExifItem>, String> {
+    #[derive(Clone)] struct Candidate { id:i64, path:PathBuf, key:String, entry:CacheEntry, missing:Vec<String> }
+    let requested=display_metadata::allowed_fields(&fields);
+    if requested.is_empty() { return Ok(asset_ids.into_iter().map(|asset_id|TileExifItem{asset_id,values:TileExifValues::default()}).collect()); }
+    let mut candidates=Vec::new();
+    for id in asset_ids {
+        let (path,date,is_directory)=if let Some(asset)=listing.0.asset(id){(asset.path,asset.exif_date,asset.is_directory)}else{
+            let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+            conn.query_row("SELECT path,exif_date FROM assets WHERE id=? AND is_listed=1",[id],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?))).map(|(p,d)|(p,d,false)).unwrap_or((None,None,false))
+        };
+        let Some(path)=path.filter(|_|!is_directory) else { candidates.push(Candidate{id,path:PathBuf::new(),key:String::new(),entry:CacheEntry::default(),missing:Vec::new()});continue; };
+        let path=PathBuf::from(path);
+        if !path.is_file(){candidates.push(Candidate{id,path,key:String::new(),entry:CacheEntry::default(),missing:Vec::new()});continue;}
+        let (key,_,_)=display_metadata::file_key(&path).map_err(|e|e.to_string())?;
+        let entry=cache.0.get(&key);
+        let missing=display_metadata::missing_fields(&entry,&requested,date.as_deref());
+        candidates.push(Candidate{id,path,key,entry,missing});
+    }
+    let query_fields=requested.iter().filter(|field|candidates.iter().any(|c|c.missing.contains(field))).cloned().collect::<Vec<_>>();
+    if !query_fields.is_empty(){
+        let targets=candidates.iter().enumerate().filter(|(_,c)|!c.missing.is_empty()&&!c.key.is_empty()).map(|(i,_)|i).collect::<Vec<_>>();
+        let paths=targets.iter().map(|i|candidates[*i].path.clone()).collect::<Vec<_>>();
+        let tags=display_metadata::tags_for(&query_fields);
+        let records=exif.0.metadata_batch(&paths,&tags).map_err(|e|e.to_string())?;
+        for (idx,record) in targets.into_iter().zip(records.into_iter()){
+            let candidate=&mut candidates[idx];
+            if let Some(object)=record.as_object(){let values=display_metadata::parse_values(object,&query_fields);display_metadata::merge_values(&mut candidate.entry.values,values);}
+            display_metadata::mark_loaded(&mut candidate.entry,&query_fields);
+            cache.0.put(&candidate.key,candidate.entry.clone());
+        }
+    }
+    Ok(candidates.into_iter().map(|candidate|TileExifItem{asset_id:candidate.id,values:candidate.entry.values}).collect())
 }
 #[tauri::command]
 pub fn get_catalog_asset_links(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<db::CatalogAssetLinks>,String>{

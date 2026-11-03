@@ -6,7 +6,10 @@ export type Asset = {
   acdseeDate: string | null; mdDirty: number | null; isOrphan: number | null; path: string | null;
   isDirectory?: boolean; offline?: boolean;
   hasCategories?: boolean;
+  displayCategories?: string | null; displayKeywords?: string | null;
 };
+export type TileExifMetadata = { iso?: string | null; aperture?: string | null; shutter?: string | null; focalLength?: string | null; lens?: string | null; camera?: string | null; dateTaken?: string | null };
+export type TileExifMetadataItem = TileExifMetadata & { assetId: number };
 export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special"; id?: number; rootId?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
 export type ViewFilters = { ratingMode?: "equal" | "atLeast" | "atMost" | "unrated"; ratingValue?: number; labelFilter?: string; taggedOnly?: boolean; fileGroup?: "images" | "raw" | "video" | "other" };
 export type Page = { items: Asset[]; total: number; totalSize: number };

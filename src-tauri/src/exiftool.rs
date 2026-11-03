@@ -196,6 +196,16 @@ impl ExifTool {
         Ok(json.as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null))
     }
 
+    pub fn metadata_batch(&self, paths: &[PathBuf], tags: &[&str]) -> std::io::Result<Vec<Value>> {
+        if paths.is_empty() { return Ok(Vec::new()); }
+        let mut args=vec!["-charset".into(),"filename=UTF8".into(),"-fast2".into(),"-j".into(),"-G1".into(),"-s".into()];
+        for tag in tags { args.push(format!("-{tag}")); }
+        args.extend(paths.iter().map(|p|p.to_string_lossy().to_string()));
+        let data=self.with_process(|proc|proc.request(&args))?;
+        let json:Value=serde_json::from_slice(&data).map_err(|e|io_error(std::io::ErrorKind::InvalidData,&e.to_string()))?;
+        Ok(json.as_array().cloned().unwrap_or_default())
+    }
+
     pub fn largest_preview(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         self.largest_preview_with_orientation(path).map(|(preview,_)|preview)
     }

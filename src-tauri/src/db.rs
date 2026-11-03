@@ -60,6 +60,10 @@ pub struct Asset {
     pub offline: bool,
     #[serde(default)]
     pub has_categories: bool,
+    #[serde(default)]
+    pub display_categories: Option<String>,
+    #[serde(default)]
+    pub display_keywords: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -136,7 +140,7 @@ pub struct CatalogAssetLinks {
     pub root_ids: Vec<i64>,
 }
 
-fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
+fn map_asset(row: &rusqlite::Row<'_>, include_categories: bool, include_keywords: bool) -> rusqlite::Result<Asset> {
     Ok(Asset {
         id: row.get(0)?,
         folder_id: row.get(1)?,
@@ -161,10 +165,18 @@ fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
         is_directory: false,
         offline: false,
         has_categories: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
+        display_categories: if include_categories { row.get(21)? } else { None },
+        display_keywords: if include_keywords { row.get(if include_categories { 22 } else { 21 })? } else { None },
     })
 }
 
 const ASSET_COLS: &str = "a.id,a.folder_id,a.name,a.ext,a.size,a.width,a.height,a.bpp,a.caption,a.notes,a.author,a.rating,a.tagged,a.label,a.file_modified,a.exif_date,a.acdsee_date,a.md_dirty,a.is_orphan,a.path,EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)";
+fn asset_cols(include_categories: bool, include_keywords: bool) -> String {
+    let mut columns = ASSET_COLS.to_owned();
+    if include_categories { columns.push_str(", (SELECT group_concat(name, ', ') FROM (SELECT DISTINCT c.name AS name FROM asset_categories ac JOIN categories c ON c.id=ac.category_id WHERE ac.asset_id=a.id ORDER BY c.name COLLATE NOCASE))"); }
+    if include_keywords { columns.push_str(", (SELECT group_concat(name, ', ') FROM (SELECT DISTINCT k.name AS name FROM asset_keywords ak JOIN keywords k ON k.id=ak.keyword_id WHERE ak.asset_id=a.id ORDER BY k.name COLLATE NOCASE))"); }
+    columns
+}
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -190,6 +202,8 @@ pub struct AssetFilter {
     #[serde(default)] pub label_filter: Option<String>,
     #[serde(default)] pub tagged_only: bool,
     #[serde(default)] pub file_group: Option<String>,
+    #[serde(default)] pub include_categories: bool,
+    #[serde(default)] pub include_keywords: bool,
 }
 
 fn descendant_assets_cte(filter: &AssetFilter) -> Option<(String, rusqlite::types::Value)> {
@@ -293,7 +307,7 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
         let Some(path) = path else { continue };
         let sql = format!("SELECT {ASSET_COLS} FROM assets a WHERE a.folder_id=? AND a.is_listed=1");
         let mut stmt = conn.prepare(&sql)?;
-        let assets = stmt.query_map([id], map_asset)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        let assets = stmt.query_map([id], |row| map_asset(row, false, false))?.collect::<rusqlite::Result<Vec<_>>>()?;
         result.push((*id, path, assets));
     }
     Ok(result)
@@ -301,6 +315,8 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
 
 pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
     let conn = db.lock().unwrap();
+    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let extra_cols = filter.include_categories as i64 + filter.include_keywords as i64;
     let mut from_sql = String::from("assets a");
     let mut with_sql = String::new();
     let mut where_sql = format!("a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
@@ -378,7 +394,7 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
     add_view_filters(&mut where_sql, &mut args, filter, formats);
     if !with_sql.is_empty() {
         let order=order_clause(&filter.sort,filter.descending);
-        let sql = format!("{with_sql}, agg AS (SELECT count(*) AS total_count,coalesce(sum(a.size),0) AS total_size FROM {from_sql} WHERE {where_sql}), page AS (SELECT {ASSET_COLS} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?) SELECT page.*,agg.total_count,agg.total_size FROM agg LEFT JOIN page ON 1");
+        let sql = format!("{with_sql}, agg AS (SELECT count(*) AS total_count,coalesce(sum(a.size),0) AS total_size FROM {from_sql} WHERE {where_sql}), page AS (SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?) SELECT page.*,agg.total_count,agg.total_size FROM agg LEFT JOIN page ON 1");
         let mut query_args=args.clone();
         query_args.extend(args.iter().skip(1).cloned());
         query_args.push(filter.limit.clamp(1,500).into());
@@ -386,9 +402,9 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         let mut stmt=conn.prepare(&sql)?;
         let rows=stmt.query_map(rusqlite::params_from_iter(query_args.iter()),|r|{
             let id:Option<i64>=r.get(0)?;
-            let total=r.get(21)?;
-            let total_size=r.get(22)?;
-            let asset=if id.is_some(){Some(map_asset(r)?)}else{None};
+            let total=r.get((21+extra_cols) as usize)?;
+            let total_size=r.get((22+extra_cols) as usize)?;
+            let asset=if id.is_some(){Some(map_asset(r,filter.include_categories,filter.include_keywords)?)}else{None};
             Ok((asset,total,total_size))
         })?;
         let mut items=Vec::new();let mut total=0;let mut total_size=0.0;
@@ -403,19 +419,39 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             Ok((r.get(0)?, r.get(1)?))
         })?;
     let sql = format!(
-        "{with_sql} SELECT {ASSET_COLS} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
+        "{with_sql} SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
     );
     args.push(filter.limit.clamp(1, 500).into());
     args.push(filter.offset.max(0).into());
     let mut stmt = conn.prepare(&sql)?;
     let items = stmt
-        .query_map(rusqlite::params_from_iter(args.iter()), map_asset)?
+        .query_map(rusqlite::params_from_iter(args.iter()), |r| map_asset(r,filter.include_categories,filter.include_keywords))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(AssetPage {
         items,
         total,
         total_size,
     })
+}
+
+pub fn attach_display_values(db: &Db, assets: &mut [Asset], include_categories: bool, include_keywords: bool) -> rusqlite::Result<()> {
+    if assets.is_empty() || (!include_categories && !include_keywords) { return Ok(()); }
+    let conn = db.lock().unwrap();
+    let ids = assets.iter().filter(|a| !a.is_directory && a.id > 0).map(|a|a.id).collect::<Vec<_>>();
+    if ids.is_empty() { return Ok(()); }
+    let placeholders=vec!["?";ids.len()].join(",");
+    let args=rusqlite::params_from_iter(ids.iter());
+    if include_categories {
+        let sql=format!("SELECT asset_id,group_concat(name, ', ') FROM (SELECT ac.asset_id,c.name AS name FROM asset_categories ac JOIN categories c ON c.id=ac.category_id WHERE ac.asset_id IN ({placeholders}) GROUP BY ac.asset_id,c.name ORDER BY ac.asset_id,c.name COLLATE NOCASE) GROUP BY asset_id");
+        let mut stmt=conn.prepare(&sql)?;
+        for row in stmt.query_map(args,|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))? { let (id,value)=row?; if let Some(asset)=assets.iter_mut().find(|a|a.id==id){asset.display_categories=Some(value);} }
+    }
+    if include_keywords {
+        let sql=format!("SELECT asset_id,group_concat(name, ', ') FROM (SELECT ak.asset_id,k.name AS name FROM asset_keywords ak JOIN keywords k ON k.id=ak.keyword_id WHERE ak.asset_id IN ({placeholders}) GROUP BY ak.asset_id,k.name ORDER BY ak.asset_id,k.name COLLATE NOCASE) GROUP BY asset_id");
+        let mut stmt=conn.prepare(&sql)?;
+        for row in stmt.query_map(rusqlite::params_from_iter(ids.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))? { let (id,value)=row?; if let Some(asset)=assets.iter_mut().find(|a|a.id==id){asset.display_keywords=Some(value);} }
+    }
+    Ok(())
 }
 
 pub fn asset_ids_page(
@@ -758,7 +794,7 @@ pub fn asset_metadata(db: &Db, id: i64) -> rusqlite::Result<Option<AssetMetadata
         .query_row(
             &format!("SELECT {ASSET_COLS} FROM assets a WHERE a.id=?"),
             [id],
-            map_asset,
+            |row| map_asset(row, false, false),
         )
         .optional()?;
     let Some(asset) = asset else { return Ok(None) };
@@ -799,13 +835,13 @@ pub fn asset_catalog_links(db: &Db, id: i64) -> rusqlite::Result<Option<CatalogA
 mod feature_tests {
     use super::*;
     use std::cmp::Ordering;
-    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,has_categories:false} }
+    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,has_categories:false,display_categories:None,display_keywords:None} }
     #[test]
     fn filter_logic_supports_modes_and_groups() {
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
         let unrated = asset(1, "a.jpg", None, None);
         let rated = asset(2, "b.jpg", Some(10.0), Some(4));
-        let mut f = AssetFilter { kind:"folder".into(), id:None, root_id:None, include_children:false, folder_path:None, ids:None, value:None, query:None, sort:"name".into(), descending:false, offset:0, limit:100, rating_mode:Some("atLeast".into()), rating_value:Some(3), label_filter:None, tagged_only:false, file_group:Some("images".into()) };
+        let mut f = AssetFilter { kind:"folder".into(), id:None, root_id:None, include_children:false, folder_path:None, ids:None, value:None, query:None, sort:"name".into(), descending:false, offset:0, limit:100, rating_mode:Some("atLeast".into()), rating_value:Some(3), label_filter:None, tagged_only:false, include_categories:false,include_keywords:false,file_group:Some("images".into()) };
         assert!(asset_filter_matches(&rated, &f, &formats));
         assert!(!asset_filter_matches(&unrated, &f, &formats));
         f.rating_mode = Some("unrated".into());
@@ -818,11 +854,17 @@ mod feature_tests {
         c.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);CREATE TABLE categories(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);CREATE TABLE keywords(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER,PRIMARY KEY(asset_id,keyword_id));CREATE INDEX idx_asset_categories_category_asset ON asset_categories(category_id,asset_id);CREATE INDEX idx_asset_keywords_keyword_asset ON asset_keywords(keyword_id,asset_id);CREATE INDEX idx_categories_parent_id ON categories(parent_id);CREATE INDEX idx_keywords_parent_id ON keywords(parent_id);").unwrap();
         Arc::new(Mutex::new(c))
     }
-    fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None} }
+    fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,file_group:None} }
     #[test] fn special_items_use_listed_photos_and_relationships(){
         let db=test_db();db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,tagged,rating) VALUES(1,'a.jpg','jpg','jpg',1,10,1,4),(2,'b.doc','doc','doc',1,20,0,5),(3,'gone.jpg','jpg','jpg',0,30,1,3),(4,'d.png','png','png',1,40,0,NULL);INSERT INTO asset_categories VALUES(1,9),(2,9);INSERT INTO asset_keywords VALUES(1,8);").unwrap();
         for (kind,count) in [("all_photos",2),("uncategorized",1),("unkeyworded",1),("tagged",1)] { assert_eq!(assets_page(&db,&test_filter("special",kind),&FormatTable::parse(include_str!("../formats.json")).unwrap()).unwrap().total,count,"{kind}"); }
         assert_eq!(values_page(&db,"special",0,10,&FormatTable::parse(include_str!("../formats.json")).unwrap()).unwrap().iter().find(|v|v.value=="unkeyworded").unwrap().count,1);
+    }
+    #[test] fn keyword_subquery_is_only_selected_when_requested() {
+        let db=test_db(); db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size) VALUES(1,'a.jpg','jpg','jpg',1,10);INSERT INTO keywords(id,name) VALUES(1,'Rodina'),(2,'Príroda');INSERT INTO asset_keywords VALUES(1,1),(1,2);").unwrap();
+        let formats=FormatTable::parse(include_str!("../formats.json")).unwrap(); let mut f=test_filter("special","all_photos");
+        let without=assets_page(&db,&f,&formats).unwrap(); assert_eq!(without.items[0].display_keywords,None);
+        f.include_keywords=true; let with=assets_page(&db,&f,&formats).unwrap(); assert_eq!(with.items[0].display_keywords.as_deref(),Some("Príroda, Rodina"));
     }
     #[test] fn rating_query_uses_selected_value_and_excludes_unrated(){
         let db=test_db();db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,rating) VALUES(1,'one.jpg','jpg','jpg',1,1,1),(2,'three.jpg','jpg','jpg',1,1,3),(3,'five.jpg','jpg','jpg',1,1,5),(4,'none.jpg','jpg','jpg',1,1,NULL);").unwrap();
@@ -948,7 +990,7 @@ mod benches {
                 descending: false,
                 offset: 0,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -989,7 +1031,7 @@ mod benches {
                 descending: false,
                 offset: 3000,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -1044,7 +1086,7 @@ mod benches {
                 descending: false,
                 offset: 0,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -1068,7 +1110,7 @@ mod benches {
             kind: "category".into(), id: None, root_id: Some(root.id), include_children: true,
             folder_path: None, ids: None, value: None, query: None, sort: "name".into(),
             descending: false, offset: 0, limit: 100, rating_mode: None, rating_value: None,
-            label_filter: None, tagged_only: false, file_group: None,
+            label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
         }, &formats).unwrap();
         println!("largest category root (id {}, tree count {}, view total {}, first page {}): {:?}", root.id, root.count, page.total, page.items.len(), started.elapsed());
     }
@@ -1079,7 +1121,7 @@ mod benches {
         let db=Arc::new(Mutex::new(open_read_only(&db_path()).unwrap()));
         let formats=FormatTable::load();
         for value in ["all_photos","uncategorized","unkeyworded","tagged"] {
-            let t=Instant::now();let p=assets_page(&db,&AssetFilter{kind:"special".into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:100,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,file_group:None},&formats).unwrap();
+            let t=Instant::now();let p=assets_page(&db,&AssetFilter{kind:"special".into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:100,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,file_group:None},&formats).unwrap();
             println!("special {value}: total {}, first page {}, {:?}",p.total,p.items.len(),t.elapsed());
         }
     }

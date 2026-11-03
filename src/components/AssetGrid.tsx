@@ -3,6 +3,7 @@ import { useVirtualizer } from "@tanstack/react-virtual";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import type { Asset, CatalogAssetMetadata, FormatTable, Page, View, ViewFilters } from "../types";
+import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type ThumbnailInfoConfig } from "../thumbnailInfo";
 
 const PAGE_SIZE = 120;
 declare global { interface Window { __ddreamsShift?: boolean } }
@@ -31,10 +32,12 @@ type Props = {
   hoverMode?: "off"|"hover"|"shift";
   includeChildren: boolean;
   formats: FormatTable;
+  thumbnailInfo: ThumbnailInfoConfig;
+  onOpenThumbnailInfo: () => void;
   refreshToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, formats }: Props) {
+export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, formats, thumbnailInfo, onOpenThumbnailInfo }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const cache = useRef(new Map<number, Asset>());
   const pages = useRef(new Set<number>());
@@ -44,12 +47,19 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const [total, setTotal] = useState(0);
   const [itemsVersion, setItemsVersion] = useState(0);
   const [columns, setColumns] = useState(5);
+  const [tileMetadata, setTileMetadata] = useState(new Map<number, import("../types").TileExifMetadata>());
   const [rubber,setRubber]=useState<{x1:number;y1:number;x2:number;y2:number;add:boolean}|null>(null);
   const rubberRef=useRef<typeof rubber>(null);
-  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, rootId: view.rootId ?? null, includeChildren: (view.kind === "category" || view.kind === "keyword") && includeChildren, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending, ratingMode:filters.ratingMode??null,ratingValue:filters.ratingValue??null,labelFilter:filters.labelFilter??null,taggedOnly:filters.taggedOnly??false,fileGroup:filters.fileGroup??null,refreshToken }), [view, query, sort, descending, filters, includeChildren,refreshToken]);
+  const wantsCategories = thumbnailInfo.fields.some(field => field.id === "categories");
+  const wantsKeywords = thumbnailInfo.fields.some(field => field.id === "keywords");
+  const params = useMemo(() => ({ kind: view.kind, id: view.id ?? null, rootId: view.rootId ?? null, includeChildren: (view.kind === "category" || view.kind === "keyword") && includeChildren, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query, sort, descending, ratingMode:filters.ratingMode??null,ratingValue:filters.ratingValue??null,labelFilter:filters.labelFilter??null,taggedOnly:filters.taggedOnly??false,fileGroup:filters.fileGroup??null,includeCategories:wantsCategories,includeKeywords:wantsKeywords,refreshToken }), [view, query, sort, descending, filters, includeChildren, wantsCategories, wantsKeywords,refreshToken]);
   const paramsKey = JSON.stringify(params);
+  const paramsKeyRef = useRef(paramsKey);
+  paramsKeyRef.current = paramsKey;
   const tileWidth = zoom + 26;
-  const rowHeight = zoom + 58;
+  const infoLineCount = thumbnailInfo.fields.reduce((sum, field) => sum + field.lines, 0);
+  const infoHeight = Math.max(27, infoLineCount * 14);
+  const rowHeight = zoom + 30 + infoHeight;
 
   const fetchPage = useCallback(async (offset: number, version: number) => {
     const pageNo = Math.floor(offset / PAGE_SIZE);
@@ -66,6 +76,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   useEffect(() => {
     requestVersion.current++;
     cache.current.clear(); pages.current.clear(); setTotal(0); setItemsVersion(v => v + 1);
+    setTileMetadata(new Map());
     scrollRef.current?.scrollTo({ top: 0 });
     void fetchPage(0, requestVersion.current);
   }, [paramsKey, fetchPage]);
@@ -86,6 +97,29 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     const end = Math.min(total, (virtualRows[virtualRows.length - 1].index + 1) * columns);
     for (let offset = Math.floor(start / PAGE_SIZE) * PAGE_SIZE; offset < end; offset += PAGE_SIZE) void fetchPage(offset, requestVersion.current);
   }, [virtualRows, columns, total, fetchPage, itemsVersion]);
+
+  const visibleSignature = virtualRows.length ? `${virtualRows[0].index}:${virtualRows[virtualRows.length - 1].index}:${columns}:${itemsVersion}` : "";
+  const exifFields = thumbnailInfo.fields.map(field => field.id).filter(field => EXIF_THUMBNAIL_FIELDS.has(field));
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el || !visibleSignature || !exifFields.length) return;
+    const requestKey = paramsKey;
+    const timer = window.setTimeout(() => {
+      const first = Math.max(0, Math.floor(el.scrollTop / rowHeight) * columns);
+      const last = Math.min(total, Math.ceil((el.scrollTop + el.clientHeight) / rowHeight) * columns);
+      const ids: number[] = [];
+      for (let index = first; index < last; index++) {
+        const asset = getAt(index);
+        if (asset && !asset.isDirectory && !asset.offline && asset.path) ids.push(asset.id);
+      }
+      if (!ids.length) return;
+      void invoke<import("../types").TileExifMetadataItem[]>("get_thumbnail_metadata", { assetIds: ids, fields: exifFields }).then(items => {
+        if (requestKey !== paramsKeyRef.current) return;
+        setTileMetadata(current => { const next = new Map(current); for (const item of items) next.set(item.assetId, item); return next; });
+      }).catch(error => console.warn("EXIF údaje pod náhľadmi sa nepodarilo načítať", error));
+    }, 180);
+    return () => window.clearTimeout(timer);
+  }, [visibleSignature, paramsKey, exifFields.join(","), rowHeight, columns, total]);
 
   const getAt = (index: number) => cache.current.get(index);
   const fetchIds = async (extra: Record<string,unknown> = {}) => { const ids:number[]=[];for(let offset=0;offset<total;offset+=500){const batch=await invoke<number[]>("get_asset_ids",{filter:{...params,...extra,offset:0,limit:500},offset,limit:500});ids.push(...batch);if(batch.length<500)break;}return ids; };
@@ -145,7 +179,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -153,7 +187,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable }) {
+function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo }: { asset: Asset; size: number; epoch: number; selected: boolean; primary: boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void }) {
   const [broken, setBroken] = useState(false);
   const [offline, setOffline] = useState(false);
   const [retry, setRetry] = useState(0);
@@ -162,6 +196,33 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
   const format = formatFor(asset, formats);
   const badge = format?.group === "raw" ? ext.toUpperCase() : ext || "FILE";
   const label = asset.label?.trim();
+  const hasSizeLine = infoFields.some(field => field.id === "sizeKb" || field.id === "sizeAuto");
+  const displayValue = (id: string): string => {
+    const name = asset.name;
+    switch (id) {
+      case "name": return name;
+      case "baseName": return asset.ext && name.toLowerCase().endsWith(`.${asset.ext.toLowerCase()}`) ? name.slice(0, -(asset.ext.length + 1)) : name;
+      case "type": return format?.name ?? (ext || "FILE");
+      case "sizeKb": return formatKilobytes(asset.size);
+      case "sizeAuto": return formatBytes(asset.size);
+      case "folder": { const parts = asset.path?.replace(/[\\/]+$/, "").split(/[\\/]/).slice(0, -1) ?? []; return parts[parts.length - 1] ?? ""; }
+      case "modified": return formatSlovakDate(asset.fileModified);
+      case "resolution": return asset.width && asset.height ? `${asset.width} × ${asset.height}` : "";
+      case "dateTaken": return formatSlovakDate(asset.exifDate ?? tileMetadata?.dateTaken);
+      case "rating": return asset.rating ? `${asset.rating} / 5` : "";
+      case "caption": return asset.caption ?? "";
+      case "author": return asset.author ?? "";
+      case "categories": return asset.displayCategories ?? "";
+      case "keywords": return asset.displayKeywords ?? "";
+      case "iso": return tileMetadata?.iso ? `ISO ${tileMetadata.iso}` : "";
+      case "aperture": return tileMetadata?.aperture ?? "";
+      case "shutter": return tileMetadata?.shutter ?? "";
+      case "focalLength": return tileMetadata?.focalLength ?? "";
+      case "lens": return tileMetadata?.lens ?? "";
+      case "camera": return tileMetadata?.camera ?? "";
+      default: return "";
+    }
+  };
   const [menu,setMenu]=useState<{x:number;y:number}|null>(null);
   const [hoverMetadata,setHoverMetadata]=useState<CatalogAssetMetadata|null>(null);
   const [hover,setHover]=useState(false);const [popup,setPopup]=useState(false);const timer=useRef<number|undefined>(undefined);
@@ -189,10 +250,10 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
       {overlayMode>0&&asset.hasCategories && <span className="category-badge" title="Zaradené v kategórii">◆</span>}
       {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }} />}
       {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
-      {!asset.isDirectory && <span className="size-badge">{formatBytes(asset.size)}</span>}
+      {!asset.isDirectory && !hasSizeLine && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
-    <div className="tile-name">{asset.name}</div>
-    {menu&&createPortal(<div className="tile-context-menu" style={{left:Math.min(menu.x,window.innerWidth-225),top:Math.min(menu.y,window.innerHeight-125)}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected&&selectedIds.length?selectedIds:[asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button></div>,document.body)}
+    <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines }} title={text}>{text || "\u00a0"}</div>; })}</div>
+    {menu&&createPortal(<div className="tile-context-menu" style={{left:Math.min(menu.x,window.innerWidth-225),top:Math.min(menu.y,window.innerHeight-155)}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected && selectedIds.length ? selectedIds : [asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button><button onClick={()=>{setMenu(null);onOpenThumbnailInfo()}}>Údaje pod náhľadmi…</button></div>,document.body)}
     {popup && createPortal(
       <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>
         <div className="hover-image">{!asset.isDirectory && asset.path && <img src={thumbUrl(asset, 640, epoch)} />}</div>

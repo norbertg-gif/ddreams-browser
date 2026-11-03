@@ -68,7 +68,7 @@ impl ListingService {
                 id: self.id(), folder_id: matched_folder, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,
                 label: None, file_modified: None, exif_date: None, acdsee_date: None, md_dirty: None, is_orphan: None,
-                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, has_categories: false,
+                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, has_categories: false, display_categories: None, display_keywords: None,
             });
             asset.name = name;
             asset.ext = ext;
@@ -111,7 +111,9 @@ impl ListingService {
         dirs.extend(files);
         let total = dirs.len() as i64; let total_size=dirs.iter().filter(|a|!a.is_directory).map(|a|a.size.unwrap_or(0.0)).sum();
         let offset=filter.offset.max(0) as usize; let limit=filter.limit.clamp(1,500) as usize;
-        Ok(AssetPage { items: dirs.into_iter().skip(offset).take(limit).collect(), total, total_size })
+        let mut items=dirs.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        db::attach_display_values(&self.db,&mut items,filter.include_categories,filter.include_keywords).map_err(|e|e.to_string())?;
+        Ok(AssetPage { items, total, total_size })
     }
 
     pub fn asset(&self, id: i64) -> Option<Asset> { self.entries.lock().ok()?.get(&id).cloned() }
@@ -128,7 +130,7 @@ impl ListingService {
         let parent=if let Some(parent_path)=parent_path.filter(|p|!p.is_empty()&&normalize(p)!=key){self.resolve_folder(&parent_path)?}else{None};
         let name=path_buf.file_name().map(|n|n.to_string_lossy().to_string()).unwrap_or_else(||path.to_string());
         let id=self.id(); let parent_id=parent.as_ref().map(|p|p.id); let root_id=parent.as_ref().and_then(|p|p.root_id);
-        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,has_categories:false};
+        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,has_categories:false,display_categories:None,display_keywords:None};
         self.entries.lock().map_err(|_|"entry map poisoned")?.insert(id,asset);
         if let Some(parent_id)=parent_id{self.directory_parents.lock().map_err(|_|"folder map poisoned")?.insert(id,parent_id);}
         self.path_ids.lock().map_err(|_|"path map poisoned")?.insert(key,id);
