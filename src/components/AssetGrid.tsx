@@ -183,12 +183,12 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
           else setBroken(true);
         } catch { setBroken(true); }
       }} /> : <div className="file-placeholder"><span>{asset.isDirectory ? "📁" : offline || asset.offline ? "OFFLINE" : badge}</span>{(offline || asset.offline) && <small>Odpojené</small>}</div>}
-      {overlayMode>0&&!asset.isDirectory && <span className="type-badge">{badge}</span>}
-      {overlayMode>0&&!!asset.rating && <span className="rating-badge">{"★".repeat(Math.min(5, asset.rating))}</span>}
-      {overlayMode>0&&!!asset.tagged && <span className="tagged-badge">✓</span>}
-      {overlayMode>0&&asset.hasCategories && <span className="category-badge">◆</span>}
-      {overlayMode>0&&label && <span className="label-badge" style={{ backgroundColor: overlayMode===1?"#777":labelColor(label) }}>{labelText(label)}</span>}
-      {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge">OFFLINE</span>}
+      {overlayMode>0&&!asset.isDirectory && <span className="type-badge" title={`Typ súboru: ${badge}`}>{badge}</span>}
+      {overlayMode>0&&!!asset.rating && <span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}
+      {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
+      {overlayMode>0&&asset.hasCategories && <span className="category-badge" title="Zaradené v kategórii">◆</span>}
+      {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }}>{labelText(label)}</span>}
+      {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
       {!asset.isDirectory && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
     <div className="tile-name">{asset.name}</div>
