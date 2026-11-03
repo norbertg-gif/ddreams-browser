@@ -110,6 +110,7 @@ pub fn run() {
             commands::get_catalog_values,
             commands::get_metadata,
             commands::get_catalog_asset_metadata,
+            commands::get_catalog_asset_links,
             commands::set_thumbnail_epoch,
             commands::get_thumbnail_state
         ])

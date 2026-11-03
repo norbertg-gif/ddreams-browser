@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { Node as CatalogNode, Metadata, MetadataRow, Root, ValueCount, View } from "../types";
+import type { CatalogAssetLinks, Node as CatalogNode, Metadata, MetadataRow, Root, ValueCount, View } from "../types";
 import { labelColor, labelText } from "./AssetGrid";
+import { readStored, writeStored } from "../storage";
 
 type Props = { primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void };
 export default function RightPanel({ primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate }: Props) {
@@ -50,9 +51,9 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
     if (!blocks.length) return;
     const plural=(n:number,one:string,few:string,many:string)=>n===1?one:n>=2&&n<=4?few:many;
     const rowsText=`${rowCount} ${plural(rowCount,"riadok","riadky","riadkov")}`;
-    const message=ids.length===1?`Skop?rovan?: ${rowsText}`:`Skop?rovan?: ${rowsText} ? ${blocks.length} ${plural(blocks.length,"s?bor","s?bory","s?borov")}`;
+    const message=ids.length===1?`Skopírované: ${rowsText}`:`Skopírované: ${rowsText} · ${blocks.length} ${plural(blocks.length,"súbor","súbory","súborov")}`;
     try { await navigator.clipboard.writeText(blocks.join("\n\n")); setCopyMessage(message); }
-    catch { setCopyMessage("Kop?rovanie do schr?nky sa nepodarilo"); }
+    catch { setCopyMessage("Kopírovanie do schránky sa nepodarilo"); }
     setCopyMenu(false);
     if(toastTimer.current!==undefined)window.clearTimeout(toastTimer.current);
     toastTimer.current=window.setTimeout(() => setCopyMessage(""), 1500);
@@ -82,11 +83,11 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
       <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button><button onClick={() => void copy("section", "IPTC")}>Kopírovať celú sekciu IPTC</button><button onClick={() => void copy("section", "EXIF")}>Kopírovať celú sekciu EXIF</button><button onClick={() => void copy("section", "ACDSee")}>Kopírovať celú sekciu ACDSee</button><button onClick={() => void copy("section", "Ostatné")}>Kopírovať celú sekciu Ostatné</button></div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
-    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} />}
+    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} />}
   </aside>;
 }
 
-function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void }) {
+function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, primaryId }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null }) {
   const [roots,setRoots]=useState<Root[]>([]);
   const [openRoots,setOpenRoots]=useState(new Set<number>());
   const [cats,setCats]=useState(new Map<number,CatalogNode[]>());
@@ -101,6 +102,19 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange }: 
   const [ratings,setRatings]=useState<ValueCount[]>([]);
   const [labels,setLabels]=useState<ValueCount[]>([]);
   const [special,setSpecial]=useState<ValueCount[]>([]);
+  const [links,setLinks]=useState<CatalogAssetLinks|null>(null);
+  const [collapsed,setCollapsed]=useState<Record<string,boolean>>(()=>readStored("ddreams.catalogCollapsed",{}));
+  const linksRequest=useRef(0);
+  const labelTimer=useRef<number|undefined>(undefined);
+
+  useEffect(()=>writeStored("ddreams.catalogCollapsed",collapsed),[collapsed]);
+  useEffect(()=>{
+    const request=++linksRequest.current;
+    setLinks(null);
+    if(primaryId==null)return;
+    void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(value=>{if(linksRequest.current===request)setLinks(value)}).catch(()=>{if(linksRequest.current===request)setLinks(null)});
+    return()=>{linksRequest.current++};
+  },[primaryId]);
 
   useEffect(()=>{
     let active=true;
@@ -120,41 +134,61 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange }: 
 
   useEffect(()=>{
     if(!keywordQuery.trim()){setKeywordResults([]);setCategoryResults([]);return;}
+    let active=true;
     const timer=window.setTimeout(()=>{void Promise.all([
       invoke<CatalogNode[]>("search_catalog_tree",{kind:"category",query:keywordQuery,includeChildren,offset:0,limit:500}),
       invoke<CatalogNode[]>("search_catalog_tree",{kind:"keyword",query:keywordQuery,includeChildren,offset:0,limit:500})
-    ]).then(([c,k])=>{setCategoryResults(c);setKeywordResults(k)});},180);
-    return()=>window.clearTimeout(timer);
+    ]).then(([c,k])=>{if(active){setCategoryResults(c);setKeywordResults(k)}});},180);
+    return()=>{active=false;window.clearTimeout(timer)};
   },[keywordQuery,includeChildren]);
 
+  const toggleSection=(key:string)=>setCollapsed(p=>({...p,[key]:!p[key]}));
   const toggleRoot=async(root:Root)=>{
     if(openRoots.has(root.id)){setOpenRoots(p=>{const n=new Set(p);n.delete(root.id);return n});return;}
     setOpenRoots(p=>new Set(p).add(root.id));
     if(!cats.has(root.id)){const nodes=await invoke<CatalogNode[]>("get_catalog_nodes",{kind:"category",parentId:null,rootId:root.id,includeChildren,offset:0,limit:500});setCats(p=>new Map(p).set(root.id,nodes));}
   };
   const toggleCat=async(node:CatalogNode)=>{
+    if(!node.hasChildren)return;
     if(openCats.has(node.id)){setOpenCats(p=>{const n=new Set(p);n.delete(node.id);return n});return;}
     setOpenCats(p=>new Set(p).add(node.id));
     if(!catChildren.has(node.id)){const nodes=await invoke<CatalogNode[]>("get_catalog_nodes",{kind:"category",parentId:node.id,rootId:node.rootId,includeChildren,offset:0,limit:500});setCatChildren(p=>new Map(p).set(node.id,nodes));}
   };
   const toggleKeyword=async(node:CatalogNode)=>{
+    if(!node.hasChildren)return;
     if(openKeywords.has(node.id)){setOpenKeywords(p=>{const n=new Set(p);n.delete(node.id);return n});return;}
     setOpenKeywords(p=>new Set(p).add(node.id));
     if(!keywordChildren.has(node.id)){const nodes=await invoke<CatalogNode[]>("get_catalog_nodes",{kind:"keyword",parentId:node.id,rootId:null,includeChildren,offset:0,limit:500});setKeywordChildren(p=>new Map(p).set(node.id,nodes));}
   };
+  const delayLabelClick=(action:()=>void)=>{if(labelTimer.current!==undefined)window.clearTimeout(labelTimer.current);labelTimer.current=window.setTimeout(action,450);};
+  const cancelLabelClick=()=>{if(labelTimer.current!==undefined){window.clearTimeout(labelTimer.current);labelTimer.current=undefined;}};
   const navigateCategory=(node:CatalogNode)=>onNavigate({kind:"category",id:node.id,title:`Kategória: ${node.name}`});
-  const navigateCategoryRoot=(root:Root)=>onNavigate({kind:"category",rootId:root.id,title:`Kategória: ${root.name}`});
+  const navigateCategoryRoot=(root:Root)=>onNavigate({kind:"category",id:root.mergedCategoryId??undefined,rootId:root.mergedCategoryId==null?root.id:undefined,title:`Kategória: ${root.name}`});
+  const navigateRoot=(root:Root)=>{if(root.mergedCategoryId!=null)navigateCategoryRoot(root);else if(includeChildren)navigateCategoryRoot(root);else void toggleRoot(root);};
   const navigateKeyword=(node:CatalogNode)=>onNavigate({kind:"keyword",id:node.id,title:`Kľúčové slovo: ${node.name}`});
   const filteredKeywords=keywordQuery.trim()?keywordResults:keywords;
+  const assignedCategory=(id:number)=>links?.categoryIds.includes(id)??false;
+  const categoryAncestor=(id:number)=>links?.categoryAncestorIds.includes(id)??false;
+  const assignedKeyword=(id:number)=>links?.keywordIds.includes(id)??false;
+  const keywordAncestor=(id:number)=>links?.keywordAncestorIds.includes(id)??false;
+  const rootRelated=(id:number)=>links?.rootIds.includes(id)??false;
+  const sectionHead=(key:string,title:string,tools?:ReactNode)=><div className="catalog-section-heading"><button onClick={()=>toggleSection(key)} aria-expanded={!collapsed[key]}><span>{collapsed[key]?"▸":"▾"}</span>{title}</button>{tools}</div>;
+  const categoryTools=<><button className="collapse-all" onClick={()=>{setOpenRoots(new Set());setOpenCats(new Set())}}>Zbaliť všetko</button><label className="include-children"><input type="checkbox" checked={includeChildren} onChange={e=>onIncludeChildrenChange(e.target.checked)}/>Vrátane podkategórií</label></>;
+  const keywordTools=<button className="collapse-all" onClick={()=>setOpenKeywords(new Set())}>Zbaliť všetko</button>;
   return <div className="catalog-content">
     <input className="keyword-filter" value={keywordQuery} onChange={e=>setKeywordQuery(e.target.value)} placeholder="Filtrovať kategórie a keywordy…" />
-    {keywordQuery.trim()&&<section className="catalog-section"><div className="section-heading">Zhody kategórií</div>{categoryResults.map(node=><button className="tree-row tree-label keyword-result" key={node.id} onClick={()=>navigateCategory(node)}>{node.name}<small>{node.count}</small></button>)}</section>}
-    <section className="catalog-section"><div className="section-heading">Špeciálne položky</div>{[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["tagged","Označené"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section>
-    <section className="catalog-section"><div className="section-heading category-heading"><span>Kategórie</span><label><input type="checkbox" checked={includeChildren} onChange={e=>onIncludeChildrenChange(e.target.checked)}/>Vrátane podkategórií</label></div>{roots.map(root=><div key={root.id}><div className="tree-row"><button className="tree-toggle" onClick={()=>void toggleRoot(root)}>{openRoots.has(root.id)?"▾":"▸"}</button><button className="tree-label" onClick={()=>includeChildren?navigateCategoryRoot(root):void toggleRoot(root)}><span className="category-icon">◈</span>{root.name}<small>{root.count||""}</small></button></div>{openRoots.has(root.id)&&(cats.get(root.id)??[]).map(cat=><CategoryNode key={cat.id} node={cat} depth={1} open={openCats} childrenMap={catChildren} onToggle={toggleCat} onNavigate={navigateCategory}/>)}</div>)}</section>
-    <section className="catalog-section"><div className="section-heading">Hodnotenie</div>{ratings.map(r=><button className="value-row" key={r.value} onClick={()=>onNavigate({kind:"rating",value:r.value,title:r.value==="unrated"?"Bez hodnotenia":`Hodnotenie ${r.value} ★`})}><span>{r.value==="unrated"?"Bez hodnotenia":"★".repeat(Number(r.value))}</span><small>{r.count}</small></button>)}</section>
-    <section className="catalog-section"><div className="section-heading">Farebné štítky</div>{labels.filter(l=>l.value).map(l=><button className="value-row" key={l.value} onClick={()=>onNavigate({kind:"label",value:l.value,title:`Farebný štítok: ${labelText(l.value)}`})}><span><i className="label-dot" style={{background:labelColor(l.value)}}/>{labelText(l.value)}</span><small>{l.count}</small></button>)}</section>
-    <section className="catalog-section keyword-section"><div className="section-heading">Kľúčové slová</div><input className="keyword-filter" value={keywordQuery} onChange={e=>setKeywordQuery(e.target.value)} placeholder="Filtrovať..."/>{filteredKeywords.map(node=>keywordQuery?<button className="tree-row tree-label keyword-result" key={node.id} onClick={()=>navigateKeyword(node)}>{node.name}<small>{node.count}</small></button>:<KeywordNode key={node.id} node={node} depth={0} open={openKeywords} childrenMap={keywordChildren} onToggle={toggleKeyword} onNavigate={navigateKeyword}/>)}</section>
+    {keywordQuery.trim()&&<section className="catalog-section">{sectionHead("matches","Zhody kategórií")}{!collapsed.matches&&categoryResults.map(node=><button className={`tree-row tree-label keyword-result ${assignedCategory(node.id)?"catalog-assigned":categoryAncestor(node.id)?"catalog-ancestor":""}`} key={node.id} onClick={()=>navigateCategory(node)}><span>{assignedCategory(node.id)?"✓":categoryAncestor(node.id)?"•":""}</span>{node.name}<small>{node.count}</small></button>)}</section>}
+    <section className="catalog-section">{sectionHead("special","Špeciálne položky")}{!collapsed.special&&[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["tagged","Označené"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section>
+    <section className="catalog-section">{sectionHead("categories","Kategórie",categoryTools)}{!collapsed.categories&&roots.map(root=>{
+      const direct=root.mergedCategoryId!=null&&assignedCategory(root.mergedCategoryId);
+      const related=rootRelated(root.id)&&!direct;
+      return <div key={root.id}><div className="tree-row"><TreeArrow visible={root.hasChildren} open={openRoots.has(root.id)} onClick={()=>void toggleRoot(root)}/><button className={`tree-label ${direct?"catalog-assigned":related?"catalog-ancestor":""}`} onClick={e=>{if(e.detail<=1)delayLabelClick(()=>navigateRoot(root));}} onDoubleClick={()=>{cancelLabelClick();void toggleRoot(root);}}><span className="category-icon">◈</span><span className="tree-text">{direct?"✓ ":related?"• ":""}{root.name}</span><small>{root.count||""}</small></button></div>{openRoots.has(root.id)&&(cats.get(root.id)??[]).map(cat=><CategoryNode key={cat.id} node={cat} depth={1} open={openCats} childrenMap={catChildren} onToggle={toggleCat} onNavigate={navigateCategory} onLabelClick={delayLabelClick} onLabelDoubleClick={cancelLabelClick} assignedIds={new Set(links?.categoryIds??[])} ancestorIds={new Set(links?.categoryAncestorIds??[])}/>)}</div>;
+    })}</section>
+    <section className="catalog-section">{sectionHead("ratings","Hodnotenie")}{!collapsed.ratings&&ratings.map(r=><button className="value-row" key={r.value} onClick={()=>onNavigate({kind:"rating",value:r.value,title:r.value==="unrated"?"Bez hodnotenia":`Hodnotenie ${r.value} ★`})}><span>{r.value==="unrated"?"Bez hodnotenia":"★".repeat(Number(r.value))}</span><small>{r.count}</small></button>)}</section>
+    <section className="catalog-section">{sectionHead("labels","Farebné štítky")}{!collapsed.labels&&labels.filter(l=>l.value).map(l=><button className="value-row" key={l.value} onClick={()=>onNavigate({kind:"label",value:l.value,title:`Farebný štítok: ${labelText(l.value)}`})}><span><i className="label-dot" style={{background:labelColor(l.value)}}/>{labelText(l.value)}</span><small>{l.count}</small></button>)}</section>
+    <section className="catalog-section keyword-section">{sectionHead("keywords","Kľúčové slová",keywordTools)}{!collapsed.keywords&&filteredKeywords.map(node=>keywordQuery?<button className={`tree-row tree-label keyword-result ${assignedKeyword(node.id)?"catalog-assigned":keywordAncestor(node.id)?"catalog-ancestor":""}`} key={node.id} onClick={()=>navigateKeyword(node)}><span>{assignedKeyword(node.id)?"✓":keywordAncestor(node.id)?"•":""}</span>{node.name}<small>{node.count}</small></button>:<KeywordNode key={node.id} node={node} depth={0} open={openKeywords} childrenMap={keywordChildren} onToggle={toggleKeyword} onNavigate={navigateKeyword} onLabelClick={delayLabelClick} onLabelDoubleClick={cancelLabelClick} assignedIds={new Set(links?.keywordIds??[])} ancestorIds={new Set(links?.keywordAncestorIds??[])}/>)}</section>
   </div>;
 }
-function CategoryNode({node,depth,open,childrenMap,onToggle,onNavigate}:{node:CatalogNode;depth:number;open:Set<number>;childrenMap:Map<number,CatalogNode[]>;onToggle:(node:CatalogNode)=>void;onNavigate:(node:CatalogNode)=>void}){return <div><div className="tree-row" style={{paddingLeft:8+depth*14}}><button className="tree-toggle" onClick={()=>onToggle(node)}>{open.has(node.id)?"▾":"▸"}</button><button className="tree-label" onClick={()=>onNavigate(node)}><span className="category-icon">▤</span><span className="tree-text">{node.name}</span><small>{node.count||""}</small></button></div>{open.has(node.id)&&(childrenMap.get(node.id)??[]).map(child=><CategoryNode key={child.id} node={child} depth={depth+1} open={open} childrenMap={childrenMap} onToggle={onToggle} onNavigate={onNavigate}/>)}</div>}
-function KeywordNode({node,depth,open,childrenMap,onToggle,onNavigate}:{node:CatalogNode;depth:number;open:Set<number>;childrenMap:Map<number,CatalogNode[]>;onToggle:(node:CatalogNode)=>void;onNavigate:(node:CatalogNode)=>void}){return <div><div className="tree-row" style={{paddingLeft:8+depth*14}}><button className="tree-toggle" onClick={()=>onToggle(node)}>{open.has(node.id)?"▾":"▸"}</button><button className="tree-label" onClick={()=>onNavigate(node)}><span className="keyword-icon">⌑</span><span className="tree-text">{node.name}</span><small>{node.count||""}</small></button></div>{open.has(node.id)&&(childrenMap.get(node.id)??[]).map(child=><KeywordNode key={child.id} node={child} depth={depth+1} open={open} childrenMap={childrenMap} onToggle={onToggle} onNavigate={onNavigate}/>)}</div>}
+function TreeArrow({visible,open,onClick}:{visible:boolean;open:boolean;onClick:()=>void}){return visible?<button className="tree-toggle" aria-label={open?"Zbaliť":"Rozbaliť"} onClick={onClick}>{open?"▾":"▸"}</button>:<span className="tree-toggle-placeholder"/>;}
+function CategoryNode({node,depth,open,childrenMap,onToggle,onNavigate,onLabelClick,onLabelDoubleClick,assignedIds,ancestorIds}:{node:CatalogNode;depth:number;open:Set<number>;childrenMap:Map<number,CatalogNode[]>;onToggle:(node:CatalogNode)=>void;onNavigate:(node:CatalogNode)=>void;onLabelClick:(action:()=>void)=>void;onLabelDoubleClick:()=>void;assignedIds:Set<number>;ancestorIds:Set<number>}){const assigned=assignedIds.has(node.id),ancestor=!assigned&&ancestorIds.has(node.id);return <div><div className="tree-row" style={{paddingLeft:8+depth*14}}><TreeArrow visible={node.hasChildren} open={open.has(node.id)} onClick={()=>onToggle(node)}/><button className={`tree-label ${assigned?"catalog-assigned":ancestor?"catalog-ancestor":""}`} onClick={e=>{if(e.detail<=1)onLabelClick(()=>onNavigate(node));}} onDoubleClick={()=>{onLabelDoubleClick();onToggle(node);}}><span className="category-icon">{assigned?"✓":ancestor?"•":"▤"}</span><span className="tree-text">{node.name}</span><small>{node.count||""}</small></button></div>{open.has(node.id)&&(childrenMap.get(node.id)??[]).map(child=><CategoryNode key={child.id} node={child} depth={depth+1} open={open} childrenMap={childrenMap} onToggle={onToggle} onNavigate={onNavigate} onLabelClick={onLabelClick} onLabelDoubleClick={onLabelDoubleClick} assignedIds={assignedIds} ancestorIds={ancestorIds}/>)}</div>}
+function KeywordNode({node,depth,open,childrenMap,onToggle,onNavigate,onLabelClick,onLabelDoubleClick,assignedIds,ancestorIds}:{node:CatalogNode;depth:number;open:Set<number>;childrenMap:Map<number,CatalogNode[]>;onToggle:(node:CatalogNode)=>void;onNavigate:(node:CatalogNode)=>void;onLabelClick:(action:()=>void)=>void;onLabelDoubleClick:()=>void;assignedIds:Set<number>;ancestorIds:Set<number>}){const assigned=assignedIds.has(node.id),ancestor=!assigned&&ancestorIds.has(node.id);return <div><div className="tree-row" style={{paddingLeft:8+depth*14}}><TreeArrow visible={node.hasChildren} open={open.has(node.id)} onClick={()=>onToggle(node)}/><button className={`tree-label ${assigned?"catalog-assigned":ancestor?"catalog-ancestor":""}`} onClick={e=>{if(e.detail<=1)onLabelClick(()=>onNavigate(node));}} onDoubleClick={()=>{onLabelDoubleClick();onToggle(node);}}><span className="keyword-icon">{assigned?"✓":ancestor?"•":"⌑"}</span><span className="tree-text">{node.name}</span><small>{node.count||""}</small></button></div>{open.has(node.id)&&(childrenMap.get(node.id)??[]).map(child=><KeywordNode key={child.id} node={child} depth={depth+1} open={open} childrenMap={childrenMap} onToggle={onToggle} onNavigate={onNavigate} onLabelClick={onLabelClick} onLabelDoubleClick={onLabelDoubleClick} assignedIds={assignedIds} ancestorIds={ancestorIds}/>)}</div>}

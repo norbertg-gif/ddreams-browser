@@ -95,6 +95,8 @@ pub struct CatalogNode {
     pub root_id: Option<i64>,
     pub name: String,
     pub count: i64,
+    #[serde(default)]
+    pub has_children: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -118,6 +120,20 @@ pub struct Root {
     pub id: i64,
     pub name: String,
     pub count: i64,
+    #[serde(default)]
+    pub merged_category_id: Option<i64>,
+    #[serde(default)]
+    pub has_children: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogAssetLinks {
+    pub category_ids: Vec<i64>,
+    pub category_ancestor_ids: Vec<i64>,
+    pub keyword_ids: Vec<i64>,
+    pub keyword_ancestor_ids: Vec<i64>,
+    pub root_ids: Vec<i64>,
 }
 
 fn map_asset(row: &rusqlite::Row<'_>) -> rusqlite::Result<Asset> {
@@ -532,15 +548,47 @@ pub fn folder_ancestors(db: &Db, id: i64) -> rusqlite::Result<Vec<Folder>> {
     Ok(result)
 }
 
+fn category_root_matches(conn: &Connection, root_id: i64) -> rusqlite::Result<Option<i64>> {
+    let root_name: String = conn.query_row("SELECT name FROM category_roots WHERE id=?", [root_id], |r| r.get(0))?;
+    let mut stmt = conn.prepare("SELECT id,name FROM categories WHERE root_id=? AND (parent_id IS NULL OR parent_id=0)")?;
+    let candidates = stmt.query_map([root_id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let wanted = root_name.trim().to_lowercase();
+    Ok(candidates.into_iter().find(|(_, name)| name.trim().to_lowercase() == wanted).map(|(id, _)| id))
+}
+
 pub fn roots_page(db: &Db, offset: i64, limit: i64, include_children: bool) -> rusqlite::Result<Vec<Root>> {
     let conn = db.lock().unwrap();
-    let sql = if include_children {
-        "WITH RECURSIVE closure(root_id,id) AS (SELECT root_id,id FROM categories WHERE parent_id IS NULL OR parent_id=0 UNION SELECT closure.root_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id), counts AS (SELECT closure.root_id,count(DISTINCT ac.asset_id) n FROM closure JOIN asset_categories ac ON ac.category_id=closure.id JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.root_id) SELECT r.id,r.name,coalesce(counts.n,0) FROM category_roots r LEFT JOIN counts ON counts.root_id=r.id ORDER BY r.name COLLATE NOCASE,r.id LIMIT ? OFFSET ?"
-    } else {
-        "WITH counts AS (SELECT c.root_id,count(DISTINCT ac.asset_id) n FROM categories c JOIN asset_categories ac ON ac.category_id=c.id JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 WHERE c.parent_id IS NULL OR c.parent_id=0 GROUP BY c.root_id) SELECT r.id,r.name,coalesce(counts.n,0) FROM category_roots r LEFT JOIN counts ON counts.root_id=r.id ORDER BY r.name COLLATE NOCASE,r.id LIMIT ? OFFSET ?"
-    };
-    let mut stmt = conn.prepare(sql)?;
-    stmt.query_map(params![limit.clamp(1, 500), offset.max(0)], |r| Ok(Root { id: r.get(0)?, name: r.get(1)?, count: r.get(2)? }))?.collect()
+    let mut roots = conn.prepare("SELECT id,name FROM category_roots ORDER BY name COLLATE NOCASE,id LIMIT ? OFFSET ?")?;
+    let rows = roots.query_map(params![limit.clamp(1, 500), offset.max(0)], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut top_stmt=conn.prepare("SELECT c.id,c.root_id,c.name,EXISTS(SELECT 1 FROM categories child WHERE child.parent_id=c.id) FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0")?;
+    let top=top_stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?,r.get::<_,bool>(3)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut seeds=Vec::<(i64,i64)>::new();
+    let mut root_data=Vec::with_capacity(rows.len());
+    for (id,name) in rows {
+        let candidates=top.iter().filter(|item|item.1==id).collect::<Vec<_>>();
+        let wanted=name.trim().to_lowercase();
+        let merged=candidates.iter().find(|item|item.2.trim().to_lowercase()==wanted).map(|item|item.0);
+        if let Some(category_id)=merged { seeds.push((id,category_id)); }
+        else { seeds.extend(candidates.iter().map(|item|(id,item.0))); }
+        let has_children=if let Some(category_id)=merged {
+            candidates.iter().any(|item|item.0!=category_id)||candidates.iter().any(|item|item.0==category_id&&item.3)
+        } else { !candidates.is_empty() };
+        root_data.push((id,name,merged,has_children));
+    }
+    let mut counts=std::collections::HashMap::<i64,i64>::new();
+    if !seeds.is_empty() {
+        let values=vec!["(?,?)";seeds.len()].join(",");
+        let recursion=if include_children {"WITH RECURSIVE root_seeds(root_id,seed_id) AS (VALUES __VALUES__), d(root_id,seed_id,id) AS (SELECT root_id,seed_id,seed_id FROM root_seeds UNION SELECT d.root_id,d.seed_id,c.id FROM d JOIN categories c ON c.parent_id=d.id AND c.root_id=d.root_id)"} else {"WITH root_seeds(root_id,seed_id) AS (VALUES __VALUES__), d(root_id,seed_id,id) AS (SELECT root_id,seed_id,seed_id FROM root_seeds)"};
+        let sql=format!("{} SELECT d.root_id,count(DISTINCT ac.asset_id) FROM d CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=d.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY d.root_id",recursion.replace("__VALUES__",&values));
+        let mut args:Vec<rusqlite::types::Value>=Vec::with_capacity(seeds.len()*2); for (root_id,seed_id) in seeds {args.push(root_id.into());args.push(seed_id.into());}
+        let mut stmt=conn.prepare(&sql)?;
+        for row in stmt.query_map(rusqlite::params_from_iter(args.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?)))? {let (id,count)=row?;counts.insert(id,count);}
+    }
+    let mut result = Vec::with_capacity(root_data.len());
+    for (id,name,merged_category_id,has_children) in root_data {
+        result.push(Root { id, name, count:*counts.get(&id).unwrap_or(&0), merged_category_id, has_children });
+    }
+    Ok(result)
 }
 
 pub fn nodes_page(
@@ -555,11 +603,26 @@ pub fn nodes_page(
     let conn = db.lock().unwrap();
     if table == "category" {
         let root_value = root_id.map(rusqlite::types::Value::Integer).unwrap_or(rusqlite::types::Value::Null);
+        if parent_id.is_none() {
+            if let Some(root) = root_id {
+                if let Some(merged_id) = category_root_matches(&conn, root)? {
+                    let (sql, args): (&str, Vec<rusqlite::types::Value>) = if include_children {
+                        ("WITH RECURSIVE closure(ancestor_id,id) AS (SELECT id,id FROM categories WHERE root_id=? UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id WHERE c.root_id=?), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=closure.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT n.id,n.parent_id,n.root_id,n.name,coalesce(counts.n,0),EXISTS(SELECT 1 FROM categories child WHERE child.parent_id=n.id) FROM categories n LEFT JOIN counts ON counts.ancestor_id=n.id WHERE (n.parent_id=? OR ((n.parent_id IS NULL OR n.parent_id=0) AND n.id<>?)) AND n.root_id=? ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+                            vec![root.into(),root.into(),merged_id.into(),merged_id.into(),root.into(),limit.clamp(1,500).into(),offset.max(0).into()])
+                    } else {
+                        ("SELECT n.id,n.parent_id,n.root_id,n.name,count(DISTINCT ac.asset_id),EXISTS(SELECT 1 FROM categories child WHERE child.parent_id=n.id) FROM categories n LEFT JOIN asset_categories ac ON ac.category_id=n.id LEFT JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 WHERE (n.parent_id=? OR ((n.parent_id IS NULL OR n.parent_id=0) AND n.id<>?)) AND n.root_id=? GROUP BY n.id ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+                            vec![merged_id.into(),merged_id.into(),root.into(),limit.clamp(1,500).into(),offset.max(0).into()])
+                    };
+                    let mut stmt=conn.prepare(sql)?;
+                    return stmt.query_map(rusqlite::params_from_iter(args.iter()), |r| Ok(CatalogNode { id:r.get(0)?, parent_id:r.get(1)?, root_id:r.get(2)?, name:r.get(3)?, count:r.get(4)?, has_children:r.get(5)? }))?.collect();
+                }
+            }
+        }
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = if include_children {
-            ("WITH RECURSIVE closure(ancestor_id,id) AS (SELECT id,id FROM categories WHERE (? IS NULL OR root_id=?) UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id WHERE (? IS NULL OR c.root_id=?)), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure JOIN asset_categories ac ON ac.category_id=closure.id JOIN assets a ON a.id=ac.asset_id WHERE a.is_listed=1 GROUP BY closure.ancestor_id) SELECT n.id,n.parent_id,n.root_id,n.name,coalesce(counts.n,0) FROM categories n LEFT JOIN counts ON counts.ancestor_id=n.id WHERE coalesce(n.parent_id,0)=? AND (? IS NULL OR n.root_id=?) ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+            ("WITH RECURSIVE closure(ancestor_id,id) AS (SELECT id,id FROM categories WHERE (? IS NULL OR root_id=?) UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id WHERE (? IS NULL OR c.root_id=?)), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=closure.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT n.id,n.parent_id,n.root_id,n.name,coalesce(counts.n,0),EXISTS(SELECT 1 FROM categories child WHERE child.parent_id=n.id) FROM categories n LEFT JOIN counts ON counts.ancestor_id=n.id WHERE coalesce(n.parent_id,0)=? AND (? IS NULL OR n.root_id=?) ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
                 vec![root_value.clone(),root_value.clone(),root_value.clone(),root_value.clone(),parent_id.unwrap_or(0).into(),root_value.clone(),root_value.clone(),limit.clamp(1,500).into(),offset.max(0).into()])
         } else {
-            ("SELECT n.id,n.parent_id,n.root_id,n.name,count(DISTINCT ac.asset_id) FROM categories n LEFT JOIN asset_categories ac ON ac.category_id=n.id JOIN (SELECT ? AS parent_filter, ? AS root_filter) p WHERE coalesce(n.parent_id,0)=p.parent_filter AND (p.root_filter IS NULL OR n.root_id=p.root_filter) GROUP BY n.id ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+            ("SELECT n.id,n.parent_id,n.root_id,n.name,count(DISTINCT ac.asset_id),EXISTS(SELECT 1 FROM categories child WHERE child.parent_id=n.id) FROM categories n LEFT JOIN asset_categories ac ON ac.category_id=n.id LEFT JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 JOIN (SELECT ? AS parent_filter, ? AS root_filter) p WHERE coalesce(n.parent_id,0)=p.parent_filter AND (p.root_filter IS NULL OR n.root_id=p.root_filter) GROUP BY n.id ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
                 vec![parent_id.unwrap_or(0).into(),root_value,limit.clamp(1,500).into(),offset.max(0).into()])
         };
         let mut stmt = conn.prepare(sql)?;
@@ -572,16 +635,17 @@ pub fn nodes_page(
                     root_id: r.get(2)?,
                     name: r.get(3)?,
                     count: r.get(4)?,
+                    has_children: r.get(5)?,
                 })
             },
         )?
         .collect()
     } else {
         let (sql, args): (&str, Vec<rusqlite::types::Value>) = if include_children {
-            ("WITH RECURSIVE closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure JOIN asset_keywords ak ON ak.keyword_id=closure.id JOIN assets a ON a.id=ak.asset_id WHERE a.is_listed=1 GROUP BY closure.ancestor_id) SELECT n.id,n.parent_id,NULL,n.name,coalesce(counts.n,0) FROM keywords n LEFT JOIN counts ON counts.ancestor_id=n.id WHERE coalesce(n.parent_id,0)=? ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+            ("WITH RECURSIVE closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure CROSS JOIN asset_keywords ak INDEXED BY idx_asset_keywords_keyword_asset CROSS JOIN assets a WHERE ak.keyword_id=closure.id AND a.id=ak.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT n.id,n.parent_id,NULL,n.name,coalesce(counts.n,0),EXISTS(SELECT 1 FROM keywords child WHERE child.parent_id=n.id) FROM keywords n LEFT JOIN counts ON counts.ancestor_id=n.id WHERE coalesce(n.parent_id,0)=? ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
                 vec![parent_id.unwrap_or(0).into(),limit.clamp(1,500).into(),offset.max(0).into()])
         } else {
-            ("SELECT n.id,n.parent_id,NULL,n.name,count(DISTINCT ak.asset_id) FROM keywords n LEFT JOIN asset_keywords ak ON ak.keyword_id=n.id WHERE coalesce(n.parent_id,0)=? GROUP BY n.id ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
+            ("SELECT n.id,n.parent_id,NULL,n.name,count(DISTINCT ak.asset_id),EXISTS(SELECT 1 FROM keywords child WHERE child.parent_id=n.id) FROM keywords n LEFT JOIN asset_keywords ak ON ak.keyword_id=n.id WHERE coalesce(n.parent_id,0)=? GROUP BY n.id ORDER BY n.name COLLATE NOCASE,n.id LIMIT ? OFFSET ?",
                 vec![parent_id.unwrap_or(0).into(),limit.clamp(1,500).into(),offset.max(0).into()])
         };
         let mut stmt = conn.prepare(sql)?;
@@ -594,6 +658,7 @@ pub fn nodes_page(
                     root_id: None,
                     name: r.get(3)?,
                     count: r.get(4)?,
+                    has_children: r.get(5)?,
                 })
             },
         )?
@@ -622,6 +687,7 @@ pub fn keyword_search_page(
                 root_id: None,
                 name: r.get(3)?,
                 count: r.get(4)?,
+                has_children: false,
             })
         },
     )?
@@ -632,16 +698,24 @@ pub fn catalog_tree_search(db:&Db, kind:&str, query:&str, offset:i64, limit:i64,
     let conn=db.lock().unwrap();
     let sql=if kind=="category" {
         if include_children {
-            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM categories UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure JOIN asset_categories ac ON ac.category_id=closure.id JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,t.root_id,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM categories UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=closure.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,t.root_id,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
         } else {
             "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,t.root_id,t.path,(SELECT count(DISTINCT ac.asset_id) FROM asset_categories ac JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 WHERE ac.category_id=t.id) FROM t WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
         }
     } else if include_children {
-        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure JOIN asset_keywords ak ON ak.keyword_id=closure.id JOIN assets a ON a.id=ak.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,NULL,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure CROSS JOIN asset_keywords ak INDEXED BY idx_asset_keywords_keyword_asset CROSS JOIN assets a WHERE ak.keyword_id=closure.id AND a.id=ak.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,NULL,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
     } else {
         "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,NULL,t.path,(SELECT count(DISTINCT ak.asset_id) FROM asset_keywords ak JOIN assets a ON a.id=ak.asset_id AND a.is_listed=1 WHERE ak.keyword_id=t.id) FROM t WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
     };
-    let mut stmt=conn.prepare(sql)?;stmt.query_map(params![format!("%{}%",query.replace('%',"\\%").replace('_',"\\_")),limit.clamp(1,500),offset.max(0)],|r|Ok(CatalogNode{id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,count:r.get(4)?}))?.collect()
+    let mut stmt=conn.prepare(sql)?;
+    let mut nodes=stmt.query_map(params![format!("%{}%",query.replace('%',"\\%").replace('_',"\\_")),limit.clamp(1,500),offset.max(0)],|r|Ok(CatalogNode{id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,count:r.get(4)?,has_children:false}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    if kind=="category" {
+        for node in &mut nodes {
+            let mut parts=node.name.split(" > ").collect::<Vec<_>>();
+            if parts.len()>1 && parts[0].trim().to_lowercase()==parts[1].trim().to_lowercase() { parts.remove(1); node.name=parts.join(" > "); }
+        }
+    }
+    Ok(nodes)
 }
 
 pub fn values_page(
@@ -701,6 +775,24 @@ pub fn asset_metadata(db: &Db, id: i64) -> rusqlite::Result<Option<AssetMetadata
         categories,
         keywords,
     }))
+}
+
+
+pub fn asset_catalog_links(db: &Db, id: i64) -> rusqlite::Result<Option<CatalogAssetLinks>> {
+    let conn = db.lock().unwrap();
+    let exists: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?)", [id], |r| r.get(0))?;
+    if !exists { return Ok(None); }
+    let category_ids = conn.prepare("SELECT category_id FROM asset_categories WHERE asset_id=? ORDER BY category_id")?
+        .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let keyword_ids = conn.prepare("SELECT keyword_id FROM asset_keywords WHERE asset_id=? ORDER BY keyword_id")?
+        .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let category_ancestor_ids = conn.prepare("WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM categories WHERE id IN (SELECT category_id FROM asset_categories WHERE asset_id=?) AND parent_id IS NOT NULL UNION SELECT c.parent_id FROM categories c JOIN ancestors a ON c.id=a.id WHERE c.parent_id IS NOT NULL) SELECT id FROM ancestors ORDER BY id")?
+        .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let keyword_ancestor_ids = conn.prepare("WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM keywords WHERE id IN (SELECT keyword_id FROM asset_keywords WHERE asset_id=?) AND parent_id IS NOT NULL UNION SELECT k.parent_id FROM keywords k JOIN ancestors a ON k.id=a.id WHERE k.parent_id IS NOT NULL) SELECT id FROM ancestors ORDER BY id")?
+        .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let root_ids = conn.prepare("SELECT DISTINCT c.root_id FROM asset_categories ac JOIN categories c ON c.id=ac.category_id WHERE ac.asset_id=? AND c.root_id IS NOT NULL ORDER BY c.root_id")?
+        .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(Some(CatalogAssetLinks { category_ids, category_ancestor_ids, keyword_ids, keyword_ancestor_ids, root_ids }))
 }
 
 #[cfg(test)]
@@ -766,6 +858,44 @@ mod feature_tests {
         let top_off=nodes_page(&db,"category",None,Some(10),0,20,false).unwrap();assert_eq!(top_off[0].count,1);
         let child_on=nodes_page(&db,"category",Some(100),Some(10),0,20,true).unwrap();assert_eq!(child_on[0].count,2);
         let keywords_on=nodes_page(&db,"keyword",None,None,0,20,true).unwrap();assert_eq!(keywords_on[0].count,3);
+    }
+    #[test]
+    fn merged_category_roots_expand_count_and_search_without_duplicate_level() {
+        let db=test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO category_roots VALUES(1,'Miesta'),(2,'Príroda'),(3,'Bez kategórií');
+            INSERT INTO categories VALUES(10,NULL,1,' miesta '),(11,10,1,'Dieťa'),(12,NULL,1,'Extra'),(20,NULL,2,'Krajina');
+            INSERT INTO assets(id,name,ext,ext_lower,is_listed,size) VALUES(1,'root.jpg','jpg','jpg',1,1),(2,'child.jpg','jpg','jpg',1,1),(3,'extra.jpg','jpg','jpg',1,1),(4,'nature.jpg','jpg','jpg',1,1);
+            INSERT INTO asset_categories VALUES(1,10),(2,11),(3,12),(4,20);").unwrap();
+        let roots_on=roots_page(&db,0,10,true).unwrap();
+        let places=roots_on.iter().find(|r|r.id==1).unwrap();
+        assert_eq!(places.merged_category_id,Some(10));assert_eq!(places.count,2);assert!(places.has_children);
+        let places_off=roots_page(&db,0,10,false).unwrap().into_iter().find(|r|r.id==1).unwrap();
+        assert_eq!(places_off.count,1);
+        let children=nodes_page(&db,"category",None,Some(1),0,20,true).unwrap();
+        assert_eq!(children.iter().map(|n|n.id).collect::<Vec<_>>(),vec![11,12]);
+        assert!(children.iter().any(|n|n.id==11&&n.count==1));
+        let path=catalog_tree_search(&db,"category","dieťa",0,20,true).unwrap();
+        assert_eq!(path[0].name,"Miesta > Dieťa");
+        let nature=roots_page(&db,0,10,true).unwrap().into_iter().find(|r|r.id==2).unwrap();
+        assert_eq!(nature.merged_category_id,None);assert_eq!(nature.count,1);
+        assert_eq!(nodes_page(&db,"category",None,Some(2),0,20,true).unwrap()[0].id,20);
+        let empty=roots_page(&db,0,10,true).unwrap().into_iter().find(|r|r.id==3).unwrap();
+        assert_eq!(empty.merged_category_id,None);assert_eq!(empty.count,0);assert!(!empty.has_children);
+    }
+    #[test]
+    fn asset_catalog_links_include_direct_links_ancestors_and_root_ids() {
+        let db=test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO category_roots VALUES(1,'Miesta');
+            INSERT INTO categories VALUES(10,NULL,1,'Miesta'),(11,10,1,'Dieťa'),(12,11,1,'Vnuk');
+            INSERT INTO keywords VALUES(20,NULL,'Téma'),(21,20,'Podtéma'),(22,21,'List');
+            INSERT INTO assets(id,name,ext,ext_lower,is_listed) VALUES(1,'linked.jpg','jpg','jpg',1),(2,'uncatalogued.jpg','jpg','jpg',1);
+            INSERT INTO asset_categories VALUES(1,12);INSERT INTO asset_keywords VALUES(1,22);").unwrap();
+        let links=asset_catalog_links(&db,1).unwrap().unwrap();
+        assert_eq!(links.category_ids,vec![12]);assert_eq!(links.category_ancestor_ids,vec![10,11]);
+        assert_eq!(links.keyword_ids,vec![22]);assert_eq!(links.keyword_ancestor_ids,vec![20,21]);
+        assert_eq!(links.root_ids,vec![1]);
+        assert!(asset_catalog_links(&db,2).unwrap().unwrap().category_ids.is_empty());
+        assert!(asset_catalog_links(&db,99).unwrap().is_none());
     }
 }
 

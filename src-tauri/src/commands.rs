@@ -311,6 +311,10 @@ pub fn get_metadata(
 pub fn get_catalog_asset_metadata(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<AssetMetadata>,String>{
     db::asset_metadata(&state.0,asset_id).map_err(|e|e.to_string())
 }
+#[tauri::command]
+pub fn get_catalog_asset_links(state:State<'_,DatabaseState>,asset_id:i64)->Result<Option<db::CatalogAssetLinks>,String>{
+    db::asset_catalog_links(&state.0,asset_id).map_err(|e|e.to_string())
+}
 
 #[tauri::command]
 pub fn get_formats(state: State<'_, FormatsState>) -> FormatTable { state.0.as_ref().clone() }
