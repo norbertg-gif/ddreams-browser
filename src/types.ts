@@ -15,7 +15,7 @@ export type Node = { id: number; parentId: number | null; rootId: number | null;
 export type Root = { id: number; name: string; count: number; mergedCategoryId: number | null; hasChildren: boolean };
 export type CatalogAssetLinks = { categoryIds: number[]; categoryAncestorIds: number[]; keywordIds: number[]; keywordAncestorIds: number[]; rootIds: number[] };
 export type ValueCount = { value: string; count: number };
-export type MetadataRow = { group: string; name: string; value: string };
+export type MetadataRow = { group: string; subgroup: string; name: string; value: string };
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
 export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };
 

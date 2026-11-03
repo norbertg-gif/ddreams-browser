@@ -9,7 +9,7 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
   const [tab, setTab] = useState<"properties" | "catalog">("properties");
   const [metadata, setMetadata] = useState<Metadata | null>(null);
   const [loading, setLoading] = useState(false);
-  const [openGroups, setOpenGroups] = useState(new Set(["IPTC", "EXIF", "ACDSee", "Ostatné"]));
+  const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(readStored("ddreams.metadataOpen", ["IPTC", "EXIF", "ACDSee"])));
   const [selectedRows, setSelectedRows] = useState<string[]>([]);
   const [rowAnchor, setRowAnchor] = useState("");
   const [copyMenu, setCopyMenu] = useState(false);
@@ -23,8 +23,16 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
   }, [primaryId]);
-  const groups = useMemo(() => ["IPTC", "EXIF", "ACDSee", "Ostatné"].map(name => ({ name, rows: metadata?.rows.filter(row => row.group === name) ?? [] })), [metadata]);
-  const rowKey = (row: MetadataRow) => `${row.group}\u0000${row.name}`;
+  useEffect(() => writeStored("ddreams.metadataOpen", [...openGroups]), [openGroups]);
+  const groups = useMemo(() => {
+    const rows = metadata?.rows ?? [];
+    const fixed = ["IPTC", "EXIF", "ACDSee"];
+    const extra = [...new Set(rows.map(row => row.group).filter(name => !fixed.includes(name)))].sort((a,b) => {
+      if (a === "Všetky metadáta") return 1; if (b === "Všetky metadáta") return -1; return a.localeCompare(b);
+    });
+    return [...fixed, ...extra].map(name => ({name, rows: rows.filter(row => row.group === name)})).filter(group => group.rows.length);
+  }, [metadata]);
+  const rowKey = (row: MetadataRow) => `${row.group}\u0000${row.subgroup}\u0000${row.name}`;
   const rowList = groups.flatMap(g => g.rows);
   const selectRow = (row: MetadataRow, event: MouseEvent) => {
     const key = rowKey(row); setRowAnchor(key);
@@ -74,14 +82,16 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
       {groups.map(group => <section className="property-group" key={group.name}>
         <button className="accordion-head" onClick={() => toggleGroup(group.name)}><span>{openGroups.has(group.name) ? "▾" : "▸"} {group.name}</span><span>{group.rows.length}</span></button>
         {openGroups.has(group.name) && <div className="metadata-rows">
-          {group.rows.map(row => <div key={rowKey(row)} className={`meta-row ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setSelectedRows([rowKey(row)]); setRowAnchor(rowKey(row)); setCopyMenu(true); }}>
-            <span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "ACDSee" && row.name.toLowerCase() === "label" ? labelText(row.value) : row.value}</b>
+          {[...new Set(group.rows.map(row=>row.subgroup))].map(subgroup=><div className="metadata-subgroup" key={subgroup}>
+            {group.rows.some(row=>row.subgroup) && <div className="metadata-subgroup-title">{subgroup}</div>}
+            {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setSelectedRows([rowKey(row)]); setRowAnchor(rowKey(row)); setCopyMenu(true); }}>
+              <span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "ACDSee" && row.name === "Farebný štítok" ? labelText(row.value) : row.value}</b>
+            </div>)}
           </div>)}
-          {!group.rows.length && <div className="tree-empty">Žiadne údaje</div>}
         </div>}
       </section>)}
       <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
-        {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button><button onClick={() => void copy("section", "IPTC")}>Kopírovať celú sekciu IPTC</button><button onClick={() => void copy("section", "EXIF")}>Kopírovať celú sekciu EXIF</button><button onClick={() => void copy("section", "ACDSee")}>Kopírovať celú sekciu ACDSee</button><button onClick={() => void copy("section", "Ostatné")}>Kopírovať celú sekciu Ostatné</button></div>}
+        {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
     </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} />}
   </aside>;

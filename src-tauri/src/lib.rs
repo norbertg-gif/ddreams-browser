@@ -3,9 +3,10 @@ mod db;
 mod exiftool;
 mod formats;
 mod listing;
+mod metadata_view;
 mod thumbs;
 
-use commands::{DatabaseState, ExifState, FormatsState, ListingState, ThumbnailState};
+use commands::{DatabaseState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
 use db::{catalog_path, open_read_only};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use tauri::http::{Response, StatusCode, header};
@@ -28,6 +29,7 @@ pub fn run() {
             }),
     );
     let formats = formats::FormatTable::load();
+    let metadata_view = metadata_view::MetadataView::load();
     let listing = listing::ListingService::new(db.clone(), formats.clone());
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone());
     let protocol_thumbs = thumbs.clone();
@@ -38,6 +40,7 @@ pub fn run() {
         .manage(ExifState(exif))
         .manage(ListingState(listing))
         .manage(FormatsState(formats))
+        .manage(MetadataViewState(metadata_view))
         .manage(ThumbnailState(thumbs))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();

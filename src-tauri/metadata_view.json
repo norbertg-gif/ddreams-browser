@@ -1,0 +1,74 @@
+{
+  "version": 1,
+  "sections": [
+    { "name": "IPTC", "subgroups": [
+      { "name": "Obsah", "fields": [
+        { "label": "Názov", "keys": ["XMP-dc:Title", "IPTC:ObjectName"] },
+        { "label": "Titulok", "keys": ["IPTC:Headline", "XMP-photoshop:Headline"] },
+        { "label": "Popis", "keys": ["IPTC:Caption-Abstract", "XMP-dc:Description"] },
+        { "label": "Autor popisu", "keys": ["IPTC:Writer-Editor"] },
+        { "label": "Kľúčové slová", "keys": ["IPTC:Keywords", "XMP-dc:Subject"] },
+        { "label": "Kód predmetu IPTC", "keys": ["IPTC:SubjectReference"] }
+      ] },
+      { "name": "Kontakt", "fields": [
+        { "label": "Autor", "keys": ["XMP-dc:Creator", "IPTC:By-line"] },
+        { "label": "Pracovná pozícia", "keys": ["XMP-iptcCore:CreatorJobTitle"] },
+        { "label": "Adresa", "keys": ["XMP-iptcCore:CiAdrExtadr"] },
+        { "label": "Mesto", "keys": ["XMP-iptcCore:CiAdrCity", "IPTC:City"] },
+        { "label": "Kraj", "keys": ["XMP-iptcCore:CiAdrRegion", "IPTC:Province-State"] },
+        { "label": "PSČ", "keys": ["XMP-iptcCore:CiAdrPcode"] },
+        { "label": "Krajina", "keys": ["XMP-iptcCore:CiAdrCtry", "IPTC:Country-PrimaryLocationName"] },
+        { "label": "Telefón", "keys": ["XMP-iptcCore:CiTelWork"] },
+        { "label": "E-mail", "keys": ["XMP-iptcCore:CiEmailWork"] },
+        { "label": "Webová adresa", "keys": ["XMP-iptcCore:CiUrlWork"] }
+      ] },
+      { "name": "Autorské práva", "fields": [
+        { "label": "Oznámenie o autorských právach", "keys": ["XMP-dc:Rights", "IPTC:CopyrightNotice"] },
+        { "label": "Podmienky použitia", "keys": ["XMP-xmpRights:UsageTerms"] }
+      ] },
+      { "name": "Obrázok", "fields": [
+        { "label": "Žáner", "keys": ["IPTC:IntellectualGenre", "XMP-iptcCore:IntellectualGenre"] },
+        { "label": "Kód scény IPTC", "keys": ["IPTC:Scene", "XMP-iptcCore:Scene"] },
+        { "label": "Lokalita", "keys": ["IPTC:Sub-location", "XMP-photoshop:Location", "XMP-iptcExt:LocationName"] },
+        { "label": "Mesto", "keys": ["IPTC:City", "XMP-photoshop:City"] },
+        { "label": "Krajina", "keys": ["IPTC:Country-PrimaryLocationName", "XMP-photoshop:Country"] },
+        { "label": "Kód krajiny", "keys": ["IPTC:Country-PrimaryLocationCode", "XMP-iptcCore:CountryCode"] }
+      ] }
+    ] },
+    { "name": "EXIF", "subgroups": [
+      { "name": "Fotoaparát", "fields": [
+        { "label": "Čas uzávierky", "keys": ["ExifIFD:ExposureTime", "ExifIFD:ShutterSpeedValue", "ExposureTime", "ShutterSpeed"], "format": "seconds" },
+        { "label": "Clona", "keys": ["ExifIFD:FNumber", "ExifIFD:ApertureValue", "FNumber", "Aperture"], "format": "fnumber" },
+        { "label": "ISO", "keys": ["ExifIFD:ISO", "ExifIFD:PhotographicSensitivity", "ISO"] },
+        { "label": "Korekcia expozície", "keys": ["ExifIFD:ExposureCompensation", "ExposureCompensation"] },
+        { "label": "Ohnisková vzdialenosť", "keys": ["Composite:FocalLength35efl", "ExifIFD:FocalLength", "FocalLength"] },
+        { "label": "Blesk", "keys": ["ExifIFD:Flash", "Flash"] },
+        { "label": "Režim expozície", "keys": ["ExifIFD:ExposureProgram", "ExposureProgram"] },
+        { "label": "Meranie", "keys": ["ExifIFD:MeteringMode", "MeteringMode"] },
+        { "label": "Výrobca", "keys": ["IFD0:Make", "Make"] },
+        { "label": "Model", "keys": ["IFD0:Model", "Model"] },
+        { "label": "Objektív", "keys": ["ExifIFD:LensModel", "LensModel"] },
+        { "label": "Vyváženie bielej", "keys": ["ExifIFD:WhiteBalance", "WhiteBalance"] },
+        { "label": "Korekcia blesku", "keys": ["ExifIFD:FlashExposureComp", "FlashExposureComp"] }
+      ] },
+      { "name": "Snímka", "fields": [
+        { "label": "Softvér", "keys": ["IFD0:Software", "Software"] },
+        { "label": "Dátum snímania", "keys": ["ExifIFD:DateTimeOriginal", "DateTimeOriginal", "Db:Date taken"], "format": "date" },
+        { "label": "Dátum digitalizácie", "keys": ["ExifIFD:CreateDate", "CreateDate"], "format": "date" },
+        { "label": "Rozmery", "keys": ["Composite:ImageSize", "ImageSize", "Db:Dimensions"], "format": "dimensions" }
+      ] },
+      { "name": "GPS", "fields": [
+        { "label": "Poloha", "keys": ["Composite:GPSPosition", "GPSLatitude+GPSLongitude"] },
+        { "label": "Nadmorská výška", "keys": ["GPSAltitude"] }
+      ] }
+    ] },
+    { "name": "ACDSee", "subgroups": [
+      { "name": "Katalóg", "fields": [
+        { "label": "Popis", "keys": ["Db:Caption"] }, { "label": "Poznámky", "keys": ["Db:Notes"] },
+        { "label": "Autor", "keys": ["Db:Author"] }, { "label": "Hodnotenie", "keys": ["Db:Rating"] },
+        { "label": "Farebný štítok", "keys": ["Db:Label"] }, { "label": "Označené", "keys": ["Db:Tagged"] },
+        { "label": "Kategórie", "keys": ["Db:Categories"] }, { "label": "Kľúčové slová", "keys": ["Db:Keywords"] }
+      ] }
+    ] }
+  ]
+}

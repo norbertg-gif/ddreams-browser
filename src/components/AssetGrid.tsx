@@ -187,7 +187,7 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
       {overlayMode>0&&!!asset.rating && <span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}
       {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
       {overlayMode>0&&asset.hasCategories && <span className="category-badge" title="Zaradené v kategórii">◆</span>}
-      {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }}>{labelText(label)}</span>}
+      {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }} />}
       {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
       {!asset.isDirectory && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>

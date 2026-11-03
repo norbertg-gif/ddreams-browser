@@ -3,6 +3,7 @@ use crate::{
     exiftool::ExifTool,
     formats::FormatTable,
     listing::ListingService,
+    metadata_view::{self, MetadataView},
     thumbs::ThumbService,
 };
 use crate::thumbs;
@@ -16,11 +17,13 @@ pub struct ExifState(pub Arc<ExifTool>);
 pub struct ThumbnailState(pub Arc<ThumbService>);
 pub struct ListingState(pub Arc<ListingService>);
 pub struct FormatsState(pub Arc<FormatTable>);
+pub struct MetadataViewState(pub Arc<MetadataView>);
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MetadataRow {
     pub group: String,
+    pub subgroup: String,
     pub name: String,
     pub value: String,
 }
@@ -177,109 +180,48 @@ pub fn get_thumbnail_state(state: State<'_, ThumbnailState>, asset_id: i64, epoc
     state.0.state(asset_id, epoch)
 }
 
-fn db_rows(data: &AssetMetadata) -> Vec<MetadataRow> {
+fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
     let a = &data.asset;
-    let mut rows = Vec::new();
-    let mut add = |group: &str, name: &str, value: Option<String>| {
-        if let Some(v) = value.filter(|v| !v.is_empty()) {
-            rows.push(MetadataRow {
-                group: group.into(),
-                name: name.into(),
-                value: v,
-            })
+    let mut tags = Vec::new();
+    let mut add = |name: &str, value: Option<String>| {
+        if let Some(value) = value.filter(|v| !v.is_empty()) {
+            tags.push(metadata_view::RawTag { key: format!("Db:{name}"), group: "Db".into(), name: name.into(), value });
         }
     };
-    add("ACDSee", "Caption", a.caption.clone());
-    add("ACDSee", "Notes", a.notes.clone());
-    add("ACDSee", "Author", a.author.clone());
-    add(
-        "ACDSee",
-        "Rating",
-        a.rating.filter(|v| *v > 0).map(|v| v.to_string()),
-    );
-    add("ACDSee", "Label", a.label.clone());
-    add(
-        "ACDSee",
-        "Tagged",
-        a.tagged.map(|v| if v != 0 { "Yes" } else { "No" }.into()),
-    );
-    add(
-        "ACDSee",
-        "Categories",
-        if data.categories.is_empty() {
-            None
-        } else {
-            Some(data.categories.join(", "))
-        },
-    );
-    add(
-        "ACDSee",
-        "Keywords",
-        if data.keywords.is_empty() {
-            None
-        } else {
-            Some(data.keywords.join(", "))
-        },
-    );
-    add("EXIF", "Date taken", a.exif_date.clone());
-    add("EXIF", "Width", a.width.map(|v| v.to_string()));
-    add("EXIF", "Height", a.height.map(|v| v.to_string()));
-    add("EXIF", "Bits per pixel", a.bpp.map(|v| v.to_string()));
-    add("File", "File modified", a.file_modified.clone());
-    rows
+    add("Caption", a.caption.clone()); add("Notes", a.notes.clone()); add("Author", a.author.clone());
+    add("Rating", a.rating.filter(|v| *v > 0).map(|v| v.to_string())); add("Label", a.label.clone());
+    add("Tagged", a.tagged.map(|v| if v != 0 { "Áno" } else { "Nie" }.into()));
+    add("Categories", (!data.categories.is_empty()).then(||data.categories.join(", ")));
+    add("Keywords", (!data.keywords.is_empty()).then(||data.keywords.join(", ")));
+    add("Date taken", a.exif_date.clone());
+    add("Dimensions", match (a.width,a.height) {(Some(w),Some(h))=>Some(format!("{w} × {h}")),_=>None});
+    add("Bits per pixel", a.bpp.map(|v| v.to_string()));
+    add("File modified", a.file_modified.clone());
+    tags
 }
-fn live_rows(json: Value) -> Vec<MetadataRow> {
-    let mut rows = Vec::new();
-    let Some(obj) = json.as_object() else {
-        return rows;
-    };
-    for (key, value) in obj {
-        if key == "SourceFile" || key.starts_with("ExifTool:") {
-            continue;
-        }
-        let (group, name) = key.split_once(':').unwrap_or(("Metadata", key));
-        let text = match value {
-            Value::String(s) => s.clone(),
-            Value::Null => continue,
-            Value::Array(a) => a
-                .iter()
-                .map(Value::to_string)
-                .collect::<Vec<_>>()
-                .join(", "),
-            _ => value.to_string(),
-        };
-        if text.is_empty() {
-            continue;
-        }
-        if text.starts_with("(Binary data ") { continue; }
-        let group = if group.to_ascii_lowercase().contains("iptc") {
-            "IPTC"
-        } else if group.to_ascii_lowercase().contains("exif") || group.to_ascii_lowercase().contains("composite") {
-            "EXIF"
-        } else {
-            "Ostatné"
-        };
-        rows.push(MetadataRow {
-            group: group.into(),
-            name: name.into(),
-            value: text,
-        });
-    }
-    let order=|g:&str|match g{"IPTC"=>0,"EXIF"=>1,"Ostatné"=>2,_=>3};
-    rows.sort_by(|a, b| order(&a.group).cmp(&order(&b.group)).then(a.name.cmp(&b.name)));
-    rows
+fn live_rows(json: Value, view: &MetadataView, data: Option<&AssetMetadata>) -> Vec<MetadataRow> {
+    let Some(obj) = json.as_object() else { return Vec::new(); };
+    let tags = metadata_view::raw_tags(obj);
+    rows_from_curated(metadata_view::curate(view, &tags, &data.map(db_tags).unwrap_or_default()))
+}
+fn db_only_rows(view: &MetadataView, data: &AssetMetadata) -> Vec<MetadataRow> {
+    rows_from_curated(metadata_view::curate(view, &[], &db_tags(data)))
+}
+fn rows_from_curated(rows: Vec<metadata_view::CuratedRow>) -> Vec<MetadataRow> {
+    rows.into_iter().map(|row|MetadataRow{group:row.group,subgroup:row.subgroup,name:row.name,value:row.value}).collect()
 }
 #[tauri::command]
 pub fn get_metadata(
     db: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
     exif: State<'_, ExifState>,
+    view: State<'_, MetadataViewState>,
     asset_id: i64,
 ) -> Result<Option<MetadataResponse>, String> {
     if let Some(asset)=listing.0.asset(asset_id) {
         let path=asset.path.clone().unwrap_or_default();
         let online=Path::new(&path).is_file();
-        let rows=if online { exif.0.metadata(Path::new(&path)).map(live_rows).unwrap_or_default() } else { Vec::new() };
+        let rows=if online { exif.0.metadata(Path::new(&path)).map(|json|live_rows(json,&view.0,None)).unwrap_or_default() } else { Vec::new() };
         return Ok(Some(MetadataResponse{asset,offline:!online,rows}));
     }
     let Some(data) = db::asset_metadata(&db.0, asset_id).map_err(|e| e.to_string())? else {
@@ -289,9 +231,8 @@ pub fn get_metadata(
     let online = Path::new(path).is_file();
     if online {
         if let Ok(value) = exif.0.metadata(Path::new(path)) {
-            let mut rows = live_rows(value);
+            let rows = live_rows(value, &view.0, Some(&data));
             if !rows.is_empty() {
-                rows.extend(db_rows(&data).into_iter().filter(|r| r.group == "ACDSee"));
                 return Ok(Some(MetadataResponse {
                     asset: data.asset,
                     offline: false,
@@ -300,7 +241,7 @@ pub fn get_metadata(
             }
         }
     }
-    let rows = db_rows(&data);
+    let rows = db_only_rows(&view.0, &data);
     Ok(Some(MetadataResponse {
         asset: data.asset,
         offline: !online,
