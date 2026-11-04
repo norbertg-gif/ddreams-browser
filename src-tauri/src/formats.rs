@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
+#[cfg(test)]
+use std::path::PathBuf;
 
 const DEFAULT_FORMATS: &str = include_str!("../formats.json");
 
@@ -23,10 +25,24 @@ pub struct FormatTable {
 }
 
 impl FormatTable {
+    #[cfg(test)]
     pub fn load() -> Arc<Self> {
-        Self::load_from(std::env::var_os("DDREAMS_FORMATS").map(PathBuf::from), std::env::current_exe().ok())
+        let paths = crate::paths::Paths::resolve();
+        Self::load_selected(paths.formats.as_deref())
     }
 
+    pub fn load_selected(path: Option<&Path>) -> Arc<Self> {
+        let Some(path) = path else { return Arc::new(Self::parse(DEFAULT_FORMATS).expect("embedded format table must be valid")); };
+        match std::fs::read_to_string(path).map_err(|e|e.to_string()).and_then(|source|Self::parse(&source).map_err(|e|e.to_string())) {
+            Ok(table) => Arc::new(table),
+            Err(error) => {
+                eprintln!("Invalid formats file {}: {error}; using embedded defaults",path.display());
+                Arc::new(Self::parse(DEFAULT_FORMATS).expect("embedded format table must be valid"))
+            }
+        }
+    }
+
+    #[cfg(test)]
     fn load_from(override_path: Option<PathBuf>, executable: Option<PathBuf>) -> Arc<Self> {
         let adjacent = executable.as_deref().and_then(Path::parent).map(|p| p.join("formats.json"));
         let selected = override_path.or_else(|| adjacent.filter(|p| p.is_file()));

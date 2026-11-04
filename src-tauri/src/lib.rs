@@ -1,41 +1,48 @@
 mod commands;
+mod backup;
 mod calendar;
 mod db;
 mod display_metadata;
 mod exiftool;
 mod formats;
+pub mod journal;
 mod listing;
 mod metadata_view;
+mod paths;
+mod schema;
 mod thumbs;
 
-use commands::{CalendarState, DatabaseState, DisplayMetadataState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
-use db::{catalog_path, open_read_only};
+use commands::{AppInfoState, CalendarState, CatalogWriterState, DatabaseState, DisplayMetadataState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
+use db::open_catalog;
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use tauri::http::{Response, StatusCode, header};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let catalog = catalog_path();
-    let connection = open_read_only(&catalog).unwrap_or_else(|e| {
-        panic!(
-            "Cannot open catalog read-only at {}: {e}",
-            catalog.display()
-        )
+    let paths = paths::Paths::resolve();
+    let info = paths.info();
+    eprintln!("DDreams paths: root={}, catalog={}, backups={}, cache={}, exiftool={}, formats={}, metadata_view={}, settings={}, portable={}, readonly={}", info.root, info.catalog, info.backups, info.cache, info.exiftool, info.formats, info.metadata_view, info.settings, info.portable, info.readonly);
+    if let Err(error) = paths.ensure_runtime_dirs() { eprintln!("Warning: cannot create runtime directories: {error}"); }
+    match backup::create_startup_backup(&paths.catalog, &paths.backups) {
+        Ok(Some(path)) => eprintln!("Catalog backup created: {}", path.display()),
+        Ok(None) => eprintln!("Catalog backup skipped: unchanged within the last hour"),
+        Err(error) => eprintln!("Warning: catalog backup failed: {error}"),
+    }
+    let mut connection = open_catalog(&paths.catalog, paths.readonly).unwrap_or_else(|e| {
+        panic!("Cannot open catalog at {}: {e}", paths.catalog.display())
     });
+    if !paths.readonly {
+        schema::migrate_catalog(&mut connection).unwrap_or_else(|e| panic!("Catalog migration failed at {}: {e}", paths.catalog.display()));
+    }
     let db = Arc::new(Mutex::new(connection));
-    let exif = exiftool::ExifTool::new(
-        std::env::var_os("DDREAMS_EXIFTOOL")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| {
-                std::path::PathBuf::from(r"G:\Programovanie\photosort\tools\exiftool\exiftool.exe")
-            }),
-    );
-    let formats = formats::FormatTable::load();
-    let metadata_view = metadata_view::MetadataView::load();
-    let display_metadata = display_metadata::DisplayMetadataCache::new(display_metadata::cache_root());
+    let exif = exiftool::ExifTool::new(paths.exiftool.clone());
+    let formats = formats::FormatTable::load_selected(paths.formats.as_deref());
+    let metadata_view = metadata_view::MetadataView::load_selected(paths.metadata_view.as_deref());
+    let display_metadata = display_metadata::DisplayMetadataCache::new(paths.cache.clone());
     let listing = listing::ListingService::new(db.clone(), formats.clone());
     let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
-    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone());
+    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone());
+    let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
     tauri::Builder::default()
@@ -48,6 +55,8 @@ pub fn run() {
         .manage(DisplayMetadataState(display_metadata))
         .manage(ThumbnailState(thumbs))
         .manage(CalendarState(calendar))
+        .manage(CatalogWriterState(writer))
+        .manage(AppInfoState(info))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();
             let query = request.uri().query().unwrap_or_default();
@@ -102,6 +111,9 @@ pub fn run() {
             });
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_app_info,
+            commands::get_recent_changes,
+            commands::undo_last_change,
             commands::get_calendar_aggregate,
             commands::get_assets,
             commands::get_formats,

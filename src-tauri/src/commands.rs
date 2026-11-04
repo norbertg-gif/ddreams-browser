@@ -4,8 +4,10 @@ use crate::{
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
+    journal::{CatalogWriter, ChangeSummary},
     listing::ListingService,
     metadata_view::{self, MetadataView},
+    paths::AppInfo,
     thumbs::ThumbService,
 };
 use crate::thumbs;
@@ -22,6 +24,21 @@ pub struct FormatsState(pub Arc<FormatTable>);
 pub struct MetadataViewState(pub Arc<MetadataView>);
 pub struct DisplayMetadataState(pub Arc<DisplayMetadataCache>);
 pub struct CalendarState(pub Arc<CalendarService>);
+pub struct CatalogWriterState(pub Arc<CatalogWriter>);
+pub struct AppInfoState(pub AppInfo);
+
+#[tauri::command]
+pub fn get_app_info(state: State<'_, AppInfoState>) -> AppInfo { state.0.clone() }
+
+#[tauri::command]
+pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> Result<Vec<ChangeSummary>, String> {
+    state.0.recent_changes(limit)
+}
+
+#[tauri::command]
+pub fn undo_last_change(state: State<'_, CatalogWriterState>) -> Result<Option<ChangeSummary>, String> {
+    state.0.undo_last()
+}
 
 #[tauri::command]
 pub fn get_calendar_aggregate(state: State<'_, CalendarState>, source: String) -> Result<CalendarAggregate, String> {

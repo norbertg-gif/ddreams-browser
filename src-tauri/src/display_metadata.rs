@@ -20,10 +20,6 @@ pub struct CacheEntry { pub loaded: Vec<String>, pub values: TileExifValues }
 
 pub struct DisplayMetadataCache { root: PathBuf, entries: Mutex<HashMap<String, CacheEntry>> }
 
-pub fn cache_root() -> PathBuf {
-    std::env::var_os("DDREAMS_CACHE").map(PathBuf::from).unwrap_or_else(||PathBuf::from(r"G:\ddreams-work\thumb-cache"))
-}
-
 pub fn cache_key(path: &str, size: u64, modified_ns: u128) -> String {
     Sha256::digest(format!("tile-exif-v1|{path}|{size}|{modified_ns}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect()
 }
@@ -115,7 +111,8 @@ mod tests{
         let exif=crate::exiftool::ExifTool::new(executable);
         let fields=vec!["iso","aperture","shutter","focalLength","lens","camera","dateTaken"].into_iter().map(str::to_owned).collect::<Vec<_>>();
         let tags=tags_for(&fields);
-        let cache=DisplayMetadataCache::new(cache_root().join("bench"));
+        let bench_cache=std::env::temp_dir().join(format!("ddreams-exif-bench-{}",std::process::id()));
+        let cache=DisplayMetadataCache::new(bench_cache.join("bench"));
         let keys=paths.iter().map(|path|file_key(path).expect("file metadata").0).collect::<Vec<_>>();
         let cold=Instant::now();
         let records=exif.metadata_batch(&paths,&tags).expect("single ExifTool batch");
@@ -125,7 +122,7 @@ mod tests{
         let cached=keys.iter().map(|key|cache.get(key)).collect::<Vec<_>>();
         let warm_elapsed=warm.elapsed();
         drop(cache);
-        let disk_cache=DisplayMetadataCache::new(cache_root().join("bench"));
+        let disk_cache=DisplayMetadataCache::new(bench_cache.join("bench"));
         let disk=Instant::now();
         let disk_cached=keys.iter().map(|key|disk_cache.get(key)).collect::<Vec<_>>();
         let disk_elapsed=disk.elapsed();
@@ -133,6 +130,6 @@ mod tests{
         assert_eq!(disk_cached.len(),30);
         println!("EXIF batch 30: cold ExifTool={cold_elapsed:?}; cached memory={warm_elapsed:?}; cached disk reads={disk_elapsed:?}");
         drop(disk_cache);
-        let _=std::fs::remove_dir_all(cache_root().join("bench"));
+        let _=std::fs::remove_dir_all(bench_cache);
     }
 }

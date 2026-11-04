@@ -153,8 +153,7 @@ pub struct ThumbService { pub db: Db, pub listing: Arc<ListingService>, pub form
 #[derive(Clone, Debug)]
 pub struct RenderedPreview { pub bytes: Vec<u8>, pub source: String }
 impl ThumbService {
-    pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>) -> Arc<Self> {
-        let cache=std::env::var_os("DDREAMS_CACHE").map(PathBuf::from).unwrap_or_else(||PathBuf::from(r"G:\ddreams-work\thumb-cache"));
+    pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>, cache: PathBuf) -> Arc<Self> {
         let chain=PreviewChain::new(exif.clone());
         Arc::new(Self{db,listing,formats,chain,cache,epoch:AtomicU64::new(0),workers:Arc::new(Semaphore::new(4))})
     }

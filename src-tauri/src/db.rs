@@ -1,24 +1,25 @@
 use crate::formats::FormatTable;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
-};
+use std::{path::Path, sync::{Arc, Mutex}};
+#[cfg(test)]
+use std::path::PathBuf;
 
 pub type Db = Arc<Mutex<Connection>>;
 
+#[cfg(test)]
 pub fn catalog_path() -> PathBuf {
-    if let Some(path) = std::env::var_os("DDREAMS_CATALOG") {
-        return PathBuf::from(path);
-    }
-    let here = std::env::current_dir().unwrap_or_default();
-    let exe = std::env::current_exe().unwrap_or_default();
-    exe.ancestors()
-        .chain(here.ancestors())
-        .map(|dir| dir.join(".local").join("catalog.sqlite"))
-        .find(|path| path.exists())
-        .unwrap_or_else(|| here.join(".local").join("catalog.sqlite"))
+    crate::paths::Paths::resolve().catalog
+}
+
+pub fn open_catalog(path: &Path, readonly: bool) -> rusqlite::Result<Connection> {
+    if readonly { return open_read_only(path); }
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    conn.pragma_update(None, "foreign_keys", "ON")?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(conn)
 }
 
 pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
@@ -29,6 +30,33 @@ pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     conn.pragma_update(None, "query_only", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(4))?;
     Ok(conn)
+}
+
+#[cfg(test)]
+mod catalog_open_tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn writable_catalog_uses_wal_busy_timeout_and_foreign_keys() {
+        let root = std::env::temp_dir().join(format!(
+            "ddreams-open-catalog-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("catalog.sqlite");
+        Connection::open(&path).unwrap();
+        let connection = open_catalog(&path, false).unwrap();
+        let journal_mode: String = connection.query_row("PRAGMA journal_mode", [], |row| row.get(0)).unwrap();
+        let foreign_keys: i64 = connection.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+        let busy_timeout: i64 = connection.query_row("PRAGMA busy_timeout", [], |row| row.get(0)).unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(foreign_keys, 1);
+        assert_eq!(busy_timeout, 5_000);
+        drop(connection);
+        let _ = std::fs::remove_dir_all(root);
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

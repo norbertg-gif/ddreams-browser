@@ -1,0 +1,72 @@
+param(
+    [string]$Catalog,
+    [string]$ExifToolSource = 'G:\Programovanie\photosort\tools\exiftool'
+)
+
+$ErrorActionPreference = 'Stop'
+$RepoRoot = Split-Path -Parent $PSScriptRoot
+$ExeCandidates = @(
+    (Join-Path $RepoRoot 'src-tauri\target\release\ddreams-browser.exe'),
+    (Join-Path $RepoRoot 'target\release\ddreams-browser.exe')
+)
+$ReleaseExe = $ExeCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $ReleaseExe) { throw 'Release exe not found. Build the app first; this script does not build it.' }
+
+$InstallRoot = 'G:\DDreams'
+$InstallExe = Join-Path $InstallRoot 'ddreams-browser.exe'
+$CatalogDir = Join-Path $InstallRoot 'catalog'
+$InstallCatalog = Join-Path $CatalogDir 'catalog.sqlite'
+$BackupDir = Join-Path $InstallRoot 'backups'
+$CacheDir = Join-Path $InstallRoot 'cache'
+$ModulesDir = Join-Path $InstallRoot 'modules'
+$InstallExifToolDir = Join-Path $ModulesDir 'exiftool'
+$InstallExifTool = Join-Path $InstallExifToolDir 'exiftool.exe'
+$SourceExifTool = Join-Path $ExifToolSource 'exiftool.exe'
+if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) { throw "ExifTool source not found: $SourceExifTool" }
+$catalogExists = Test-Path -LiteralPath $InstallCatalog -PathType Leaf
+if ($catalogExists -and $Catalog) { throw "Refusing to overwrite existing DDreams catalog: $InstallCatalog" }
+if (-not $catalogExists) {
+    if (-not $Catalog) { throw 'First install requires -Catalog <path>.' }
+    if (-not (Test-Path -LiteralPath $Catalog -PathType Leaf)) { throw "Catalog source not found: $Catalog" }
+}
+
+$runningInstall = Get-Process -Name 'ddreams-browser' -ErrorAction SilentlyContinue | Where-Object {
+    try { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq [IO.Path]::GetFullPath($InstallExe)) } catch { $false }
+}
+if ($runningInstall) { throw 'Close G:\DDreams\ddreams-browser.exe before publishing.' }
+
+foreach ($directory in @($InstallRoot, $CatalogDir, $BackupDir, $CacheDir, $ModulesDir)) {
+    New-Item -ItemType Directory -Path $directory -Force | Out-Null
+}
+Copy-Item -LiteralPath $ReleaseExe -Destination $InstallExe -Force
+Write-Output "Copied app: $InstallExe"
+
+if (-not (Test-Path -LiteralPath $InstallCatalog -PathType Leaf)) {
+    Copy-Item -LiteralPath $Catalog -Destination $InstallCatalog
+    Write-Output "Installed catalog: $InstallCatalog"
+} else {
+    Write-Output "Preserved existing catalog: $InstallCatalog"
+}
+
+$SourceSupport = Join-Path $ExifToolSource 'exiftool_files'
+$copyExifTool = -not (Test-Path -LiteralPath $InstallExifTool -PathType Leaf)
+if (-not $copyExifTool) {
+    $copyExifTool = (Get-Item -LiteralPath $SourceExifTool).LastWriteTimeUtc -gt (Get-Item -LiteralPath $InstallExifTool).LastWriteTimeUtc
+}
+if ($SourceSupport -and (Test-Path -LiteralPath $SourceSupport -PathType Container) -and -not (Test-Path -LiteralPath (Join-Path $InstallExifToolDir 'exiftool_files') -PathType Container)) {
+    $copyExifTool = $true
+}
+if ($copyExifTool) {
+    New-Item -ItemType Directory -Path $InstallExifToolDir -Force | Out-Null
+    Copy-Item -LiteralPath $SourceExifTool -Destination $InstallExifTool -Force
+    if (Test-Path -LiteralPath $SourceSupport -PathType Container) {
+        $DestinationSupport = Join-Path $InstallExifToolDir 'exiftool_files'
+        New-Item -ItemType Directory -Path $DestinationSupport -Force | Out-Null
+        Copy-Item -Path (Join-Path $SourceSupport '*') -Destination $DestinationSupport -Recurse -Force
+    }
+    Write-Output "Copied/updated ExifTool: $InstallExifTool"
+} else {
+    Write-Output "ExifTool is current: $InstallExifTool"
+}
+
+Write-Output "Portable installation ready: $InstallRoot"

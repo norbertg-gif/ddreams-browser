@@ -177,6 +177,10 @@ def schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
       PRAGMA foreign_keys=OFF;
       CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE ddreams_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+      CREATE TABLE ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT,FOREIGN KEY(change_id) REFERENCES ddreams_changes(id) ON DELETE CASCADE);
+      CREATE INDEX idx_ddreams_change_items_change_id ON ddreams_change_items(change_id);
       CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT NOT NULL,path TEXT);
       CREATE TABLE folder_roots(id INTEGER PRIMARY KEY,name TEXT NOT NULL,path TEXT);
       CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT NOT NULL,ext TEXT,ext_lower TEXT NOT NULL,is_listed INTEGER NOT NULL,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);
@@ -250,9 +254,16 @@ def import_data(source: pathlib.Path, out: pathlib.Path) -> str:
     if out.exists():
         try:
             with contextlib.closing(sqlite3.connect(f"file:{out.resolve().as_posix()}?mode=ro", uri=True)) as old:
+                has_ddreams_meta = old.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ddreams_meta'").fetchone()
+                if has_ddreams_meta:
+                    owner = old.execute("SELECT value FROM ddreams_meta WHERE key='catalog_owner'").fetchone()
+                    if owner and owner[0] == "ddreams":
+                        raise ValueError(f"Refusing to replace a DDreams-owned catalog: {out}")
                 modified = old.execute("SELECT value FROM meta WHERE key='catalog_modified'").fetchone()
             if modified and modified[0] == "1":
                 raise ValueError(f"Refusing to overwrite user-modified catalog (catalog_modified=1): {out}")
+        except ValueError:
+            raise
         except sqlite3.OperationalError:
             pass
     handle = tempfile.NamedTemporaryFile(prefix=out.name + ".", suffix=".tmp", dir=out.parent, delete=False)
@@ -268,6 +279,8 @@ def import_data(source: pathlib.Path, out: pathlib.Path) -> str:
                     "date_type_7": "FoxPro Julian day + milliseconds since midnight",
                     "md_dirty_interpretation": "raw value; meaning not verified"}
             conn.executemany("INSERT INTO meta VALUES (?,?)", meta.items())
+            ddreams_meta = {"schema_version": "1", "catalog_owner": "ddreams", "created_from": "acdsee_import", "import_date": now}
+            conn.executemany("INSERT INTO ddreams_meta VALUES (?,?)", ddreams_meta.items())
             conn.executemany("INSERT INTO folders VALUES (?,?,?,?,?)", [
                 (ident(f.get("FOLDER_ID")), ident(f.get("PRNT_ID")), ident(f.get("FOLD_RT_ID")), f.get("NAME") or "", paths.get(ident(f.get("FOLDER_ID")))) for f in folders])
             conn.executemany("INSERT INTO folder_roots VALUES (?,?,?)", [

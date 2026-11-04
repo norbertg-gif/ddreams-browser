@@ -113,6 +113,8 @@ class ImportTests(unittest.TestCase):
                 self.assertEqual(conn.execute("select path from folders where id=10").fetchone()[0], "F:\\2019-poltár")
                 self.assertEqual(conn.execute("select count(*) from asset_categories").fetchone()[0], 1)
                 self.assertEqual(conn.execute("select value from meta where key='catalog_modified'").fetchone()[0], "0")
+                self.assertEqual(dict(conn.execute("select key,value from ddreams_meta"))["schema_version"], "1")
+                self.assertEqual(dict(conn.execute("select key,value from ddreams_meta"))["catalog_owner"], "ddreams")
                 self.assertEqual(conn.execute("select count(*) from assets_fts").fetchone()[0], 1)
                 self.assertEqual(conn.execute("select ext_lower,is_listed from assets").fetchone(), ("jpg", 1))
                 self.assertEqual(conn.execute("select name,path from folder_roots").fetchone(), ("F:", "F:\\"))
@@ -122,6 +124,7 @@ class ImportTests(unittest.TestCase):
                 self.assertIn("idx_assets_listed_exif_date_ext", indexes)
                 self.assertIn("idx_assets_listed_acdsee_date_ext", indexes)
                 self.assertIn("idx_assets_listed_file_modified_ext", indexes)
+                self.assertIn("idx_ddreams_change_items_change_id", indexes)
                 self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_ext_name')")])
                 self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_name')")])
             self.assertIn("Asset: 1 / 1", report)
@@ -139,6 +142,20 @@ class ImportTests(unittest.TestCase):
                 conn.commit()
             before = out.read_bytes()
             with self.assertRaisesRegex(ValueError, "catalog_modified=1"):
+                import_acdsee.import_data(source, out)
+            self.assertEqual(out.read_bytes(), before)
+
+    def test_refuses_to_replace_any_ddreams_owned_catalog(self):
+        with tempfile.TemporaryDirectory() as temp:
+            source = pathlib.Path(temp) / "source"
+            fixtures(source)
+            out = pathlib.Path(temp) / "catalog.sqlite"
+            with contextlib.closing(sqlite3.connect(out)) as conn:
+                conn.execute("create table ddreams_meta(key text primary key,value text)")
+                conn.execute("insert into ddreams_meta values('catalog_owner','ddreams')")
+                conn.commit()
+            before = out.read_bytes()
+            with self.assertRaisesRegex(ValueError, "DDreams-owned catalog"):
                 import_acdsee.import_data(source, out)
             self.assertEqual(out.read_bytes(), before)
 

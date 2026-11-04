@@ -10,9 +10,13 @@ import { DEFAULT_THUMBNAIL_INFO, normalizeThumbnailInfo, type ThumbnailInfoConfi
 import "./App.css";
 
 const DEFAULT_PATH = String.raw`F:\My_docs\My Pictures\Fotky`;
+type AppInfo = { root: string; catalog: string; backups: string; cache: string; exiftool: string; formats: string; metadataView: string; settings: string; portable: boolean; readonly: boolean };
 function dateText(value: string | null | undefined) { return value ? value.replace("T", " ").slice(0, 19) : "—"; }
 
 export default function App() {
+  const [appInfo, setAppInfo] = useState<AppInfo | null>(null);
+  useEffect(() => { void invoke<AppInfo>("get_app_info").then(setAppInfo).catch(() => {}); }, []);
+  const catalogTooltip = appInfo ? `Katalóg: ${appInfo.catalog}\nZálohy: ${appInfo.backups}\nCache: ${appInfo.cache}\nExifTool: ${appInfo.exiftool}\nFormáty: ${appInfo.formats}\nMetadata: ${appInfo.metadataView}\nNastavenia: ${appInfo.settings}\nRežim: ${appInfo.portable ? "prenosný" : "vývojový"}` : "Cesty katalógu sa načítavajú";
   const [view, setView] = useState<View>({ kind: "folder", id: -1, title: "Načítavam katalóg…" });
   const [query, setQuery] = useState("");
   const [queryDebounced, setQueryDebounced] = useState("");
@@ -117,7 +121,7 @@ export default function App() {
     if (folder) navigate({ kind: "folder", id: folder.id, ids: folder.folderIds, title: folder.path ?? folder.name, folderPath: folder.path ?? undefined });
   };
   return <main className="app-shell">
-    <header className="topbar"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><div className="top-separator"/><span className="mode-label">SPRÁVA FOTOGRAFIÍ</span><div className="top-spacer"/><div className="catalog-label"><span className="status-light"/> Katalóg iba na čítanie</div></header>
+    <header className="topbar"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><div className="top-separator"/><span className="mode-label">SPRÁVA FOTOGRAFIÍ</span><div className="top-spacer"/><div className="catalog-label" title={catalogTooltip}><span className="status-light"/>{appInfo?.readonly ? "Katalóg iba na čítanie" : "Katalóg"}</div></header>
     <div className="workspace">
       <LeftPanel onNavigate={navigate} activeFolderId={view.kind === "folder" ? view.id ?? null : null} activeFolderIds={view.kind === "folder" ? view.ids : []} activeView={view} refreshToken={refreshTick}/>
       <section className="center-pane">

@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashSet, path::{Path, PathBuf}, sync::Arc};
+use std::{collections::HashSet, path::Path, sync::Arc};
+#[cfg(test)]
+use std::path::PathBuf;
 
 const DEFAULT_VIEW: &str = include_str!("../metadata_view.json");
 
@@ -18,9 +20,23 @@ pub struct ViewSection { pub name: String, pub subgroups: Vec<ViewSubgroup> }
 pub struct MetadataView { pub version: u32, pub sections: Vec<ViewSection> }
 
 impl MetadataView {
+    #[cfg(test)]
     pub fn load() -> Arc<Self> {
-        Self::load_from(std::env::var_os("DDREAMS_METADATA_VIEW").map(PathBuf::from), std::env::current_exe().ok())
+        let paths = crate::paths::Paths::resolve();
+        Self::load_selected(paths.metadata_view.as_deref())
     }
+
+    pub fn load_selected(path: Option<&Path>) -> Arc<Self> {
+        let Some(path) = path else { return Arc::new(Self::parse(DEFAULT_VIEW).expect("embedded metadata view must be valid")); };
+        match std::fs::read_to_string(path).map_err(|e|e.to_string()).and_then(|source|Self::parse(&source).map_err(|e|e.to_string())) {
+            Ok(view) => Arc::new(view),
+            Err(error) => {
+                eprintln!("Invalid metadata view file {}: {error}; using embedded defaults",path.display());
+                Arc::new(Self::parse(DEFAULT_VIEW).expect("embedded metadata view must be valid"))
+            }
+        }
+    }
+    #[cfg(test)]
     fn load_from(override_path: Option<PathBuf>, executable: Option<PathBuf>) -> Arc<Self> {
         let adjacent = executable.as_deref().and_then(Path::parent).map(|p| p.join("metadata_view.json"));
         let selected = override_path.or_else(|| adjacent.filter(|p| p.is_file()));
