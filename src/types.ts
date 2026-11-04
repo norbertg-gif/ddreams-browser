@@ -10,7 +10,7 @@ export type Asset = {
 };
 export type TileExifMetadata = { iso?: string | null; aperture?: string | null; shutter?: string | null; focalLength?: string | null; lens?: string | null; camera?: string | null; dateTaken?: string | null };
 export type TileExifMetadataItem = TileExifMetadata & { assetId: number };
-export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special"; id?: number; rootId?: number; ids?: number[]; value?: string; title: string; folderPath?: string };
+export type View = { kind: "folder" | "category" | "keyword" | "rating" | "label" | "special" | "date"; id?: number; rootId?: number; ids?: number[]; value?: string; title: string; folderPath?: string; dateFrom?: string; dateTo?: string; dateSource?: "taken" | "database" | "modified"; dateNoDate?: boolean };
 export type ViewFilters = { ratingMode?: "equal" | "atLeast" | "atMost" | "unrated"; ratingValue?: number; labelFilter?: string; taggedOnly?: boolean; fileGroup?: "images" | "raw" | "video" | "other" };
 export type Page = { items: Asset[]; total: number; totalSize: number };
 export type Folder = { id: number; parentId: number | null; rootId: number | null; name: string; path: string | null; count: number; folderIds: number[]; virtualNode?: string | null; offline?: boolean };

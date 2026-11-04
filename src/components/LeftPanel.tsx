@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState, type MutableRefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Folder, View } from "../types";
+import CalendarPane from "./CalendarPane";
 
 const shortcuts = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
-type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; refreshToken?:number };
+type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number };
 
-export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], refreshToken=0 }: Props) {
+export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0 }: Props) {
   const [tab, setTab] = useState<"folders" | "calendar">("folders");
   const [roots, setRoots] = useState<Folder[]>([]);
   const [expanded, setExpanded] = useState(new Set<number>());
@@ -72,7 +73,7 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
   return <aside className="left-pane">
     <section className="shortcuts-pane"><div className="pane-title">SKRATKY</div>{shortcuts.map(s => <button className="shortcut" key={s.path} onClick={() => void clickShortcut(s.path)}><span>▣</span><span><b>{s.name}</b><small>{s.path}</small></span></button>)}</section>
     <div className="left-tabs"><button className={tab === "folders" ? "active" : ""} onClick={() => setTab("folders")}>Priečinky</button><button className={tab === "calendar" ? "active" : ""} onClick={() => setTab("calendar")}>Kalendár</button></div>
-    {tab === "calendar" ? <div className="calendar-placeholder">Pripravuje sa</div> : <div className="folder-tree">
+    {tab === "calendar" ? <CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/> : <div className="folder-tree">
       {error && <div className="inline-error">{error}<button onClick={() => setError("")}>×</button></div>}
       {roots.map(folder => <FolderRow key={folder.id} folder={folder} depth={0} activeIds={activeSet} expanded={expanded} childrenMap={children} loading={loading.has(folder.id)} rowRefs={rowRefs} onToggle={toggle} onNavigate={navigate} />)}
     </div>}

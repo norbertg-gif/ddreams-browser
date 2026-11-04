@@ -119,6 +119,9 @@ class ImportTests(unittest.TestCase):
                 indexes = {row[0] for row in conn.execute("select name from sqlite_master where type='index'")}
                 self.assertIn("idx_assets_listed_ext_name", indexes)
                 self.assertIn("idx_assets_listed_tagged_name", indexes)
+                self.assertIn("idx_assets_listed_exif_date_ext", indexes)
+                self.assertIn("idx_assets_listed_acdsee_date_ext", indexes)
+                self.assertIn("idx_assets_listed_file_modified_ext", indexes)
                 self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_ext_name')")])
                 self.assertIn("size", [row[2] for row in conn.execute("pragma index_info('idx_assets_listed_name')")])
             self.assertIn("Asset: 1 / 1", report)

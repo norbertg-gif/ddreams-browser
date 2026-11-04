@@ -1,4 +1,5 @@
 mod commands;
+mod calendar;
 mod db;
 mod display_metadata;
 mod exiftool;
@@ -7,7 +8,7 @@ mod listing;
 mod metadata_view;
 mod thumbs;
 
-use commands::{DatabaseState, DisplayMetadataState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
+use commands::{CalendarState, DatabaseState, DisplayMetadataState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
 use db::{catalog_path, open_read_only};
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use tauri::http::{Response, StatusCode, header};
@@ -33,6 +34,7 @@ pub fn run() {
     let metadata_view = metadata_view::MetadataView::load();
     let display_metadata = display_metadata::DisplayMetadataCache::new(display_metadata::cache_root());
     let listing = listing::ListingService::new(db.clone(), formats.clone());
+    let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone());
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
@@ -45,6 +47,7 @@ pub fn run() {
         .manage(MetadataViewState(metadata_view))
         .manage(DisplayMetadataState(display_metadata))
         .manage(ThumbnailState(thumbs))
+        .manage(CalendarState(calendar))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();
             let query = request.uri().query().unwrap_or_default();
@@ -99,6 +102,7 @@ pub fn run() {
             });
         })
         .invoke_handler(tauri::generate_handler![
+            commands::get_calendar_aggregate,
             commands::get_assets,
             commands::get_formats,
             commands::get_preview_source,

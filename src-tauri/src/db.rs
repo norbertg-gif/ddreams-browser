@@ -204,6 +204,42 @@ pub struct AssetFilter {
     #[serde(default)] pub file_group: Option<String>,
     #[serde(default)] pub include_categories: bool,
     #[serde(default)] pub include_keywords: bool,
+    #[serde(default)] pub date_from: Option<String>,
+    #[serde(default)] pub date_to: Option<String>,
+    #[serde(default)] pub date_source: Option<String>,
+    #[serde(default)] pub date_no_date: bool,
+}
+
+pub fn date_column(source: Option<&str>) -> Option<&'static str> {
+    match source.unwrap_or("taken") { "taken" => Some("a.exif_date"), "database" => Some("a.acdsee_date"), "modified" => Some("a.file_modified"), _ => None }
+}
+
+pub fn valid_date_sql(column: &str) -> String {
+    format!("{column} IS NOT NULL AND length({column})>=10 AND substr({column},1,4) GLOB '[0-9][0-9][0-9][0-9]' AND substr({column},1,4)>='1900' AND substr({column},5,1)='-' AND CAST(substr({column},6,2) AS INTEGER) BETWEEN 1 AND 12 AND substr({column},8,1)='-' AND CAST(substr({column},9,2) AS INTEGER) BETWEEN 1 AND 31")
+}
+
+pub fn next_date(date: &str) -> Option<String> {
+    let bytes=date.as_bytes();
+    if bytes.len()!=10 || bytes[4]!=b'-' || bytes[7]!=b'-' { return None; }
+    let year=date[0..4].parse::<i32>().ok()?; let month=date[5..7].parse::<u32>().ok()?; let day=date[8..10].parse::<u32>().ok()?;
+    if !(1900..=9998).contains(&year) || !(1..=12).contains(&month) { return None; }
+    let leap=year%4==0&&(year%100!=0||year%400==0);
+    let days=[31,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];
+    if day==0||day>days[(month-1) as usize] { return None; }
+    let (ny,nm,nd)=if day<days[(month-1) as usize]{(year,month,day+1)}else if month<12{(year,month+1,1)}else{(year+1,1,1)};
+    Some(format!("{ny:04}-{nm:02}-{nd:02}"))
+}
+
+fn add_date_filter(where_sql:&mut String,args:&mut Vec<rusqlite::types::Value>,filter:&AssetFilter,formats:&FormatTable){
+    let Some(column)=date_column(filter.date_source.as_deref()) else { where_sql.push_str(" AND 0");return; };
+    where_sql.push_str(&format!(" AND {}",formats.sql_in("a.ext_lower", &["image","raw","video"])));
+    let valid=valid_date_sql(column);
+    if filter.date_no_date { where_sql.push_str(&format!(" AND CASE WHEN {valid} THEN 0 ELSE 1 END=1"));return; }
+    let (Some(from),Some(to))=(filter.date_from.as_deref(),filter.date_to.as_deref()) else { where_sql.push_str(" AND 0");return; };
+    let Some(exclusive)=next_date(to) else { where_sql.push_str(" AND 0");return; };
+    if next_date(from).is_none() || from>to { where_sql.push_str(" AND 0");return; }
+    where_sql.push_str(&format!(" AND ({valid}) AND {column}>=? AND {column}<?"));
+    args.push(from.to_owned().into());args.push(exclusive.into());
 }
 
 fn descendant_assets_cte(filter: &AssetFilter) -> Option<(String, rusqlite::types::Value)> {
@@ -375,6 +411,7 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             _ => where_sql.push_str(" AND 0"),
         },
+        "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
         _ => {
             where_sql.push_str(" AND 0");
         }
@@ -518,6 +555,7 @@ pub fn asset_ids_page(
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             _ => where_sql.push_str(" AND 0"),
         },
+        "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
         _ => where_sql.push_str(" AND 0"),
     }
     add_view_filters(&mut where_sql, &mut args, filter, formats);
@@ -841,7 +879,7 @@ mod feature_tests {
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
         let unrated = asset(1, "a.jpg", None, None);
         let rated = asset(2, "b.jpg", Some(10.0), Some(4));
-        let mut f = AssetFilter { kind:"folder".into(), id:None, root_id:None, include_children:false, folder_path:None, ids:None, value:None, query:None, sort:"name".into(), descending:false, offset:0, limit:100, rating_mode:Some("atLeast".into()), rating_value:Some(3), label_filter:None, tagged_only:false, include_categories:false,include_keywords:false,file_group:Some("images".into()) };
+        let mut f = AssetFilter { kind:"folder".into(), id:None, root_id:None, include_children:false, folder_path:None, ids:None, value:None, query:None, sort:"name".into(), descending:false, offset:0, limit:100, rating_mode:Some("atLeast".into()), rating_value:Some(3), label_filter:None, tagged_only:false, include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:Some("images".into()) };
         assert!(asset_filter_matches(&rated, &f, &formats));
         assert!(!asset_filter_matches(&unrated, &f, &formats));
         f.rating_mode = Some("unrated".into());
@@ -854,7 +892,7 @@ mod feature_tests {
         c.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);CREATE TABLE categories(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);CREATE TABLE keywords(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER,PRIMARY KEY(asset_id,keyword_id));CREATE INDEX idx_asset_categories_category_asset ON asset_categories(category_id,asset_id);CREATE INDEX idx_asset_keywords_keyword_asset ON asset_keywords(keyword_id,asset_id);CREATE INDEX idx_categories_parent_id ON categories(parent_id);CREATE INDEX idx_keywords_parent_id ON keywords(parent_id);").unwrap();
         Arc::new(Mutex::new(c))
     }
-    fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,file_group:None} }
+    fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
     #[test] fn special_items_use_listed_photos_and_relationships(){
         let db=test_db();db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,tagged,rating) VALUES(1,'a.jpg','jpg','jpg',1,10,1,4),(2,'b.doc','doc','doc',1,20,0,5),(3,'gone.jpg','jpg','jpg',0,30,1,3),(4,'d.png','png','png',1,40,0,NULL);INSERT INTO asset_categories VALUES(1,9),(2,9);INSERT INTO asset_keywords VALUES(1,8);").unwrap();
         for (kind,count) in [("all_photos",2),("uncategorized",1),("unkeyworded",1),("tagged",1)] { assert_eq!(assets_page(&db,&test_filter("special",kind),&FormatTable::parse(include_str!("../formats.json")).unwrap()).unwrap().total,count,"{kind}"); }
@@ -990,7 +1028,7 @@ mod benches {
                 descending: false,
                 offset: 0,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -1031,7 +1069,7 @@ mod benches {
                 descending: false,
                 offset: 3000,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -1086,7 +1124,7 @@ mod benches {
                 descending: false,
                 offset: 0,
                 limit: 100,
-                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
+                rating_mode: None, rating_value: None, label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group: None,
             }, &formats,
         )
         .unwrap();
@@ -1110,7 +1148,7 @@ mod benches {
             kind: "category".into(), id: None, root_id: Some(root.id), include_children: true,
             folder_path: None, ids: None, value: None, query: None, sort: "name".into(),
             descending: false, offset: 0, limit: 100, rating_mode: None, rating_value: None,
-            label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,file_group: None,
+            label_filter: None, tagged_only: false, include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group: None,
         }, &formats).unwrap();
         println!("largest category root (id {}, tree count {}, view total {}, first page {}): {:?}", root.id, root.count, page.total, page.items.len(), started.elapsed());
     }
@@ -1121,7 +1159,7 @@ mod benches {
         let db=Arc::new(Mutex::new(open_read_only(&db_path()).unwrap()));
         let formats=FormatTable::load();
         for value in ["all_photos","uncategorized","unkeyworded","tagged"] {
-            let t=Instant::now();let p=assets_page(&db,&AssetFilter{kind:"special".into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:100,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,file_group:None},&formats).unwrap();
+            let t=Instant::now();let p=assets_page(&db,&AssetFilter{kind:"special".into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:100,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None},&formats).unwrap();
             println!("special {value}: total {}, first page {}, {:?}",p.total,p.items.len(),t.elapsed());
         }
     }

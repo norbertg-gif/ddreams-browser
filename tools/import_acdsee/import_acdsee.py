@@ -193,6 +193,9 @@ def schema(conn: sqlite3.Connection) -> None:
       CREATE INDEX idx_assets_listed_name ON assets(is_listed,name COLLATE NOCASE,id,size,tagged);
       CREATE INDEX idx_assets_listed_ext_name ON assets(is_listed,ext_lower,name COLLATE NOCASE,id,size);
       CREATE INDEX idx_assets_listed_tagged_name ON assets(is_listed,tagged,name COLLATE NOCASE,id,size);
+      CREATE INDEX idx_assets_listed_exif_date_ext ON assets(is_listed,exif_date,ext_lower);
+      CREATE INDEX idx_assets_listed_acdsee_date_ext ON assets(is_listed,acdsee_date,ext_lower);
+      CREATE INDEX idx_assets_listed_file_modified_ext ON assets(is_listed,file_modified,ext_lower);
       CREATE INDEX idx_folders_parent_id ON folders(parent_id);
       CREATE INDEX idx_folders_root_id ON folders(root_id);
       CREATE INDEX idx_categories_parent_id ON categories(parent_id);
