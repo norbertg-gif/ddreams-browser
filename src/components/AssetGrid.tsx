@@ -58,7 +58,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   paramsKeyRef.current = paramsKey;
   const tileWidth = zoom + 26;
   const infoLineCount = thumbnailInfo.fields.reduce((sum, field) => sum + field.lines, 0);
-  const infoHeight = Math.max(27, infoLineCount * 14);
+  const infoHeight = Math.max(27, 8 + infoLineCount * 14);
   const rowHeight = zoom + 30 + infoHeight;
 
   const fetchPage = useCallback(async (offset: number, version: number) => {
@@ -252,7 +252,7 @@ function AssetTile({ asset, size, epoch, selected, primary, onViewport, onClick,
       {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
       {!asset.isDirectory && !hasSizeLine && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
-    <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines }} title={text}>{text || "\u00a0"}</div>; })}</div>
+    <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines, maxHeight: field.lines * 14 }} title={text}>{text || "\u00a0"}</div>; })}</div>
     {menu&&createPortal(<div className="tile-context-menu" style={{left:Math.min(menu.x,window.innerWidth-225),top:Math.min(menu.y,window.innerHeight-155)}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected && selectedIds.length ? selectedIds : [asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button><button onClick={()=>{setMenu(null);onOpenThumbnailInfo()}}>Údaje pod náhľadmi…</button></div>,document.body)}
     {popup && createPortal(
       <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>
