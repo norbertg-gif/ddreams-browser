@@ -114,6 +114,7 @@ pub fn run() {
             commands::get_app_info,
             commands::get_recent_changes,
             commands::undo_last_change,
+            commands::set_asset_values,
             commands::get_calendar_aggregate,
             commands::get_assets,
             commands::get_formats,

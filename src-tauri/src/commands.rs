@@ -4,7 +4,7 @@ use crate::{
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
-    journal::{CatalogWriter, ChangeSummary},
+    journal::{CatalogWriter, ChangeSummary, ListedAsset, SetAssetValuesResult},
     listing::ListingService,
     metadata_view::{self, MetadataView},
     paths::AppInfo,
@@ -38,6 +38,29 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
 #[tauri::command]
 pub fn undo_last_change(state: State<'_, CatalogWriterState>) -> Result<Option<ChangeSummary>, String> {
     state.0.undo_last()
+}
+
+#[tauri::command]
+pub fn set_asset_values(
+    state: State<'_, CatalogWriterState>,
+    listing: State<'_, ListingState>,
+    asset_ids: Vec<i64>,
+    changes: serde_json::Map<String, Value>,
+) -> Result<SetAssetValuesResult, String> {
+    let mut candidates = Vec::new();
+    let mut file_ids = asset_ids.iter().copied().filter(|id| *id >= 0).collect::<Vec<_>>();
+    for id in asset_ids.iter().copied().filter(|id| *id < 0) {
+        let asset = listing.0.asset(id).ok_or_else(|| format!("Listed asset {id} is no longer available"))?;
+        if asset.is_directory || asset.ext.is_empty() { continue; }
+        let path = asset.path.ok_or_else(|| format!("Path for listed asset {id} is unavailable"))?;
+        let folder_path = Path::new(&path).parent().map(|parent| parent.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;
+        candidates.push(ListedAsset { temporary_id: id, name: asset.name, ext: asset.ext, size: asset.size, file_modified: asset.file_modified, path, folder_path });
+        file_ids.push(id);
+    }
+    let result = state.0.set_asset_values(&file_ids, &candidates, &changes)?;
+    for id in asset_ids.iter().copied().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
+    for candidate in candidates { let _ = listing.0.invalidate_path(&candidate.folder_path); }
+    Ok(result)
 }
 
 #[tauri::command]
@@ -215,8 +238,9 @@ fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
         }
     };
     add("Caption", a.caption.clone()); add("Notes", a.notes.clone()); add("Author", a.author.clone());
-    add("Rating", a.rating.filter(|v| *v > 0).map(|v| v.to_string())); add("Label", a.label.clone());
-    add("Tagged", a.tagged.map(|v| if v != 0 { "Áno" } else { "Nie" }.into()));
+    add("Rating", Some(a.rating.filter(|v| *v > 0).map(|v| v.to_string()).unwrap_or_else(|| "0".into())));
+    add("Label", Some(a.label.clone().unwrap_or_else(|| "-".into())));
+    add("Tagged", Some(if a.tagged.unwrap_or(0) != 0 { "Áno" } else { "Nie" }.into()));
     add("Categories", (!data.categories.is_empty()).then(||data.categories.join(", ")));
     add("Keywords", (!data.keywords.is_empty()).then(||data.keywords.join(", ")));
     add("Date taken", a.exif_date.clone());

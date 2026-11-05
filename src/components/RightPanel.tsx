@@ -4,8 +4,8 @@ import type { CatalogAssetLinks, Node as CatalogNode, Metadata, MetadataRow, Roo
 import { labelColor, labelText } from "./AssetGrid";
 import { readStored, writeStored } from "../storage";
 
-type Props = { primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void };
-export default function RightPanel({ primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate }: Props) {
+type Props = { primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; readOnly:boolean; refreshToken:number };
+export default function RightPanel({ primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, readOnly, refreshToken }: Props) {
   const [tab, setTab] = useState<"properties" | "catalog">("properties");
   const [metadata, setMetadata] = useState<Metadata | null>(null);
   const [loading, setLoading] = useState(false);
@@ -22,7 +22,7 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
     setMetadata(null); setSelectedRows([]); if (primaryId == null) return;
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
-  }, [primaryId]);
+  }, [primaryId, refreshToken]);
   useEffect(() => writeStored("ddreams.metadataOpen", [...openGroups]), [openGroups]);
   const groups = useMemo(() => {
     const rows = metadata?.rows ?? [];
@@ -85,7 +85,7 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
           {[...new Set(group.rows.map(row=>row.subgroup))].map(subgroup=><div className="metadata-subgroup" key={subgroup}>
             {group.rows.some(row=>row.subgroup) && <div className="metadata-subgroup-title">{subgroup}</div>}
             {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setSelectedRows([rowKey(row)]); setRowAnchor(rowKey(row)); setCopyMenu(true); }}>
-              <span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "ACDSee" && row.name === "Farebný štítok" ? labelText(row.value) : row.value}</b>
+              <span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "ACDSee" && row.name === "Hodnotenie" ? <span className="property-rating">{[1,2,3,4,5].map(value=><button key={value} disabled={readOnly} className={Number(row.value)>=value?"active":""} title={`${value} / 5`} onClick={e=>{e.stopPropagation();onSetValues(selectedIds.length?selectedIds:primaryId==null?[]:[primaryId],{rating:value})}}>★</button>)}<button disabled={readOnly} title="Bez hodnotenia" onClick={e=>{e.stopPropagation();onSetValues(selectedIds.length?selectedIds:primaryId==null?[]:[primaryId],{rating:null})}}>×</button></span> : group.name === "ACDSee" && row.name === "Farebný štítok" ? <span className="property-labels">{[["Red","Červená"],["Yellow","Žltá"],["Green","Zelená"],["Blue","Modrá"],["Purple","Fialová"]].map(([value,label])=><button key={value} disabled={readOnly} title={label} className={row.value.toLowerCase()===value.toLowerCase()?"active":""} onClick={e=>{e.stopPropagation();onSetValues(selectedIds.length?selectedIds:primaryId==null?[]:[primaryId],{label:value})}}><i style={{background:labelColor(value)}}/></button>)}<button disabled={readOnly} title="Bez štítku" onClick={e=>{e.stopPropagation();onSetValues(selectedIds.length?selectedIds:primaryId==null?[]:[primaryId],{label:null})}}>×</button></span> : group.name === "ACDSee" && row.name === "Označené" ? <input type="checkbox" disabled={readOnly} checked={row.value==="Áno"} onClick={e=>e.stopPropagation()} onChange={e=>onSetValues(selectedIds.length?selectedIds:primaryId==null?[]:[primaryId],{tagged:e.target.checked})}/> : row.value}</b>
             </div>)}
           </div>)}
         </div>}
@@ -93,11 +93,11 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
       <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
-    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} />}
+    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} refreshToken={refreshToken} />}
   </aside>;
 }
 
-function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, primaryId }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null }) {
+function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, primaryId, refreshToken }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null; refreshToken:number }) {
   const [roots,setRoots]=useState<Root[]>([]);
   const [openRoots,setOpenRoots]=useState(new Set<number>());
   const [cats,setCats]=useState(new Map<number,CatalogNode[]>());
@@ -140,7 +140,7 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, pr
     const allKeywords=[...keywords,...[...keywordChildren.values()].flat()];
     for(const id of openKeywords){if(allKeywords.some(n=>n.id===id))load(invoke<CatalogNode[]>("get_catalog_nodes",{kind:"keyword",parentId:id,rootId:null,includeChildren,offset:0,limit:500}),nodes=>setKeywordChildren(p=>new Map(p).set(id,nodes)));}
     return()=>{active=false};
-  },[includeChildren]);
+  },[includeChildren,refreshToken]);
 
   useEffect(()=>{
     if(!keywordQuery.trim()){setKeywordResults([]);setCategoryResults([]);return;}

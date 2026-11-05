@@ -23,8 +23,22 @@ impl ListingService {
 
     pub fn invalidate(&self, folder_id: i64) -> Result<(), String> {
         let path = self.asset(folder_id).and_then(|a| a.path).or_else(|| db::folder_ancestors(&self.db, folder_id).ok()?.last()?.path.clone()).ok_or("folder path unavailable")?;
-        self.listings.lock().map_err(|_| "listing cache poisoned")?.remove(&normalize(&path));
+        self.invalidate_path(&path)?;
         Ok(())
+    }
+
+    pub fn invalidate_path(&self, path: &str) -> Result<(), String> {
+        self.listings.lock().map_err(|_| "listing cache poisoned")?.remove(&normalize(path));
+        Ok(())
+    }
+
+    pub fn invalidate_asset_parent(&self, asset_id: i64) -> Result<(), String> {
+        let path: String = self.db.lock().map_err(|_| "catalog lock poisoned")?
+            .query_row("SELECT coalesce(path,'') FROM assets WHERE id=?1", [asset_id], |row| row.get(0))
+            .map_err(|e| e.to_string())?;
+        if path.is_empty() { return Err("asset path unavailable".into()); }
+        let parent = Path::new(&path).parent().ok_or("asset parent unavailable")?.to_string_lossy().to_string();
+        self.invalidate_path(&parent)
     }
 
     fn list(&self, path: &str, folder_ids: &[i64]) -> (Vec<Asset>, bool) {
@@ -57,6 +71,8 @@ impl ListingService {
             return (rows, true);
         }};
         let contexts = db::folder_disk_context(&self.db, folder_ids).unwrap_or_default();
+        let parent_folder_id = db::folder_by_path(&self.db, path).ok().flatten().map(|folder| folder.id)
+            .or_else(|| (folder_ids.len() == 1 && folder_ids[0] > 0).then_some(folder_ids[0]));
         let mut known = HashMap::<String, Asset>::new();
         for (_, catalog_path, assets) in contexts { if normalize(&catalog_path)==key { for asset in assets { known.insert(asset.name.to_lowercase(), asset); } } }
         let mut rows = Vec::with_capacity(disk.len());
@@ -65,7 +81,7 @@ impl ListingService {
             let ext = if is_dir { String::new() } else { full.extension().unwrap_or_default().to_string_lossy().trim_start_matches('.').to_ascii_lowercase() };
             let matched_folder = if is_dir { db::folder_by_path(&self.db, &full.to_string_lossy()).ok().flatten().map(|f|f.id) } else { None };
             let mut asset = known.remove(&name.to_lowercase()).unwrap_or_else(|| Asset {
-                id: self.id(), folder_id: matched_folder, name: name.clone(), ext: ext.clone(), size: None,
+                id: self.id(), folder_id: if is_dir { matched_folder } else { parent_folder_id }, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,
                 label: None, file_modified: None, exif_date: None, acdsee_date: None, md_dirty: None, is_orphan: None,
                 path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, has_categories: false, display_categories: None, display_keywords: None,
