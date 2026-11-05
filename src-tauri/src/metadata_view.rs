@@ -8,7 +8,7 @@ const DEFAULT_VIEW: &str = include_str!("../metadata_view.json");
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct ViewField { pub label: String, pub keys: Vec<String>, #[serde(default)] pub format: Option<String> }
+pub struct ViewField { pub label: String, pub keys: Vec<String>, #[serde(default)] pub format: Option<String>, #[serde(default)] pub always: bool }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ViewSubgroup { pub name: String, pub fields: Vec<ViewField> }
@@ -134,6 +134,8 @@ pub fn curate(view: &MetadataView, tags: &[RawTag], db_tags: &[RawTag]) -> Vec<C
                 if let Some((value, keys)) = resolve_field(field, &all) {
                     consumed.extend(keys);
                     rows.push(CuratedRow { group: section.name.clone(), subgroup: subgroup.name.clone(), name: field.label.clone(), value });
+                } else if field.always {
+                    rows.push(CuratedRow { group: section.name.clone(), subgroup: subgroup.name.clone(), name: field.label.clone(), value: String::new() });
                 }
             }
         }
@@ -178,7 +180,7 @@ mod tests {
     #[test] fn formats_values() { assert_eq!(format_value(Some("fnumber"),"5.0"),"f/5"); assert_eq!(format_value(Some("fnumber"),"0"),"f/0"); assert_eq!(format_value(Some("fnumber"),"2.8"),"f/2.8"); assert_eq!(format_value(Some("seconds"),"1/250"),"1/250 s"); assert_eq!(format_value(Some("dimensions"),"6048x4024"),"6048 × 4024"); assert_eq!(format_date("2020-06-13T11:25:25"),"13. 6. 2020 11:25:25"); }
     #[test] fn formats_dates_and_preserves_timezone() { assert_eq!(format_date("2019:05:17 13:05:38+02:00"),"17. 5. 2019 13:05:38+02:00"); assert_eq!(format_date("bad"),"bad"); }
     #[test] fn first_non_empty_key_wins_and_combined_keys_work() {
-        let f=ViewField{label:"Poloha".into(),keys:vec!["Composite:GPSPosition".into(),"GPSLatitude+GPSLongitude".into()],format:None};
+        let f=ViewField{label:"Poloha".into(),keys:vec!["Composite:GPSPosition".into(),"GPSLatitude+GPSLongitude".into()],format:None,always:false};
         let tags=vec![RawTag{key:"Composite:GPSPosition".into(),group:"Composite".into(),name:"GPSPosition".into(),value:"  ".into()},RawTag{key:"GPS:GPSLatitude".into(),group:"GPS".into(),name:"GPSLatitude".into(),value:"48 N".into()},RawTag{key:"GPS:GPSLongitude".into(),group:"GPS".into(),name:"GPSLongitude".into(),value:"17 E".into()}];
         assert_eq!(resolve_field(&f,&tags).unwrap().0,"48 N 17 E");
     }

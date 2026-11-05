@@ -67,7 +67,7 @@
         { "label": "Popis", "keys": ["Db:Caption"] }, { "label": "Poznámky", "keys": ["Db:Notes"] },
         { "label": "Autor", "keys": ["Db:Author"] }, { "label": "Hodnotenie", "keys": ["Db:Rating"] },
         { "label": "Farebný štítok", "keys": ["Db:Label"] }, { "label": "Označené", "keys": ["Db:Tagged"] },
-        { "label": "Kategórie", "keys": ["Db:Categories"] }, { "label": "Kľúčové slová", "keys": ["Db:Keywords"] }
+        { "label": "Kategórie", "keys": ["Db:Categories"], "always": true }, { "label": "Kľúčové slová", "keys": ["Db:Keywords"], "always": true }
       ] }
     ] }
   ]

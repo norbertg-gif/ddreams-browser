@@ -4,7 +4,7 @@ use crate::{
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
-    journal::{CatalogWriter, CategoryDeleteInfo, CategoryMutationResult, ChangeSummary, ListedAsset, SetAssetCategoriesResult, SetAssetValuesResult},
+    journal::{CatalogWriter, CategoryDeleteInfo, CategoryMutationResult, ChangeSummary, KeywordDeleteInfo, KeywordMutationResult, ListedAsset, SetAssetCategoriesResult, SetAssetKeywordsResult, SetAssetValuesResult},
     listing::ListingService,
     metadata_view::{self, MetadataView},
     paths::AppInfo,
@@ -97,6 +97,14 @@ pub fn get_category_selection_counts(db:State<'_,DatabaseState>,listing:State<'_
 }
 
 #[tauri::command]
+pub fn get_keyword_selection_counts(db:State<'_,DatabaseState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>)->Result<CategorySelectionCounts,String>{
+    let mut positive=Vec::new();let mut total=0usize;for id in asset_ids{if id<0{if listing.0.asset(id).is_some_and(|a|!a.is_directory&&!a.ext.is_empty()){total+=1;}}else{positive.push(id);}}
+    let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;for chunk in positive.chunks(500){if chunk.is_empty(){continue;}let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT count(*) FROM assets WHERE is_listed=1 AND ext_lower<>'' AND id IN ({marks})");total+=conn.query_row(&sql,rusqlite::params_from_iter(chunk.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? as usize;}
+    let mut assigned=std::collections::HashMap::new();for chunk in positive.chunks(500){if chunk.is_empty(){continue;}let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT ak.keyword_id,count(DISTINCT ak.asset_id) FROM asset_keywords ak JOIN assets a ON a.id=ak.asset_id WHERE a.is_listed=1 AND a.ext_lower<>'' AND ak.asset_id IN ({marks}) GROUP BY ak.keyword_id");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let rows=stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?;for row in rows{let(id,count)=row.map_err(|e|e.to_string())?;*assigned.entry(id).or_insert(0)+=count as usize;}}
+    Ok(CategorySelectionCounts{total_files:total,assigned})
+}
+
+#[tauri::command]
 pub fn create_category(state:State<'_,CatalogWriterState>,parent_id:Option<i64>,name:String)->Result<CategoryMutationResult,String>{state.0.create_category(parent_id,&name)}
 #[tauri::command]
 pub fn rename_category(state:State<'_,CatalogWriterState>,id:i64,name:String)->Result<CategoryMutationResult,String>{state.0.rename_category(id,&name)}
@@ -106,6 +114,30 @@ pub fn move_category(state:State<'_,CatalogWriterState>,id:i64,new_parent_id:Opt
 pub fn get_category_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryDeleteInfo,String>{state.0.category_delete_info(id)}
 #[tauri::command]
 pub fn delete_category(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryMutationResult,String>{state.0.delete_category(id)}
+
+#[tauri::command]
+pub fn set_asset_keywords(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
+    let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
+    for id in asset_ids.iter().copied().filter(|id|*id<0){let Some(asset)=listing.0.asset(id)else{continue};if asset.is_directory||asset.ext.is_empty(){continue;}let path=asset.path.ok_or_else(||format!("Listed file {id} has no resolved path"))?;let folder_path=Path::new(&path).parent().map(|p|p.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);}
+    let result=state.0.set_asset_keywords(&file_ids,&candidates,keyword_id,assign)?;for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
+}
+#[tauri::command]
+pub fn create_and_assign_keyword(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,parent_id:Option<i64>,name:String)->Result<SetAssetKeywordsResult,String>{
+    let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();for id in asset_ids.iter().copied().filter(|id|*id<0){let Some(asset)=listing.0.asset(id)else{continue};if asset.is_directory||asset.ext.is_empty(){continue;}let path=asset.path.ok_or_else(||format!("Listed file {id} has no resolved path"))?;let folder_path=Path::new(&path).parent().map(|p|p.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);}
+    let result=state.0.create_and_assign_keyword(&file_ids,&candidates,parent_id,&name)?;for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
+}
+#[tauri::command]
+pub fn create_keyword(state:State<'_,CatalogWriterState>,parent_id:Option<i64>,name:String)->Result<KeywordMutationResult,String>{state.0.create_keyword(parent_id,&name)}
+#[tauri::command]
+pub fn rename_keyword(state:State<'_,CatalogWriterState>,id:i64,name:String)->Result<KeywordMutationResult,String>{state.0.rename_keyword(id,&name)}
+#[tauri::command]
+pub fn move_keyword(state:State<'_,CatalogWriterState>,id:i64,new_parent_id:Option<i64>)->Result<KeywordMutationResult,String>{state.0.move_keyword(id,new_parent_id)}
+#[tauri::command]
+pub fn get_keyword_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Result<KeywordDeleteInfo,String>{state.0.keyword_delete_info(id)}
+#[tauri::command]
+pub fn delete_keyword(state:State<'_,CatalogWriterState>,id:i64)->Result<KeywordMutationResult,String>{state.0.delete_keyword(id)}
+#[tauri::command]
+pub fn search_keyword_options(state:State<'_,DatabaseState>,query:String)->Result<Vec<db::KeywordOption>,String>{db::keyword_options(&state.0,&query).map_err(|e|e.to_string())}
 
 #[tauri::command]
 pub fn get_calendar_aggregate(state: State<'_, CalendarState>, source: String) -> Result<CalendarAggregate, String> {

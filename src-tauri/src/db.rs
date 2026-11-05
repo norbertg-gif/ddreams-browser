@@ -1,7 +1,7 @@
 use crate::formats::FormatTable;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path, sync::{Arc, Mutex}};
+use std::{collections::{HashMap, HashSet}, path::Path, sync::{Arc, Mutex}};
 #[cfg(test)]
 use std::path::PathBuf;
 
@@ -165,6 +165,7 @@ pub struct CatalogAssetLinks {
     pub category_paths: Vec<CategoryPath>,
     pub category_ancestor_ids: Vec<i64>,
     pub keyword_ids: Vec<i64>,
+    pub keyword_paths: Vec<CategoryPath>,
     pub keyword_ancestor_ids: Vec<i64>,
     pub root_ids: Vec<i64>,
 }
@@ -202,6 +203,10 @@ fn map_asset(row: &rusqlite::Row<'_>, include_categories: bool, include_keywords
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryPath { pub id: i64, pub path: String }
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeywordOption { pub id: i64, pub name: String, pub path: String }
 
 const ASSET_COLS: &str = "a.id,a.folder_id,a.name,a.ext,a.size,a.width,a.height,a.bpp,a.caption,a.notes,a.author,a.rating,a.tagged,a.label,a.file_modified,a.exif_date,a.acdsee_date,a.md_dirty,a.is_orphan,a.path,EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)";
 fn asset_cols(include_categories: bool, include_keywords: bool) -> String {
@@ -901,13 +906,21 @@ pub fn asset_catalog_links(db: &Db, id: i64) -> rusqlite::Result<Option<CatalogA
     }
     let keyword_ids = conn.prepare("SELECT keyword_id FROM asset_keywords WHERE asset_id=? ORDER BY keyword_id")?
         .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut keyword_paths=Vec::with_capacity(keyword_ids.len());for keyword_id in &keyword_ids{let mut names=Vec::new();let mut current=Some(*keyword_id);let mut seen=HashSet::new();while let Some(key)=current{if !seen.insert(key){break;}let row:Option<(String,Option<i64>)>=conn.query_row("SELECT name,parent_id FROM keywords WHERE id=?",[key],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;let Some((name,parent))=row else{break};names.push(name);current=parent;}names.reverse();keyword_paths.push(CategoryPath{id:*keyword_id,path:names.join(" › ")});}
     let category_ancestor_ids = conn.prepare("WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM categories WHERE id IN (SELECT category_id FROM asset_categories WHERE asset_id=?) AND parent_id IS NOT NULL UNION SELECT c.parent_id FROM categories c JOIN ancestors a ON c.id=a.id WHERE c.parent_id IS NOT NULL) SELECT id FROM ancestors ORDER BY id")?
         .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let keyword_ancestor_ids = conn.prepare("WITH RECURSIVE ancestors(id) AS (SELECT parent_id FROM keywords WHERE id IN (SELECT keyword_id FROM asset_keywords WHERE asset_id=?) AND parent_id IS NOT NULL UNION SELECT k.parent_id FROM keywords k JOIN ancestors a ON k.id=a.id WHERE k.parent_id IS NOT NULL) SELECT id FROM ancestors ORDER BY id")?
         .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
     let root_ids = conn.prepare("SELECT DISTINCT c.root_id FROM asset_categories ac JOIN categories c ON c.id=ac.category_id WHERE ac.asset_id=? AND c.root_id IS NOT NULL ORDER BY c.root_id")?
         .query_map([id], |r| r.get::<_, i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(Some(CatalogAssetLinks { category_ids, category_paths, category_ancestor_ids, keyword_ids, keyword_ancestor_ids, root_ids }))
+    Ok(Some(CatalogAssetLinks { category_ids, category_paths, category_ancestor_ids, keyword_ids, keyword_paths, keyword_ancestor_ids, root_ids }))
+}
+
+pub fn keyword_options(db:&Db,query:&str)->rusqlite::Result<Vec<KeywordOption>>{
+    let conn=db.lock().unwrap();let rows=conn.prepare("SELECT id,parent_id,name FROM keywords ORDER BY id")?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,String>(2)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let by_id=rows.iter().map(|(id,parent,name)|(*id,(*parent,name.clone()))).collect::<HashMap<_,_>>();let needle=query.trim().to_lowercase();let mut found=Vec::new();
+    for(id,_,name)in rows{if !needle.is_empty()&&!name.to_lowercase().contains(&needle){continue;}let mut current=Some(id);let mut seen=HashSet::new();let mut names=Vec::new();while let Some(key)=current{if !seen.insert(key){break;}let Some((parent,label))=by_id.get(&key)else{break};names.push(label.clone());current=*parent;}names.reverse();found.push((!name.to_lowercase().starts_with(&needle),name.to_lowercase(),KeywordOption{id,name,path:names.join(" › ")}));}
+    found.sort_by(|a,b|a.0.cmp(&b.0).then(a.1.cmp(&b.1)).then(a.2.path.cmp(&b.2.path)));Ok(found.into_iter().take(30).map(|(_,_,item)|item).collect())
 }
 
 #[cfg(test)]
