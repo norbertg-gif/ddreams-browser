@@ -4,7 +4,7 @@ use crate::{
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
-    journal::{CatalogWriter, ChangeSummary, ListedAsset, SetAssetValuesResult},
+    journal::{CatalogWriter, ChangeSummary, ListedAsset, SetAssetCategoriesResult, SetAssetValuesResult},
     listing::ListingService,
     metadata_view::{self, MetadataView},
     paths::AppInfo,
@@ -61,6 +61,39 @@ pub fn set_asset_values(
     for id in asset_ids.iter().copied().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
     for candidate in candidates { let _ = listing.0.invalidate_path(&candidate.folder_path); }
     Ok(result)
+}
+
+#[tauri::command]
+pub fn set_asset_categories(
+    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, category_id: i64, assign: bool,
+) -> Result<SetAssetCategoriesResult, String> {
+    let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
+    for id in asset_ids.iter().copied().filter(|id|*id<0){
+        let Some(asset)=listing.0.asset(id) else { continue; };
+        if asset.is_directory||asset.ext.is_empty(){continue;}
+        let path=asset.path.ok_or_else(||format!("Listed file {id} has no resolved path"))?;
+        let folder_path=Path::new(&path).parent().map(|p|p.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;
+        candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);
+    }
+    let result=state.0.set_asset_categories(&file_ids,&candidates,category_id,assign)?;
+    for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}
+    for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}
+    Ok(result)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct CategorySelectionCounts { pub total_files:usize, pub assigned:std::collections::HashMap<i64,usize> }
+
+#[tauri::command]
+pub fn get_category_selection_counts(db:State<'_,DatabaseState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>)->Result<CategorySelectionCounts,String>{
+    let mut positive=Vec::new();let mut total=0usize;
+    for id in asset_ids{if id<0{if listing.0.asset(id).is_some_and(|a|!a.is_directory&&!a.ext.is_empty()){total+=1;}}else{positive.push(id);}}
+    let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+    for chunk in positive.chunks(500){let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT count(*) FROM assets WHERE is_listed=1 AND ext_lower<>'' AND id IN ({marks})");total+=conn.query_row(&sql,rusqlite::params_from_iter(chunk.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? as usize;}
+    let mut assigned=std::collections::HashMap::new();
+    for chunk in positive.chunks(500){if chunk.is_empty(){continue;}let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT ac.category_id,count(DISTINCT ac.asset_id) FROM asset_categories ac JOIN assets a ON a.id=ac.asset_id WHERE a.is_listed=1 AND a.ext_lower<>'' AND ac.asset_id IN ({marks}) GROUP BY ac.category_id");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let rows=stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?;for row in rows{let(id,count)=row.map_err(|e|e.to_string())?;*assigned.entry(id).or_insert(0)+=count as usize;}}
+    Ok(CategorySelectionCounts{total_files:total,assigned})
 }
 
 #[tauri::command]

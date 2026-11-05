@@ -47,6 +47,15 @@ pub struct SetAssetValuesResult {
     pub assets: Vec<AssetValueState>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAssetCategoriesResult {
+    pub change_id: Option<i64>,
+    pub summary: String,
+    pub changed_count: usize,
+    pub remapped_ids: Vec<AssetIdRemap>,
+}
+
 #[derive(Clone, Debug)]
 struct StoredItem { table_name: String, row_key: String, column_name: String, old_value: SqlValue, new_value: SqlValue }
 
@@ -178,6 +187,77 @@ impl CatalogWriter {
         Ok(SetAssetValuesResult { change_id, summary, remapped_ids, assets: targets })
     }
 
+    pub fn set_asset_categories(&self, asset_ids: &[i64], listed_assets: &[ListedAsset], category_id: i64, assign: bool) -> Result<SetAssetCategoriesResult, String> {
+        self.require_write()?;
+        let candidates = listed_assets.iter().map(|asset| (asset.temporary_id, asset)).collect::<HashMap<_, _>>();
+        let mut ids = asset_ids.iter().copied().collect::<Vec<_>>();
+        ids.sort_unstable(); ids.dedup();
+        if ids.is_empty() { return Err("No files were selected".into()); }
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let category_path = category_path(&transaction, category_id)?;
+        let mut folder_paths = load_folder_paths(&transaction)?;
+        let mut folder_roots = load_folder_roots(&transaction)?;
+        let mut events = Vec::<StoredItem>::new();
+        let mut remapped_ids = Vec::new();
+        let mut targets = Vec::new();
+        let mut insertions = HashMap::<i64, (ListedAsset, i64)>::new();
+        for requested_id in ids {
+            let id = if requested_id < 0 {
+                let Some(candidate) = candidates.get(&requested_id) else { continue; };
+                if candidate.ext.trim().is_empty() { continue; }
+                if let Some(existing) = find_asset_by_path(&transaction, &candidate.path)? {
+                    if existing != requested_id { remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id: existing }); }
+                    existing
+                } else if assign {
+                    let folder_id = ensure_folder(&transaction, &candidate.folder_path, &mut folder_paths, &mut folder_roots, &mut events)?;
+                    let new_id = next_id(&transaction, "assets")?;
+                    insertions.insert(new_id, ((*candidate).clone(), folder_id));
+                    remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id });
+                    new_id
+                } else { continue; }
+            } else { requested_id };
+            if insertions.contains_key(&id) || read_asset_values(&transaction, id)?.is_some() { targets.push(id); }
+        }
+        let mut changed = Vec::new();
+        for id in targets {
+            if let Some((candidate, folder_id)) = insertions.get(&id) {
+                let row = NewCatalogAsset { id, folder_id: *folder_id, name: candidate.name.clone(), ext: candidate.ext.clone(), size: candidate.size, file_modified: candidate.file_modified.clone(), path: candidate.path.clone(), rating: None, label: None, tagged: false };
+                insert_asset(&transaction, &row)?;
+                push_insert_snapshot(&transaction, &mut events, "assets", id)?;
+            }
+            let key = format!("{id}:{category_id}");
+            let old_value = read_item(&transaction, "asset_categories", &key, "__exists__")?;
+            let old = value_truth(&old_value)?;
+            if old == assign { continue; }
+            let new_value = SqlValue::Integer(i64::from(assign));
+            apply_item(&transaction, "asset_categories", &key, "__exists__", &new_value)?;
+            events.push(StoredItem { table_name: "asset_categories".into(), row_key: key, column_name: "__exists__".into(), old_value, new_value });
+            changed.push(id);
+        }
+        // If an asset was newly inserted, it necessarily changes on assign; for an unusual
+        // duplicate relation, avoid leaving an unjournaled inserted asset behind.
+        let changed_set = changed.iter().copied().collect::<std::collections::HashSet<_>>();
+        for id in insertions.keys().copied().collect::<Vec<_>>() {
+            if !changed_set.contains(&id) { return Err("New catalog asset did not receive its category".into()); }
+        }
+        let file_word = slovak_count(changed.len(), "súbor", "súbory", "súborov");
+        let summary = format!("{} {} · {} {}", if assign { "Zaradené do" } else { "Vyradené z" }, category_path, changed.len(), file_word);
+        let change_id = if events.is_empty() { None } else {
+            let ts = iso_now();
+            transaction.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,'set_asset_categories',?2,0)", (&ts, &summary)).map_err(|e| e.to_string())?;
+            let change_id = transaction.last_insert_rowid();
+            for item in events {
+                transaction.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)", (change_id, item.table_name, item.row_key, item.column_name, encode_sql(&item.old_value)?, encode_sql(&item.new_value)?)).map_err(|e| e.to_string())?;
+            }
+            mark_catalog_modified(&transaction)?;
+            Some(change_id)
+        };
+        transaction.commit().map_err(|e| e.to_string())?;
+        let summary = if changed.is_empty() { format!("Žiadne zmeny v kategórii {category_path}") } else { summary };
+        Ok(SetAssetCategoriesResult { change_id, summary, changed_count: changed.len(), remapped_ids })
+    }
+
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
         let connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let mut statement = connection.prepare("SELECT id,ts,action,summary,undone FROM ddreams_changes ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
@@ -307,6 +387,28 @@ fn read_asset_values(transaction: &Transaction<'_>, id: i64) -> Result<Option<As
 
 fn find_asset_by_path(transaction: &Transaction<'_>, path: &str) -> Result<Option<i64>, String> {
     transaction.query_row("SELECT id FROM assets WHERE lower(rtrim(path,'/\\'))=lower(rtrim(?1,'/\\')) ORDER BY id LIMIT 1", [path], |row| row.get(0)).optional().map_err(|e| e.to_string())
+}
+
+fn category_path(transaction: &Transaction<'_>, category_id: i64) -> Result<String, String> {
+    let (root_id, root_name): (Option<i64>, Option<String>) = transaction.query_row(
+        "SELECT c.root_id, r.name FROM categories c LEFT JOIN category_roots r ON r.id=c.root_id WHERE c.id=?1",
+        [category_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).optional().map_err(|e| e.to_string())?.ok_or_else(|| format!("Category {category_id} not found"))?;
+    let mut names = Vec::new();
+    let mut current = Some(category_id);
+    let mut seen = std::collections::HashSet::new();
+    while let Some(id) = current {
+        if !seen.insert(id) { break; }
+        let row: Option<(String, Option<i64>)> = transaction.query_row("SELECT name,parent_id FROM categories WHERE id=?1", [id], |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|e| e.to_string())?;
+        let Some((name, parent)) = row else { break; };
+        names.push(name);
+        current = parent;
+    }
+    names.reverse();
+    if let Some(root) = root_name {
+        if !names.first().is_some_and(|name| name.trim().eq_ignore_ascii_case(root.trim())) { names.insert(0, root); }
+    } else if root_id.is_some() && names.is_empty() { return Err("Category path is unavailable".into()); }
+    Ok(names.join(" › "))
 }
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
@@ -548,7 +650,7 @@ mod tests {
 
     fn write_fixture() -> Db {
         let connection=Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO meta VALUES('catalog_modified','0');CREATE TABLE ddreams_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);CREATE TABLE ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT);CREATE TABLE folder_roots(id INTEGER PRIMARY KEY,name TEXT,path TEXT);CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT,path TEXT);CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty INTEGER,is_orphan INTEGER,path TEXT);CREATE INDEX idx_assets_path ON assets(path);INSERT INTO folder_roots VALUES(1,'F:','F:\\');INSERT INTO folders VALUES(1,NULL,1,'F:','F:\\');INSERT INTO folders VALUES(2,1,1,'Photos','F:\\Photos');INSERT INTO assets VALUES(1,2,'one.jpg','jpg','jpg',1,123.0,10,10,24,NULL,NULL,NULL,2,0,'Red','2020-01-01T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\one.jpg');INSERT INTO assets VALUES(2,2,'two.jpg','jpg','jpg',1,456.0,10,10,24,NULL,NULL,NULL,4,1,NULL,'2020-01-02T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\two.jpg');").unwrap();
+        connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO meta VALUES('catalog_modified','0');CREATE TABLE ddreams_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);CREATE TABLE ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT);CREATE TABLE folder_roots(id INTEGER PRIMARY KEY,name TEXT,path TEXT);CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT,path TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);INSERT INTO category_roots VALUES(1,'Rodina');CREATE TABLE categories(id INTEGER PRIMARY KEY,name TEXT,parent_id INTEGER,root_id INTEGER);INSERT INTO categories VALUES(10,'Rodina',NULL,1),(11,'Deti',10,1);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty INTEGER,is_orphan INTEGER,path TEXT);CREATE INDEX idx_assets_path ON assets(path);INSERT INTO folder_roots VALUES(1,'F:','F:\\');INSERT INTO folders VALUES(1,NULL,1,'F:','F:\\');INSERT INTO folders VALUES(2,1,1,'Photos','F:\\Photos');INSERT INTO assets VALUES(1,2,'one.jpg','jpg','jpg',1,123.0,10,10,24,NULL,NULL,NULL,2,0,'Red','2020-01-01T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\one.jpg');INSERT INTO assets VALUES(2,2,'two.jpg','jpg','jpg',1,456.0,10,10,24,NULL,NULL,NULL,4,1,NULL,'2020-01-02T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\two.jpg');").unwrap();
         Arc::new(Mutex::new(connection))
     }
 
@@ -643,5 +745,56 @@ mod tests {
         let changes=serde_json::Map::from_iter([("rating".into(),Value::from(4))]);
         assert!(writer.set_asset_values(&[1],&[],&changes).unwrap_err().contains("read-only"));
         assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),2);
+    }
+
+    #[test]
+    fn category_assignment_is_partial_idempotent_and_undo_restores_exact_rows() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        db.lock().unwrap().execute("INSERT INTO asset_categories VALUES(1,11)",[]).unwrap();
+        let assigned=writer.set_asset_categories(&[1,2],&[],11,true).unwrap();
+        assert_eq!(assigned.changed_count,1);assert_eq!(assigned.summary,"Zaradené do Rodina › Deti · 1 súbor");
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories WHERE category_id=11",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+        let journal_count=db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap();
+        let no_op=writer.set_asset_categories(&[1,2],&[],11,true).unwrap();assert_eq!(no_op.change_id,None);assert_eq!(no_op.changed_count,0);
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),journal_count);
+        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT group_concat(asset_id,',') FROM asset_categories WHERE category_id=11",[],|r|r.get::<_,String>(0)).unwrap(),"1");
+        let removed=writer.set_asset_categories(&[1,2],&[],11,false).unwrap();assert_eq!(removed.changed_count,1);assert!(removed.summary.contains("Vyradené z Rodina › Deti · 1 súbor"));
+        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories WHERE category_id=11",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
+    #[test]
+    fn category_assignment_multi_summary_has_correct_slovak_plural_and_one_journal_row() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let result=writer.set_asset_categories(&[1,2],&[],10,true).unwrap();
+        assert_eq!(result.summary,"Zaradené do Rodina · 2 súbory");
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn category_assignment_of_uncatalogued_file_is_journaled_and_undo_removes_it() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let candidate=ListedAsset{temporary_id:-10,name:"new.jpg".into(),ext:"jpg".into(),size:Some(789.0),file_modified:None,path:"G:\\Camera\\new.jpg".into(),folder_path:"G:\\Camera".into()};
+        let result=writer.set_asset_categories(&[-10],&[candidate],11,true).unwrap();let id=result.remapped_ids[0].new_id;
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1 AND category_id=11",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
+        writer.undo_last().unwrap();let conn=db.lock().unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE path='G:\\Camera'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn readonly_writer_refuses_category_changes() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),false);
+        assert!(writer.set_asset_categories(&[1],&[],11,true).unwrap_err().contains("read-only"));
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn category_summary_uses_slovenian_plural_forms() {
+        assert_eq!(slovak_count(1,"súbor","súbory","súborov"),"súbor");
+        assert_eq!(slovak_count(2,"súbor","súbory","súborov"),"súbory");
+        assert_eq!(slovak_count(4,"súbor","súbory","súborov"),"súbory");
+        assert_eq!(slovak_count(5,"súbor","súbory","súborov"),"súborov");
     }
 }
