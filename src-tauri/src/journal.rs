@@ -56,6 +56,14 @@ pub struct SetAssetCategoriesResult {
     pub remapped_ids: Vec<AssetIdRemap>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryMutationResult { pub change_id: Option<i64>, pub summary: String, pub category_id: Option<i64>, pub parent_id: Option<i64>, pub root_id: Option<i64>, pub ancestor_ids: Vec<i64>, pub deleted_category_ids: Vec<i64>, pub deleted_root_ids: Vec<i64> }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CategoryDeleteInfo { pub id: i64, pub name: String, pub assigned_files: usize, pub subcategories: usize }
+
 #[derive(Clone, Debug)]
 struct StoredItem { table_name: String, row_key: String, column_name: String, old_value: SqlValue, new_value: SqlValue }
 
@@ -258,6 +266,88 @@ impl CatalogWriter {
         Ok(SetAssetCategoriesResult { change_id, summary, changed_count: changed.len(), remapped_ids })
     }
 
+    pub fn create_category(&self, parent_id: Option<i64>, name: &str) -> Result<CategoryMutationResult, String> {
+        self.require_write()?;
+        let name=validated_category_name(name)?;
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let (category_id,summary,events,root_id)=if let Some(parent)=parent_id {
+            let root_id:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Nadradená kategória neexistuje".to_string())?;
+            ensure_unique_category_name(&tx,Some(parent),root_id,&name,None,None)?;
+            let id=next_id(&tx,"categories")?;
+            tx.execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(?1,?2,?3,?4)",(id,parent,root_id,&name)).map_err(|e|e.to_string())?;
+            let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"categories",id)?;
+            let parent_path=category_path(&tx,parent)?;
+            (id,format!("Nová kategória {parent_path} › {name}"),events,root_id)
+        } else {
+            ensure_unique_category_name(&tx,None,None,&name,None,None)?;
+            let root_id=next_id(&tx,"category_roots")?;let id=next_id(&tx,"categories")?;
+            tx.execute("INSERT INTO category_roots(id,name) VALUES(?1,?2)",(root_id,&name)).map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(?1,NULL,?2,?3)",(id,root_id,&name)).map_err(|e|e.to_string())?;
+            let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"category_roots",root_id)?;push_insert_snapshot(&tx,&mut events,"categories",id)?;
+            (id,format!("Nová kategória {name}"),events,Some(root_id))
+        };
+        let ancestor_ids=category_ancestor_ids(&tx,category_id)?;
+        let change_id=record_stored_change(&tx,events,"create_category",&summary)?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(CategoryMutationResult{change_id,summary,category_id:Some(category_id),parent_id,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
+    }
+
+    pub fn rename_category(&self,id:i64,name:&str)->Result<CategoryMutationResult,String>{
+        self.require_write()?;let name=validated_category_name(name)?;
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let (old,parent,root_id):(String,Option<i64>,Option<i64>)=tx.query_row("SELECT name,parent_id,root_id FROM categories WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kategória neexistuje".to_string())?;
+        let paired_root=if parent.is_none(){if let Some(root)=root_id{let root_name:Option<String>=tx.query_row("SELECT name FROM category_roots WHERE id=?1",[root],|r|r.get(0)).optional().map_err(|e|e.to_string())?;if root_name.is_some_and(|value|value.trim().to_lowercase()==old.trim().to_lowercase()){Some(root)}else{None}}else{None}}else{None};
+        ensure_unique_category_name(&tx,parent,root_id,&name,Some(id),paired_root)?;
+        if old==name {let path=category_path(&tx,id)?;let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;let summary=format!("Kategória už má názov {path}");return Ok(CategoryMutationResult{change_id:None,summary,category_id:Some(id),parent_id:parent,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
+        let mut events=Vec::new();record_column_update(&tx,&mut events,"categories",id,"name",SqlValue::Text(name.clone()))?;
+        if let Some(root)=paired_root{record_column_update(&tx,&mut events,"category_roots",root,"name",SqlValue::Text(name.clone()))?;}
+        let summary=format!("Premenované {old} → {name}");let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"rename_category",&summary)?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(CategoryMutationResult{change_id,summary,category_id:Some(id),parent_id:parent,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
+    }
+
+    pub fn move_category(&self,id:i64,new_parent_id:Option<i64>)->Result<CategoryMutationResult,String>{
+        self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let (name,old_parent,old_root):(String,Option<i64>,Option<i64>)=tx.query_row("SELECT name,parent_id,root_id FROM categories WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kategória neexistuje".to_string())?;
+        let subtree=category_subtree(&tx,id)?;
+        let mut events=Vec::new();let new_root;
+        if let Some(parent)=new_parent_id {
+            if subtree.contains(&parent){return Err("Kategóriu nemožno presunúť do seba ani do jej podkategórie".into());}
+            let target_root:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Cieľová kategória neexistuje".to_string())?;
+            ensure_unique_category_name(&tx,Some(parent),target_root,&name,Some(id),None)?;
+            if old_parent==Some(parent){let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(CategoryMutationResult{change_id:None,summary:format!("Kategória {name} je už na tomto mieste"),category_id:Some(id),parent_id:old_parent,root_id:old_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
+            new_root=target_root;
+            record_column_update(&tx,&mut events,"categories",id,"parent_id",SqlValue::Integer(parent))?;
+        }else{
+            if old_parent.is_none(){let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(CategoryMutationResult{change_id:None,summary:format!("Kategória {name} je už na najvyššej úrovni"),category_id:Some(id),parent_id:None,root_id:old_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
+            ensure_unique_category_name(&tx,None,None,&name,Some(id),None)?;
+            let root=next_id(&tx,"category_roots")?;tx.execute("INSERT INTO category_roots(id,name) VALUES(?1,?2)",(root,&name)).map_err(|e|e.to_string())?;push_insert_snapshot(&tx,&mut events,"category_roots",root)?;new_root=Some(root);
+            record_column_update(&tx,&mut events,"categories",id,"parent_id",SqlValue::Null)?;
+        }
+        if old_root!=new_root{for descendant in subtree.iter().copied(){if descendant!=id{record_column_update(&tx,&mut events,"categories",descendant,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}}record_column_update(&tx,&mut events,"categories",id,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}
+        if let Some(old_root)=old_root.filter(|root|Some(*root)!=new_root){let remaining:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM categories WHERE root_id=?1)",[old_root],|r|r.get(0)).map_err(|e|e.to_string())?;if !remaining{delete_row_snapshot(&tx,&mut events,"category_roots",old_root)?;}}
+        let summary=if let Some(parent)=new_parent_id{format!("Presunuté {name} do {}",category_path(&tx,parent)?)}else{format!("Presunuté {name} na najvyššiu úroveň")};let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"move_category",&summary)?;tx.commit().map_err(|e|e.to_string())?;
+        Ok(CategoryMutationResult{change_id,summary,category_id:Some(id),parent_id:new_parent_id,root_id:new_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
+    }
+
+    pub fn category_delete_info(&self,id:i64)->Result<CategoryDeleteInfo,String>{let connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;category_delete_info(&connection,id)}
+
+    pub fn delete_category(&self,id:i64)->Result<CategoryMutationResult,String>{
+        self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let info=category_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kategóriu {} nie je možné zmazať, obsahuje {} {} (vrátane podkategórií). Najprv z nej súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files as usize,"súbor","súbory","súborov")));}
+        let root_id:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
+        let ids=category_subtree(&tx,id)?;let mut events=Vec::new();
+        for category_id in ids.iter().rev().copied(){delete_row_snapshot(&tx,&mut events,"categories",category_id)?;}
+        let mut deleted_root_ids=Vec::new();
+        if let Some(root_id)=root_id{
+            let any_left:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM categories WHERE root_id=?1)",[root_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !any_left{delete_row_snapshot(&tx,&mut events,"category_roots",root_id)?;deleted_root_ids.push(root_id);}
+        }
+        let summary=format!("Zmazaná kategória {}",info.name);let change_id=record_stored_change(&tx,events,"delete_category",&summary)?;tx.commit().map_err(|e|e.to_string())?;
+        Ok(CategoryMutationResult{change_id,summary,category_id:None,parent_id:None,root_id,ancestor_ids:Vec::new(),deleted_category_ids:ids,deleted_root_ids})
+    }
+
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
         let connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let mut statement = connection.prepare("SELECT id,ts,action,summary,undone FROM ddreams_changes ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
@@ -301,7 +391,8 @@ fn validate_item(table: &str, column: &str) -> Result<(), String> {
     let allowed = match table {
         "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "__snapshot__"),
         "folders" | "folder_roots" => column == "__snapshot__",
-        "categories" => matches!(column, "name" | "parent_id" | "root_id"),
+        "categories" => matches!(column, "name" | "parent_id" | "root_id" | "__snapshot__"),
+        "category_roots" => matches!(column, "name" | "__snapshot__"),
         "keywords" => matches!(column, "name" | "parent_id"),
         "asset_categories" | "asset_keywords" => column == "__exists__",
         _ => false,
@@ -410,6 +501,29 @@ fn category_path(transaction: &Transaction<'_>, category_id: i64) -> Result<Stri
     } else if root_id.is_some() && names.is_empty() { return Err("Category path is unavailable".into()); }
     Ok(names.join(" › "))
 }
+
+fn validated_category_name(value:&str)->Result<String,String>{let name=value.trim();if name.is_empty(){return Err("Názov kategórie nesmie byť prázdny".into());}if name.chars().count()>100{return Err("Názov kategórie môže mať najviac 100 znakov".into());}Ok(name.to_owned())}
+
+fn ensure_unique_category_name(tx:&Transaction<'_>,parent:Option<i64>,_root:Option<i64>,name:&str,exclude_category:Option<i64>,exclude_root:Option<i64>)->Result<(),String>{
+    let mut existing=Vec::<(i64,String)>::new();
+    if let Some(parent)=parent{let mut stmt=tx.prepare("SELECT id,name FROM categories WHERE parent_id=?1").map_err(|e|e.to_string())?;existing.extend(stmt.query_map([parent],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?);}
+    else{let mut stmt=tx.prepare("SELECT id,name FROM categories WHERE parent_id IS NULL OR parent_id=0").map_err(|e|e.to_string())?;existing.extend(stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?);}
+    if existing.iter().any(|(id,other)|Some(*id)!=exclude_category&&other.trim().to_lowercase()==name.trim().to_lowercase()){return Err("V tejto úrovni už kategória s týmto názvom existuje".into());}
+    if parent.is_none(){let mut stmt=tx.prepare("SELECT id,name FROM category_roots").map_err(|e|e.to_string())?;let roots=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;if roots.iter().any(|(id,other)|Some(*id)!=exclude_root&&other.trim().to_lowercase()==name.trim().to_lowercase()){return Err("Koreň kategórie s týmto názvom už existuje".into());}}
+    Ok(())
+}
+
+fn category_subtree(tx:&Transaction<'_>,id:i64)->Result<Vec<i64>,String>{let mut stmt=tx.prepare("WITH RECURSIVE subtree(id) AS (SELECT id FROM categories WHERE id=?1 UNION SELECT c.id FROM categories c JOIN subtree s ON c.parent_id=s.id) SELECT id FROM subtree").map_err(|e|e.to_string())?;let ids=stmt.query_map([id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;if ids.is_empty(){return Err("Kategória neexistuje".into());}Ok(ids)}
+
+fn category_ancestor_ids(tx:&Transaction<'_>,id:i64)->Result<Vec<i64>,String>{let mut ids=Vec::new();let mut seen=std::collections::HashSet::new();let mut current=tx.query_row("SELECT parent_id FROM categories WHERE id=?1",[id],|r|r.get::<_,Option<i64>>(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kategória neexistuje".to_string())?;while let Some(parent)=current{if !seen.insert(parent){break;}ids.push(parent);current=tx.query_row("SELECT parent_id FROM categories WHERE id=?1",[parent],|r|r.get::<_,Option<i64>>(0)).optional().map_err(|e|e.to_string())?.flatten();}Ok(ids)}
+
+fn category_delete_info(connection:&rusqlite::Connection,id:i64)->Result<CategoryDeleteInfo,String>{let(name,):(String,)=connection.query_row("SELECT name FROM categories WHERE id=?1",[id],|r|Ok((r.get(0)?,))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kategória neexistuje".to_string())?;let mut stmt=connection.prepare("WITH RECURSIVE subtree(id) AS (SELECT id FROM categories WHERE id=?1 UNION SELECT c.id FROM categories c JOIN subtree s ON c.parent_id=s.id) SELECT id FROM subtree").map_err(|e|e.to_string())?;let ids=stmt.query_map([id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let marks=std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT count(DISTINCT asset_id) FROM asset_categories WHERE category_id IN ({marks})");let assigned_files=connection.query_row(&sql,rusqlite::params_from_iter(ids.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? as usize;Ok(CategoryDeleteInfo{id,name,assigned_files,subcategories:ids.len().saturating_sub(1)})}
+
+fn record_column_update(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64,column:&str,new_value:SqlValue)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),column)?;if old==new_value{return Ok(());}apply_item(tx,table,&id.to_string(),column,&new_value)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:column.into(),old_value:old,new_value});Ok(())}
+
+fn delete_row_snapshot(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),"__snapshot__")?;if matches!(old,SqlValue::Null){return Err(format!("Riadok {table} {id} neexistuje"));}apply_item(tx,table,&id.to_string(),"__snapshot__",&SqlValue::Null)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:"__snapshot__".into(),old_value:old,new_value:SqlValue::Null});Ok(())}
+
+fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;Ok(Some(change_id))}
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
     transaction.execute(
@@ -588,6 +702,8 @@ fn snapshot_columns(table:&str)->Result<&'static [&'static str],String>{
         "assets"=>Ok(&["id","folder_id","name","ext","ext_lower","is_listed","size","width","height","bpp","caption","notes","author","rating","tagged","label","file_modified","exif_date","acdsee_date","md_dirty","is_orphan","path"]),
         "folders"=>Ok(&["id","parent_id","root_id","name","path"]),
         "folder_roots"=>Ok(&["id","name","path"]),
+        "categories"=>Ok(&["id","parent_id","root_id","name"]),
+        "category_roots"=>Ok(&["id","name"]),
         _=>Err(format!("Unsupported snapshot table: {table}")),
     }
 }
@@ -796,5 +912,79 @@ mod tests {
         assert_eq!(slovak_count(2,"súbor","súbory","súborov"),"súbory");
         assert_eq!(slovak_count(4,"súbor","súbory","súborov"),"súbory");
         assert_eq!(slovak_count(5,"súbor","súbory","súborov"),"súborov");
+    }
+
+    #[test]
+    fn create_top_level_and_subcategory_are_journaled_and_undoable() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let top=writer.create_category(None,"Nové").unwrap();let top_id=top.category_id.unwrap();let root_id=top.root_id.unwrap();
+        assert_eq!(top.summary,"Nová kategória Nové");assert_eq!(db.lock().unwrap().query_row("SELECT name FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,String>(0)).unwrap(),"Nové");
+        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,i64>(0)).unwrap(),0);
+        let sub=writer.create_category(Some(10)," Vnúčatá ").unwrap();let sub_id=sub.category_id.unwrap();
+        assert_eq!(sub.summary,"Nová kategória Rodina › Vnúčatá");assert_eq!(sub.root_id,Some(1));assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
+        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert!(top_id>0);
+    }
+
+    #[test]
+    fn category_names_are_trimmed_validated_and_unique_case_insensitively() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        assert!(writer.create_category(Some(10)," dEtI ").unwrap_err().contains("už kategória"));
+        assert!(writer.create_category(None,"rodina").is_err());
+        assert!(writer.create_category(Some(10),"  ").unwrap_err().contains("nesmie byť prázdny"));
+        assert!(writer.create_category(None,&"x".repeat(101)).unwrap_err().contains("100 znakov"));
+        let created=writer.create_category(Some(10),"  Nové meno  ").unwrap();
+        assert_eq!(db.lock().unwrap().query_row("SELECT name FROM categories WHERE id=?1",[created.category_id.unwrap()],|r|r.get::<_,String>(0)).unwrap(),"Nové meno");
+    }
+
+    #[test]
+    fn renaming_top_level_keeps_root_pair_consistent_and_undo_restores_both() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let result=writer.rename_category(10,"Domov").unwrap();assert_eq!(result.summary,"Premenované Rodina → Domov");
+        {let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT name FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"Domov");assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Domov");}
+        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT name FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");
+    }
+
+    #[test]
+    fn moving_subcategory_to_top_creates_root_and_updates_entire_subtree() {
+        let db=write_fixture();db.lock().unwrap().execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(12,11,1,'Mladí')",[]).unwrap();let writer=CatalogWriter::new(db.clone(),true);
+        let result=writer.move_category(11,None).unwrap();let new_root=result.root_id.unwrap();
+        let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=11",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,String>(0)).unwrap(),"Deti");drop(conn);
+        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=11",[],|r|r.get::<_,String>(0)).unwrap(),"10:1");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn moving_top_level_under_another_category_removes_empty_root_and_undo_restores_tree() {
+        let db=write_fixture();db.lock().unwrap().execute_batch("INSERT INTO category_roots VALUES(2,'Priatelia');INSERT INTO categories(id,parent_id,root_id,name) VALUES(20,NULL,2,'Priatelia'),(21,20,2,'Blízki'),(12,11,1,'Mladí');").unwrap();let writer=CatalogWriter::new(db.clone(),true);
+        writer.move_category(10,Some(21)).unwrap();{let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"21:2");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),2);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);}
+        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=10",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=10",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");
+    }
+
+    #[test]
+    fn category_move_rejects_self_and_descendant_cycles() {
+        let db=write_fixture();db.lock().unwrap().execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(12,11,1,'Mladí')",[]).unwrap();let writer=CatalogWriter::new(db,true);
+        assert!(writer.move_category(11,Some(11)).unwrap_err().contains("seba"));assert!(writer.move_category(10,Some(12)).unwrap_err().contains("podkategórie"));
+    }
+
+    #[test]
+    fn delete_refuses_assigned_files_in_descendants_and_reports_count() {
+        let db=write_fixture();db.lock().unwrap().execute("INSERT INTO asset_categories VALUES(1,11)",[]).unwrap();let writer=CatalogWriter::new(db.clone(),true);
+        let info=writer.category_delete_info(10).unwrap();assert_eq!(info.assigned_files,1);assert_eq!(info.subcategories,1);
+        let error=writer.delete_category(10).unwrap_err();assert!(error.contains("obsahuje 1 súbor ("));assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id IN (10,11)",[],|r|r.get::<_,i64>(0)).unwrap(),2);
+    }
+
+    #[test]
+    fn delete_subtree_and_undo_restores_category_rows_exactly() {
+        let db=write_fixture();db.lock().unwrap().execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(12,11,1,'Mladí')",[]).unwrap();let writer=CatalogWriter::new(db.clone(),true);
+        let before={let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),coalesce(root_id,-1),name FROM categories WHERE id>=10 ORDER BY id").unwrap();stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()};
+        let deleted=writer.delete_category(11).unwrap();assert_eq!(deleted.deleted_category_ids.len(),2);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id IN (11,12)",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        writer.undo_last().unwrap();let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),coalesce(root_id,-1),name FROM categories WHERE id>=10 ORDER BY id").unwrap();let after=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();assert_eq!(before,after);
+    }
+
+    #[test]
+    fn readonly_writer_refuses_category_structure_changes() {
+        let db=write_fixture();let writer=CatalogWriter::new(db.clone(),false);
+        assert!(writer.create_category(None,"Test").unwrap_err().contains("read-only"));assert!(writer.rename_category(10,"Test").unwrap_err().contains("read-only"));assert!(writer.move_category(11,None).unwrap_err().contains("read-only"));assert!(writer.delete_category(11).unwrap_err().contains("read-only"));
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories",[],|r|r.get::<_,i64>(0)).unwrap(),2);
     }
 }

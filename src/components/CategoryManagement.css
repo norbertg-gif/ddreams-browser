@@ -1,0 +1,12 @@
+.category-add{min-width:21px;height:20px;padding:0 5px;font-weight:700}
+.category-top-drop{margin:3px 6px;padding:5px 8px;border:1px dashed #61b9e6;border-radius:3px;color:#b8e6fc;text-align:center;font-size:10px}
+.category-new-highlight{background:#354f32!important;outline:1px solid #7cae62}
+.category-editor-backdrop{position:fixed;inset:0;z-index:1100;display:grid;place-items:center;background:#0008}
+.category-editor-dialog{width:min(360px,calc(100vw - 32px));box-sizing:border-box;padding:15px;border:1px solid #46525f;border-radius:6px;background:#20262d;box-shadow:0 8px 28px #000b;display:flex;flex-direction:column;gap:12px;color:#e0e6ec}
+.category-editor-dialog>strong{font-size:13px}
+.category-editor-dialog>label{display:flex;flex-direction:column;gap:5px;color:#aeb6c0;font-size:11px}
+.category-editor-dialog input{width:100%;box-sizing:border-box;padding:7px 8px;background:#15191e;border:1px solid #4c5967;border-radius:3px;color:#eef2f6}
+.category-editor-dialog p{margin:0;line-height:1.45;font-size:12px}
+.category-editor-dialog>div{display:flex;justify-content:flex-end;gap:7px}
+.category-editor-dialog button{padding:6px 10px}
+.category-context-menu hr{width:100%;border:0;border-top:1px solid #3b4651;margin:3px 0}

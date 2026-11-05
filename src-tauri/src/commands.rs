@@ -4,7 +4,7 @@ use crate::{
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
     formats::FormatTable,
-    journal::{CatalogWriter, ChangeSummary, ListedAsset, SetAssetCategoriesResult, SetAssetValuesResult},
+    journal::{CatalogWriter, CategoryDeleteInfo, CategoryMutationResult, ChangeSummary, ListedAsset, SetAssetCategoriesResult, SetAssetValuesResult},
     listing::ListingService,
     metadata_view::{self, MetadataView},
     paths::AppInfo,
@@ -95,6 +95,17 @@ pub fn get_category_selection_counts(db:State<'_,DatabaseState>,listing:State<'_
     for chunk in positive.chunks(500){if chunk.is_empty(){continue;}let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT ac.category_id,count(DISTINCT ac.asset_id) FROM asset_categories ac JOIN assets a ON a.id=ac.asset_id WHERE a.is_listed=1 AND a.ext_lower<>'' AND ac.asset_id IN ({marks}) GROUP BY ac.category_id");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let rows=stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?;for row in rows{let(id,count)=row.map_err(|e|e.to_string())?;*assigned.entry(id).or_insert(0)+=count as usize;}}
     Ok(CategorySelectionCounts{total_files:total,assigned})
 }
+
+#[tauri::command]
+pub fn create_category(state:State<'_,CatalogWriterState>,parent_id:Option<i64>,name:String)->Result<CategoryMutationResult,String>{state.0.create_category(parent_id,&name)}
+#[tauri::command]
+pub fn rename_category(state:State<'_,CatalogWriterState>,id:i64,name:String)->Result<CategoryMutationResult,String>{state.0.rename_category(id,&name)}
+#[tauri::command]
+pub fn move_category(state:State<'_,CatalogWriterState>,id:i64,new_parent_id:Option<i64>)->Result<CategoryMutationResult,String>{state.0.move_category(id,new_parent_id)}
+#[tauri::command]
+pub fn get_category_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryDeleteInfo,String>{state.0.category_delete_info(id)}
+#[tauri::command]
+pub fn delete_category(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryMutationResult,String>{state.0.delete_category(id)}
 
 #[tauri::command]
 pub fn get_calendar_aggregate(state: State<'_, CalendarState>, source: String) -> Result<CalendarAggregate, String> {
