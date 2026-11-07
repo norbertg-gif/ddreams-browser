@@ -62,7 +62,7 @@
         { "label": "Nadmorská výška", "keys": ["GPSAltitude"] }
       ] }
     ] },
-    { "name": "ACDSee", "subgroups": [
+    { "name": "Katalóg", "subgroups": [
       { "name": "Katalóg", "fields": [
         { "label": "Popis", "keys": ["Db:Caption"] }, { "label": "Poznámky", "keys": ["Db:Notes"] },
         { "label": "Autor", "keys": ["Db:Author"] }, { "label": "Hodnotenie", "keys": ["Db:Rating"] },
