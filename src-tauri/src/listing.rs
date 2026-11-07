@@ -72,7 +72,7 @@ impl ListingService {
         }};
         let contexts = db::folder_disk_context(&self.db, folder_ids).unwrap_or_default();
         let parent_folder_id = db::folder_by_path(&self.db, path).ok().flatten().map(|folder| folder.id)
-            .or_else(|| (folder_ids.len() == 1 && folder_ids[0] > 0).then_some(folder_ids[0]));
+            .or_else(|| match folder_ids { [id] if *id > 0 => Some(*id), _ => None });
         let mut known = HashMap::<String, Asset>::new();
         for (_, catalog_path, assets) in contexts { if normalize(&catalog_path)==key { for asset in assets { known.insert(asset.name.to_lowercase(), asset); } } }
         let mut rows = Vec::with_capacity(disk.len());
@@ -133,6 +133,8 @@ impl ListingService {
     }
 
     pub fn asset(&self, id: i64) -> Option<Asset> { self.entries.lock().ok()?.get(&id).cloned() }
+    #[cfg(test)]
+    pub fn insert_test_asset(&self, asset:Asset){if let Ok(mut entries)=self.entries.lock(){entries.insert(asset.id,asset);}}
 
     pub fn resolve_folder(&self,path:&str)->Result<Option<db::Folder>,String>{
         if let Some(folder)=db::folder_by_path(&self.db,path).map_err(|e|e.to_string())? { return Ok(Some(folder)); }
@@ -172,7 +174,7 @@ fn hidden_or_ignored(name: &str, metadata: &std::fs::Metadata, formats: &FormatT
     #[cfg(windows)] { use std::os::windows::fs::MetadataExt; if metadata.file_attributes() & (0x2 | 0x4) != 0 { return true; } }
     let _=metadata; false
 }
-fn system_time_iso(time: std::time::SystemTime) -> String {
+pub(crate) fn system_time_iso(time: std::time::SystemTime) -> String {
     let secs=time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
     let days=secs.div_euclid(86_400); let day_secs=secs.rem_euclid(86_400);
     let z=days+719_468; let era=(if z>=0 {z} else {z-146_096})/146_097; let doe=z-era*146_097;

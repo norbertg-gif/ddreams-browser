@@ -4,6 +4,7 @@ mod calendar;
 mod db;
 mod display_metadata;
 mod exiftool;
+mod file_ops;
 mod formats;
 pub mod journal;
 mod listing;
@@ -12,7 +13,7 @@ mod paths;
 mod schema;
 mod thumbs;
 
-use commands::{AppInfoState, CalendarState, CatalogWriterState, DatabaseState, DisplayMetadataState, ExifState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
+use commands::{AppInfoState, CalendarState, CatalogWriterState, DatabaseState, DisplayMetadataState, ExifState, FileManagerState, FormatsState, ListingState, MetadataViewState, ThumbnailState};
 use db::open_catalog;
 use std::sync::{Arc, Mutex, atomic::Ordering};
 use tauri::http::{Response, StatusCode, header};
@@ -43,6 +44,7 @@ pub fn run() {
     let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone());
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
+    let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
     tauri::Builder::default()
@@ -56,6 +58,7 @@ pub fn run() {
         .manage(ThumbnailState(thumbs))
         .manage(CalendarState(calendar))
         .manage(CatalogWriterState(writer))
+        .manage(FileManagerState(file_manager))
         .manage(AppInfoState(info))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();
@@ -114,6 +117,11 @@ pub fn run() {
             commands::get_app_info,
             commands::get_recent_changes,
             commands::undo_last_change,
+            commands::get_file_operation_conflicts,
+            commands::move_files,
+            commands::copy_files,
+            commands::rename_file,
+            commands::create_folder,
             commands::set_asset_values,
             commands::set_asset_categories,
             commands::get_category_selection_counts,

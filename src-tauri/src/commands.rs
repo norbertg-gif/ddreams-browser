@@ -3,6 +3,7 @@ use crate::{
     db::{self, AssetFilter, AssetMetadata, Db},
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
     exiftool::ExifTool,
+    file_ops::{ConflictPolicy, FileManager, FileOperationResult},
     formats::FormatTable,
     journal::{CatalogWriter, CategoryDeleteInfo, CategoryMutationResult, ChangeSummary, KeywordDeleteInfo, KeywordMutationResult, ListedAsset, SetAssetCategoriesResult, SetAssetKeywordsResult, SetAssetValuesResult},
     listing::ListingService,
@@ -15,6 +16,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{path::{Path, PathBuf}, sync::Arc};
 use tauri::State;
+use tauri::Emitter;
 
 pub struct DatabaseState(pub Db);
 pub struct ExifState(pub Arc<ExifTool>);
@@ -25,6 +27,7 @@ pub struct MetadataViewState(pub Arc<MetadataView>);
 pub struct DisplayMetadataState(pub Arc<DisplayMetadataCache>);
 pub struct CalendarState(pub Arc<CalendarService>);
 pub struct CatalogWriterState(pub Arc<CatalogWriter>);
+pub struct FileManagerState(pub Arc<FileManager>);
 pub struct AppInfoState(pub AppInfo);
 
 #[tauri::command]
@@ -36,9 +39,24 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
 }
 
 #[tauri::command]
-pub fn undo_last_change(state: State<'_, CatalogWriterState>) -> Result<Option<ChangeSummary>, String> {
-    state.0.undo_last()
+pub async fn undo_last_change(state: State<'_, FileManagerState>) -> Result<Option<ChangeSummary>, String> {
+    let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())?
 }
+
+#[tauri::command]
+pub fn get_file_operation_conflicts(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String)->Result<usize,String>{state.0.preview_conflicts(&asset_ids,&target_folder_path,None)}
+#[tauri::command]
+pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Presúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+#[tauri::command]
+pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Kopírujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
+#[tauri::command]
+pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Premenúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+#[tauri::command]
+pub async fn create_folder(state:State<'_,FileManagerState>,parent_path:String,name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.create_folder(&parent_path,&name)).await.map_err(|e|e.to_string())?}
+
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct FileProgress{pub operation:String,pub done:usize,pub total:usize}
 
 #[tauri::command]
 pub fn set_asset_values(

@@ -30,6 +30,11 @@ pub struct ListedAsset {
     pub folder_path: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct FileCatalogMove { pub asset_id: i64, pub target_path: String, pub target_folder_path: String, pub name: String, pub ext: String, pub size: f64, pub file_modified: Option<String> }
+#[derive(Clone, Debug)]
+pub struct FileCatalogCopy { pub source_asset_id: i64, pub target_path: String, pub target_folder_path: String, pub name: String, pub ext: String, pub size: f64, pub file_modified: Option<String> }
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetIdRemap { pub old_id: i64, pub new_id: i64 }
@@ -401,6 +406,36 @@ impl CatalogWriter {
 
     pub fn delete_keyword(&self,id:i64)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let info=keyword_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kľúčové slovo {} nie je možné zmazať, obsahuje {} {} (vrátane podriadených slov). Najprv z neho súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files,"súbor","súbory","súborov")));}let ancestors=keyword_ancestor_ids(&tx,id)?;let ids=keyword_subtree(&tx,id)?;let mut events=Vec::new();for keyword_id in ids.iter().rev().copied(){delete_row_snapshot(&tx,&mut events,"keywords",keyword_id)?;}let summary=format!("Zmazané kľúčové slovo {}",info.name);let change_id=record_stored_change(&tx,events,"delete_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(KeywordMutationResult{change_id,summary,keyword_id:None,parent_id:None,ancestor_ids:ancestors,deleted_keyword_ids:ids})}
 
+    pub fn record_file_change(&self, action:&str, summary:&str, moved:&[FileCatalogMove], copied:&[FileCatalogCopy], created_folders:&[String], undo_payload:&str)->Result<(Option<i64>,Vec<AssetIdRemap>),String>{
+        self.require_write()?;
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let mut events=Vec::new();let mut paths=load_folder_paths(&tx)?;let mut roots=load_folder_roots(&tx)?;let mut remapped=Vec::new();
+        for item in moved {
+            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots,&mut events)?;
+            for (column,value) in [("folder_id",SqlValue::Integer(folder)),("path",SqlValue::Text(item.target_path.clone())),("name",SqlValue::Text(item.name.clone())),("ext",SqlValue::Text(item.ext.clone())),("ext_lower",SqlValue::Text(item.ext.to_ascii_lowercase())),("size",SqlValue::Real(item.size)),("file_modified",item.file_modified.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null))] {
+                record_asset_update(&tx,&mut events,item.asset_id,column,value)?;
+            }
+        }
+        for item in copied {
+            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots,&mut events)?;
+            let source_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1 AND ext_lower<>'')",[item.source_asset_id],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !source_exists { continue; }
+            let id=next_id(&tx,"assets")?;
+            tx.execute("INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) SELECT ?1,?2,?3,?4,lower(?4),is_listed,?5,width,height,bpp,caption,notes,author,rating,tagged,label,?6,exif_date,acdsee_date,md_dirty,is_orphan,?7 FROM assets WHERE id=?8",(id,folder,&item.name,&item.ext,item.size,&item.file_modified,&item.target_path,item.source_asset_id)).map_err(|e|e.to_string())?;
+            push_insert_snapshot(&tx,&mut events,"assets",id)?;remapped.push(AssetIdRemap{old_id:item.source_asset_id,new_id:id});
+            for table in ["asset_categories","asset_keywords"] {
+                let target_column=if table=="asset_categories"{"category_id"}else{"keyword_id"};
+                let mut stmt=tx.prepare(&format!("SELECT {target_column} FROM {table} WHERE asset_id=?1")).map_err(|e|e.to_string())?;
+                let relations=stmt.query_map([item.source_asset_id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(stmt);
+                for relation in relations { let key=format!("{id}:{relation}");let old=read_item(&tx,table,&key,"__exists__")?;let new=SqlValue::Integer(1);apply_item(&tx,table,&key,"__exists__",&new)?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:old,new_value:new}); }
+            }
+        }
+        for folder_path in created_folders { let _=ensure_folder(&tx,folder_path,&mut paths,&mut roots,&mut events)?; }
+        events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});
+        let change_id=record_stored_change(&tx,events,action,summary)?;tx.commit().map_err(|e|e.to_string())?;Ok((change_id,remapped))
+    }
+
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
         let connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let mut statement = connection.prepare("SELECT id,ts,action,summary,undone FROM ddreams_changes ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
@@ -408,7 +443,9 @@ impl CatalogWriter {
             .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
     }
 
-    pub fn undo_last(&self) -> Result<Option<ChangeSummary>, String> {
+    pub fn undo_last(&self) -> Result<Option<ChangeSummary>, String> { self.undo_last_with(|_|Err("This change requires the file-operation undo service".into())) }
+
+    pub fn undo_last_with<F>(&self, mut undo_external:F) -> Result<Option<ChangeSummary>, String> where F:FnMut(&str)->Result<(),String> {
         self.require_write()?;
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
@@ -422,11 +459,18 @@ impl CatalogWriter {
             statement.query_map([change.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
                 .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
         };
-        for (table, key, column, old, new) in items {
+        let mut external_payload=None;
+        for (table,key,column,old,new) in &items {
             validate_item(&table, &column)?;
-            let old_value = decode_sql(&old)?;
-            let new_value = decode_sql(&new)?;
+            let old_value=decode_sql(old)?;let new_value=decode_sql(new)?;
+            if table=="__file_ops" { external_payload=Some(match new_value{SqlValue::Text(payload)=>payload,_=>return Err("Invalid file-operation journal payload".into())});continue; }
             if read_item(&transaction, &table, &key, &column)? != new_value { return Err(format!("Cannot undo because {} {} changed since the journal entry", table, key)); }
+            if matches!(old_value,SqlValue::Null)&&column!="__snapshot__" { continue; }
+        }
+        if let Some(payload)=external_payload { undo_external(&payload)?; }
+        for (table,key,column,old,_) in items {
+            if table=="__file_ops" { continue; }
+            let old_value=decode_sql(&old)?;
             apply_item(&transaction, &table, &key, &column, &old_value)?;
         }
         transaction.execute("UPDATE ddreams_changes SET undone=1 WHERE id=?1", [change.id]).map_err(|e| e.to_string())?;
@@ -442,12 +486,13 @@ impl CatalogWriter {
 
 fn validate_item(table: &str, column: &str) -> Result<(), String> {
     let allowed = match table {
-        "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "__snapshot__"),
+        "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "path" | "name" | "ext" | "ext_lower" | "size" | "file_modified" | "folder_id" | "__snapshot__"),
         "folders" | "folder_roots" => column == "__snapshot__",
         "categories" => matches!(column, "name" | "parent_id" | "root_id" | "__snapshot__"),
         "category_roots" => matches!(column, "name" | "__snapshot__"),
         "keywords" => matches!(column, "name" | "parent_id" | "__snapshot__"),
         "asset_categories" | "asset_keywords" => column == "__exists__",
+        "__file_ops" => column == "__payload__",
         _ => false,
     };
     if allowed { Ok(()) } else { Err(format!("Unsupported journal target: {table}.{column}")) }
