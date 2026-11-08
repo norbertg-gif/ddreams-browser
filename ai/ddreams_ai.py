@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import gc
 import hashlib
 import io
 import json
@@ -25,6 +26,10 @@ COLOR_VERSION = 1
 TEXT_PROB_FLOOR = 0.003
 TEXT_PROB_RELATIVE = 0.05
 SIMILARITY_COSINE_FLOOR = 0.60
+SUGGEST_K = 10
+MIN_SCORE = 0.30
+AUTO_GROUP_SCORE = 0.70
+SUGGEST_BATCH_CHUNK = 128
 BATCH_SIZE = 32
 DECODE_THREADS = 6
 CHROMATIC_COLORS = ("červená", "oranžová", "hnedá", "žltá", "zelená", "tyrkysová", "modrá", "fialová", "ružová")
@@ -134,6 +139,32 @@ def _set_background_priority() -> None:
         pass
 
 
+def process_memory() -> dict[str, int] | None:
+    """Windows RSS/private commit; avoids adding psutil to the runtime."""
+    if os.name != "nt":
+        return None
+    class Counters(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                    ("PrivateUsage", ctypes.c_size_t)]
+    try:
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.GetCurrentProcess.restype = ctypes.c_void_p
+        psapi.GetProcessMemoryInfo.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong)
+        psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+        counters = Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(kernel.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return None
+        return {"working_set": int(counters.WorkingSetSize), "private": int(counters.PrivateUsage)}
+    except Exception:
+        return None
+
+
 def decode_photo(item: dict[str, Any]):
     """Decode a photo to an oriented RGB PIL image suitable for model input."""
     from PIL import Image, ImageOps
@@ -184,17 +215,23 @@ class SiglipEmbedder:
 
         self.torch = torch
         self._lock = threading.RLock()
-        self.model, _, self.preprocess = open_clip.create_model_and_transforms(
-            MODEL_NAME, device="meta", image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5),
-            image_interpolation="bicubic", image_resize_mode="squash",
-        )
+        # The meta-device context matters: device="meta" alone still builds random CPU
+        # weights first (~5 GB private memory, ~35 s). Measured 2026-11-08.
+        with torch.device("meta"):
+            self.model, _, self.preprocess = open_clip.create_model_and_transforms(
+                MODEL_NAME, device="meta", image_mean=(0.5, 0.5, 0.5), image_std=(0.5, 0.5, 0.5),
+                image_interpolation="bicubic", image_resize_mode="squash",
+            )
         checkpoint = Path(model_dir) / "open_clip_model.fp16.safetensors"
-        # Tensor by tensor: safetensors' bulk load_file fails with "invalid python storage"
-        # (or crashes) when the system is short on memory, e.g. while other AI tools run.
-        with safe_open(str(checkpoint), framework="pt", device="cuda") as weights:
-            state = {key: weights.get_tensor(key) for key in weights.keys()}
+        # Tensor by tensor from the CPU memory map: safetensors' bulk load_file fails with
+        # "invalid python storage" when commit memory is short, and loading straight to
+        # CUDA keeps ~0.5 GB extra private memory.
+        with safe_open(str(checkpoint), framework="pt", device="cpu") as weights:
+            state = {key: weights.get_tensor(key).to("cuda") for key in weights.keys()}
         self.model.load_state_dict(state, strict=False, assign=True)
         del state
+        gc.collect()
+        torch.cuda.empty_cache()
         self.model.eval()
         self._logit_scale = self.model.logit_scale.detach().float().exp()
         self._logit_bias = self.model.logit_bias.detach().float()
@@ -298,6 +335,7 @@ class AIService:
             CREATE TABLE IF NOT EXISTS colors(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, shares TEXT NOT NULL, auto TEXT NOT NULL, version INTEGER NOT NULL);
         """)
         self.db_lock = threading.RLock()
+        self._lock = threading.RLock()
         meta = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
         if meta.get("model") != self.model_name or meta.get("schema_version") != SCHEMA_VERSION:
             self.db.execute("DELETE FROM embeddings")
@@ -328,6 +366,8 @@ class AIService:
         self._last_progress = 0.0
         self._model_load_s: float | None = None
         self._device = "cuda" if embedder_factory is None else "cpu"
+        self._labels: dict[str, dict[int, set[int]]] = {"category": {}, "keyword": {}}
+        self._parents: dict[str, dict[int, int | None]] = {"category": {}, "keyword": {}}
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
@@ -377,8 +417,12 @@ class AIService:
             with self.db_lock:
                 rows = self.db.execute("SELECT asset_id,vector FROM embeddings WHERE model=? AND dim=? ORDER BY asset_id", (self.model_name, DIMENSION)).fetchall()
             ids = [int(row[0]) for row in rows]
-            vectors = np.stack([np.frombuffer(row[1], dtype=np.float16).astype(np.float32) for row in rows]) if rows else np.empty((0, DIMENSION), dtype=np.float32)
+            vectors = np.empty((len(rows), DIMENSION), dtype=np.float16)
+            for index, row in enumerate(rows):
+                vectors[index] = np.frombuffer(row[1], dtype=np.float16)
             embedder.replace_index(ids, vectors)
+            del rows, vectors
+            gc.collect()
             self._embedder = embedder
             self.indexed_count = len(ids)
             self._model_ready.set()
@@ -387,6 +431,12 @@ class AIService:
             ready_status["state"] = "ready"
             ready_status["model_load_s"] = self._model_load_s
             self._emit({"event": "status", **ready_status})
+            if hasattr(embedder, "torch"):
+                memory = process_memory()
+                if memory:
+                    _stderr(f"MEMORY ready working_set={memory['working_set']} private={memory['private']}")
+                if str(getattr(embedder, "device", "")).startswith("cuda"):
+                    _stderr(f"CUDA ready allocated={embedder.torch.cuda.memory_allocated()} reserved={embedder.torch.cuda.memory_reserved()}")
             _stderr(f"SigLIP2 pripravený za {self._model_load_s:.3f} s")
         except Exception as exc:
             text = str(exc)
@@ -623,6 +673,198 @@ class AIService:
             self.db.commit()
         return {"thresholds": self.color_thresholds, "examples": sum(len(values) for values in samples.values())}
 
+    @staticmethod
+    def _kind(value: Any) -> str:
+        if value not in ("category", "keyword"):
+            raise RequestError("kind musí byť category alebo keyword")
+        return value
+
+    def _set_labels(self, request: dict[str, Any]) -> dict[str, Any]:
+        kind = self._kind(request.get("kind"))
+        pairs, raw_parents = request.get("pairs"), request.get("parents", {})
+        if not isinstance(pairs, list) or not isinstance(raw_parents, dict):
+            raise RequestError("pairs musí byť zoznam a parents objekt")
+        labels: dict[int, set[int]] = {}
+        for pair in pairs:
+            if not isinstance(pair, list) or len(pair) != 2 or any(isinstance(x, bool) or not isinstance(x, int) or x <= 0 for x in pair):
+                raise RequestError("Každá dvojica labels musí obsahovať dve kladné ID")
+            labels.setdefault(pair[0], set()).add(pair[1])
+        parents: dict[int, int | None] = {}
+        try:
+            for label_id, parent_id in raw_parents.items():
+                key = int(label_id)
+                if key <= 0 or isinstance(parent_id, bool) or (parent_id is not None and (not isinstance(parent_id, int) or parent_id <= 0)):
+                    raise ValueError
+                parents[key] = parent_id
+        except (TypeError, ValueError):
+            raise RequestError("parents obsahuje neplatné ID") from None
+        with self._lock:
+            self._labels[kind] = labels
+            self._parents[kind] = parents
+        return {"assets": len(labels), "assignments": sum(map(len, labels.values())), "labels": len(parents)}
+
+    def _index_snapshot(self) -> tuple[list[int], Any, dict[int, int]]:
+        embedder = self._wait_model()
+        with getattr(embedder, "_lock", self._lock):
+            if not hasattr(embedder, "_ids"):
+                matrix = {int(a): np.asarray(v, dtype=np.float32) for a, v in embedder.vectors.items()}
+                ids = list(matrix)
+            else:
+                ids = [int(x) for x in embedder._ids]
+                matrix = embedder._matrix
+            positions = {aid: i for i, aid in enumerate(ids)}
+        return ids, matrix, positions
+
+    @staticmethod
+    def _ancestors(label_id: int, parents: dict[int, int | None]) -> set[int]:
+        found, current = set(), label_id
+        while current in parents and parents[current] is not None:
+            current = int(parents[current])
+            if current in found:
+                break
+            found.add(current)
+        return found
+
+    def _top_neighbors(self, query_id: int, candidates: list[int], k: int,
+                       index: tuple[list[int], Any, dict[int, int]]) -> list[tuple[int, float]]:
+        ids, matrix, positions = index
+        if query_id not in positions or not candidates:
+            return []
+        if isinstance(matrix, dict):
+            query = matrix.get(query_id)
+            if query is None:
+                return []
+            sims = np.asarray([float(np.dot(query, matrix[aid])) for aid in candidates], dtype=np.float32)
+            try:
+                sims[candidates.index(query_id)] = -np.inf
+            except ValueError:
+                pass
+            take = min(k, len(candidates))
+            chosen = np.argpartition(-sims, take - 1)[:take] if take else np.empty((0,), dtype=np.int64)
+            chosen = chosen[np.argsort(-sims[chosen], kind="stable")]
+            return [(candidates[int(i)], float(sims[i])) for i in chosen if np.isfinite(sims[i])]
+        else:
+            embedder = self._embedder
+            torch = embedder.torch
+            candidate_pos = torch.as_tensor([positions[a] for a in candidates], device=matrix.device)
+            with torch.inference_mode():
+                scores = matrix[candidate_pos] @ matrix[positions[query_id]]
+                scores = scores.masked_fill(candidate_pos == positions[query_id], -2.0)
+                values, chosen = torch.topk(scores, min(k, len(candidates)))
+                return [(candidates[int(i)], float(score)) for score, i in zip(values.cpu().tolist(), chosen.cpu().tolist()) if score > -1.5]
+
+    def _rank_labels(self, query_id: int, kind: str, limit: int,
+                     index: tuple[list[int], Any, dict[int, int]], labels: dict[int, set[int]],
+                     parents: dict[int, int | None], min_score: float = MIN_SCORE) -> list[dict[str, Any]]:
+        candidates = [aid for aid, values in labels.items() if values and aid in index[2]]
+        neighbors = self._top_neighbors(query_id, candidates, SUGGEST_K, index)
+        return self._rank_neighbors(query_id, neighbors, limit, labels, parents, min_score)
+
+    @staticmethod
+    def _rank_neighbors(query_id: int, neighbors: list[tuple[int, float]], limit: int,
+                        labels: dict[int, set[int]], parents: dict[int, int | None],
+                        min_score: float = MIN_SCORE) -> list[dict[str, Any]]:
+        denominator = sum(score for _, score in neighbors)
+        if not neighbors or denominator <= 0:
+            return []
+        excluded = set(labels.get(query_id, set()))
+        for label_id in tuple(excluded):
+            excluded.update(AIService._ancestors(label_id, parents))
+        votes: dict[int, float] = {}
+        support: dict[int, int] = {}
+        for aid, similarity in neighbors:
+            for label_id in labels[aid]:
+                votes[label_id] = votes.get(label_id, 0.0) + similarity
+                support[label_id] = support.get(label_id, 0) + 1
+        ranked = [{"label_id": label_id, "score": score / denominator, "support": support[label_id]}
+                  for label_id, score in votes.items() if label_id not in excluded and score / denominator >= min_score]
+        ranked.sort(key=lambda row: (-row["score"], -row["support"], row["label_id"])); return ranked[:limit]
+
+    def _suggest(self, request: dict[str, Any]) -> dict[str, Any]:
+        kind = self._kind(request.get("kind"))
+        asset_ids = request.get("asset_ids")
+        if not isinstance(asset_ids, list) or any(isinstance(a, bool) or not isinstance(a, int) or a <= 0 for a in asset_ids):
+            raise RequestError("asset_ids musí byť zoznam kladných ID")
+        limit = self._limit(request.get("limit", 5))
+        with self._lock:
+            labels, parents = self._labels[kind], self._parents[kind]
+        index = self._index_snapshot()
+        results = {}
+        totals: dict[int, float] = {}; counts: dict[int, int] = {}
+        for aid in asset_ids:
+            if aid not in index[2]:
+                continue
+            suggestions = self._rank_labels(aid, kind, 1000, index, labels, parents)
+            results[str(aid)] = suggestions[:limit]
+            for item in suggestions:
+                label_id = item["label_id"]
+                totals[label_id] = totals.get(label_id, 0.0) + item["score"]
+                counts[label_id] = counts.get(label_id, 0) + 1
+        denominator = max(1, len(asset_ids))
+        combined = [{"label_id": label_id, "score": score / denominator, "count": counts[label_id]}
+                    for label_id, score in totals.items()]
+        combined.sort(key=lambda row: (-row["score"], -row["count"], row["label_id"]))
+        return {"results": results, "combined": combined, "searched": len(index[0])}
+
+    def _suggest_batch(self, request: dict[str, Any]) -> dict[str, Any]:
+        kind = self._kind(request.get("kind"))
+        asset_ids = request.get("asset_ids")
+        minimum = request.get("min_score", AUTO_GROUP_SCORE)
+        if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not 0 <= minimum <= 1:
+            raise RequestError("min_score musí byť číslo od 0 do 1")
+        with self._lock:
+            labels, parents = self._labels[kind], self._parents[kind]
+        index = self._index_snapshot()
+        indexed = set(index[0])
+        if asset_ids == "unlabeled":
+            targets = sorted(indexed - set(labels))
+        elif isinstance(asset_ids, list) and all(isinstance(a, int) and not isinstance(a, bool) and a > 0 for a in asset_ids):
+            targets = list(dict.fromkeys(asset_ids))
+        else:
+            raise RequestError('asset_ids musí byť zoznam ID alebo "unlabeled"')
+        groups: dict[int, list[tuple[int, float]]] = {}
+        candidates = [aid for aid, values in labels.items() if values and aid in index[2]]
+        ids, matrix, positions = index
+        targets = [aid for aid in targets if aid in indexed]
+        if candidates:
+            if isinstance(matrix, dict):
+                candidate_matrix = np.stack([matrix[aid] for aid in candidates])
+                for start in range(0, len(targets), SUGGEST_BATCH_CHUNK):
+                    block = targets[start:start + SUGGEST_BATCH_CHUNK]
+                    scores = np.stack([matrix[aid] for aid in block]) @ candidate_matrix.T
+                    self._collect_batch_groups(block, candidates, scores, labels, parents, float(minimum), groups)
+            else:
+                torch = self._embedder.torch
+                candidate_pos = torch.as_tensor([positions[a] for a in candidates], device=matrix.device)
+                for start in range(0, len(targets), SUGGEST_BATCH_CHUNK):
+                    block = targets[start:start + SUGGEST_BATCH_CHUNK]
+                    query_pos = torch.as_tensor([positions[a] for a in block], device=matrix.device)
+                    with torch.inference_mode():
+                        scores = (matrix[query_pos] @ matrix[candidate_pos].T).float().cpu().numpy()
+                    self._collect_batch_groups(block, candidates, scores, labels, parents, float(minimum), groups)
+        rows = [{"label_id": label_id, "count": len(items),
+                 "asset_ids": [aid for aid, _ in sorted(items, key=lambda pair: (-pair[1], pair[0]))]}
+                for label_id, items in groups.items()]
+        rows.sort(key=lambda row: (-row["count"], row["label_id"]))
+        return {"groups": rows}
+
+    def _collect_batch_groups(self, targets: list[int], candidates: list[int], scores: np.ndarray,
+                              labels: dict[int, set[int]], parents: dict[int, int | None], minimum: float,
+                              groups: dict[int, list[tuple[int, float]]]) -> None:
+        candidate_positions = {candidate: position for position, candidate in enumerate(candidates)}
+        for row, aid in enumerate(targets):
+            similarities = scores[row].copy()
+            if aid in candidate_positions:
+                similarities[candidate_positions[aid]] = -np.inf
+            take = min(SUGGEST_K, len(candidates))
+            chosen = np.argpartition(-similarities, take - 1)[:take] if take else np.empty((0,), dtype=np.int64)
+            chosen = chosen[np.argsort(-similarities[chosen], kind="stable")]
+            neighbors = [(candidates[int(i)], float(similarities[i])) for i in chosen if np.isfinite(similarities[i])]
+            ranked = self._rank_neighbors(aid, neighbors, 1, labels, parents, minimum)
+            if ranked:
+                item = ranked[0]
+                groups.setdefault(item["label_id"], []).append((aid, item["score"]))
+
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         cmd = request.get("cmd")
         if cmd == "hello":
@@ -634,6 +876,12 @@ class AIService:
             return self._index_command(request)
         if cmd == "learn_colors":
             return self._learn_colors(request)
+        if cmd == "set_labels":
+            return self._set_labels(request)
+        if cmd == "suggest":
+            return self._suggest(request)
+        if cmd == "suggest_batch":
+            return self._suggest_batch(request)
         if cmd == "pause":
             with self._condition:
                 self._paused = True
@@ -698,7 +946,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

@@ -48,6 +48,14 @@ pub fn ai_reindex(state: State<'_, AiState>) -> Result<AiStatus, String> { state
 pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.search_text(query, limit) }
 #[tauri::command]
 pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.similar(asset_id, limit) }
+#[tauri::command]
+pub fn ai_suggest(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String)->Result<Value,String>{state.0.suggest(asset_ids,&kind)}
+#[tauri::command]
+pub fn ai_reject_suggestion(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String,label_id:i64)->Result<usize,String>{state.0.reject_suggestion(&asset_ids,&kind,label_id)}
+#[tauri::command]
+pub fn ai_suggestion_groups(state:State<'_,AiState>,kind:String)->Result<Value,String>{state.0.suggestion_groups(&kind)}
+#[tauri::command]
+pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("Neplatný typ štítku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
 
 #[derive(Serialize,Clone)]
 #[serde(rename_all="camelCase")]
@@ -106,7 +114,7 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
 
 #[tauri::command]
 pub async fn undo_last_change(state: State<'_, FileManagerState>,ai:State<'_,AiState>) -> Result<Option<ChangeSummary>, String> {
-    let manager=state.0.clone();let change=tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())??;if change.as_ref().is_some_and(|item|item.action=="set_asset_colors"||item.action=="import_photosort_colors"){ai.0.learn_colors_debounced();}Ok(change)
+    let manager=state.0.clone();let change=tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())??;if change.as_ref().is_some_and(|item|item.action=="set_asset_colors"||item.action=="import_photosort_colors"){ai.0.learn_colors_debounced();}if change.as_ref().is_some_and(|item|item.action.contains("categor")||item.action.contains("keyword")){ai.0.sync_labels_debounced("category");ai.0.sync_labels_debounced("keyword");}Ok(change)
 }
 
 #[tauri::command]
@@ -149,7 +157,7 @@ pub fn set_asset_values(
 
 #[tauri::command]
 pub fn set_asset_categories(
-    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, category_id: i64, assign: bool,
+    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>, ai:State<'_,AiState>, asset_ids: Vec<i64>, category_id: i64, assign: bool,
 ) -> Result<SetAssetCategoriesResult, String> {
     let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id|*id<0){
@@ -160,6 +168,7 @@ pub fn set_asset_categories(
         candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);
     }
     let result=state.0.set_asset_categories(&file_ids,&candidates,category_id,assign)?;
+    if result.changed_count>0{ai.0.sync_labels_debounced("category");}
     for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}
     for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}
     Ok(result)
@@ -200,10 +209,10 @@ pub fn get_category_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Resu
 pub fn delete_category(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryMutationResult,String>{state.0.delete_category(id)}
 
 #[tauri::command]
-pub fn set_asset_keywords(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
+pub fn set_asset_keywords(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
     let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id|*id<0){let Some(asset)=listing.0.asset(id)else{continue};if asset.is_directory||asset.ext.is_empty(){continue;}let path=asset.path.ok_or_else(||format!("Listed file {id} has no resolved path"))?;let folder_path=Path::new(&path).parent().map(|p|p.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);}
-    let result=state.0.set_asset_keywords(&file_ids,&candidates,keyword_id,assign)?;for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
+    let result=state.0.set_asset_keywords(&file_ids,&candidates,keyword_id,assign)?;if result.changed_count>0{ai.0.sync_labels_debounced("keyword");}for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
 }
 #[tauri::command]
 pub fn create_and_assign_keyword(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,parent_id:Option<i64>,name:String)->Result<SetAssetKeywordsResult,String>{

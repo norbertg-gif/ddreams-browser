@@ -45,9 +45,11 @@ pub fn run() {
     let listing = listing::ListingService::new(db.clone(), formats.clone());
     let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone());
-    let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
-    let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
     let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone());
+    let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
+    let journal_ai=ai_service.clone();
+    writer.set_change_hook(Arc::new(move|kinds|for kind in kinds { journal_ai.sync_labels_debounced(kind); }));
+    let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
     let _=ai_service.ensure_colors_attached();
     let setup_ai = ai_service.clone();
     let protocol_thumbs = thumbs.clone();
@@ -131,6 +133,10 @@ pub fn run() {
             commands::ai_reindex,
             commands::ai_search_text,
             commands::ai_similar,
+            commands::ai_suggest,
+            commands::ai_reject_suggestion,
+            commands::ai_suggestion_groups,
+            commands::ai_sync_labels,
             commands::set_asset_colors,
             commands::get_asset_colors,
             commands::get_color_counts,

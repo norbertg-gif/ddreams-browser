@@ -231,5 +231,43 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(any(m.get("id") == 2 and m.get("ok") is True for m in messages))
 
 
+    def test_label_suggestions_exclude_self_existing_and_ancestors(self):
+        items = [self.make_file(f"knn-{name}.jpg") for name in ("query", "n1", "n2", "n3", "unlabeled")]
+        self.index(items); self.wait_idle()
+        vectors = self.service._embedder.vectors
+        ids = [item["asset_id"] for item in items]
+        vectors[ids[0]] = np.array([1.0, 0.0] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        vectors[ids[1]] = np.array([0.9, (1 - 0.9 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        vectors[ids[2]] = np.array([0.8, 0.6] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        vectors[ids[3]] = np.array([0.7, (1 - 0.7 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        vectors[ids[4]] = np.array([0.95, (1 - 0.95 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        set_result = self.service.execute({"cmd": "set_labels", "kind": "category",
+            "pairs": [[ids[0], 30], [ids[1], 20], [ids[1], 40], [ids[2], 50], [ids[3], 30], [ids[3], 40]],
+            "parents": {"30": 20, "20": 10, "10": None, "40": None, "50": None}})
+        self.assertEqual(set_result, {"assets": 4, "assignments": 6, "labels": 5})
+        result = self.service.execute({"cmd": "suggest", "kind": "category", "asset_ids": [ids[0], ids[4]], "limit": 5})
+        rows = result["results"][str(ids[0])]
+        self.assertNotIn(ids[0], result["results"])
+        self.assertEqual([40, 50], [row["label_id"] for row in rows])
+        self.assertAlmostEqual(2.0 / 3.0, rows[0]["score"], places=5)
+        self.assertEqual(2, rows[0]["support"])
+        self.assertNotIn(30, [row["label_id"] for row in rows])
+        self.assertNotIn(20, [row["label_id"] for row in rows])
+        self.assertEqual(2, result["combined"][0]["count"])
+
+    def test_suggest_batch_grouping_unlabeled_and_unknown_kind(self):
+        items = [self.make_file(f"batch-{name}.jpg") for name in ("a", "b", "c", "d")]
+        self.index(items); self.wait_idle()
+        ids = [item["asset_id"] for item in items]
+        vectors = self.service._embedder.vectors
+        for aid, x in zip(ids, (1.0, 0.95, 0.9, 0.85)):
+            vectors[aid] = np.array([x, (1 - x * x) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        self.service.execute({"cmd": "set_labels", "kind": "keyword", "pairs": [[ids[0], 7], [ids[1], 7]], "parents": {"7": None}})
+        groups = self.service.execute({"cmd": "suggest_batch", "kind": "keyword", "asset_ids": "unlabeled", "min_score": 0.3})["groups"]
+        self.assertEqual([ids[2], ids[3]], groups[0]["asset_ids"])
+        with self.assertRaisesRegex(RequestError, "kind"):
+            self.service.execute({"cmd": "suggest", "kind": "unknown", "asset_ids": [ids[0]]})
+
+
 if __name__ == "__main__":
     unittest.main()

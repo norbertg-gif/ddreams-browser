@@ -1,6 +1,7 @@
 use crate::{db::Db, formats::FormatTable, paths::Paths};
 use serde::Serialize;
 use serde_json::{json, Value};
+use rusqlite::OptionalExtension;
 use std::{collections::HashMap, fs::{self, File, OpenOptions}, io::{BufRead, BufReader, BufWriter, Write}, path::PathBuf, process::{Child, ChildStdin, Command, Stdio}, sync::{atomic::{AtomicBool, AtomicU64, Ordering}, mpsc, Arc, Mutex}, thread, time::{Duration, UNIX_EPOCH}};
 use tauri::Emitter;
 
@@ -51,6 +52,7 @@ struct AiInner {
     auto_index_started: AtomicBool,
     colors_attached: AtomicBool,
     color_learn_generation: AtomicU64,
+    label_generation: AtomicU64,
     last_stderr: Mutex<String>,
     stderr_reader: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -72,6 +74,7 @@ impl AiService {
             auto_index_started: AtomicBool::new(false), last_stderr: Mutex::new(String::new()), stderr_reader: Mutex::new(None),
             colors_attached: AtomicBool::new(false),
             color_learn_generation: AtomicU64::new(0),
+            label_generation: AtomicU64::new(0),
         }))
     }
 
@@ -99,6 +102,13 @@ impl AiService {
             let rows={let Ok(conn)=service.0.db.lock()else{return};let Ok(mut stmt)=conn.prepare("SELECT asset_id,color,state FROM asset_color_overrides ORDER BY asset_id,color")else{return};let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))else{return};rows.filter_map(Result::ok).map(|(asset_id,color,state)|json!({"asset_id":asset_id,"color":color,"state":state!=0})).collect::<Vec<_>>()};
             if service.0.process.lock().ok().and_then(|p|p.writer.clone()).is_some(){let _=service.request("learn_colors",json!({"corrections":rows}),Duration::from_secs(60));}
         });
+    }
+
+    pub fn sync_labels_debounced(&self,kind:&str){let Ok(kind)=valid_label_kind(kind)else{return};let generation=self.0.label_generation.fetch_add(1,Ordering::Relaxed)+1;let service=self.clone();let kind=kind.to_owned();let _=thread::Builder::new().name("ai-label-sync-debounce".into()).spawn(move||{thread::sleep(Duration::from_secs(3));if service.0.label_generation.load(Ordering::Relaxed)!=generation||!service.status().available{return;}let _=service.sync_labels(&kind);});}
+
+    fn sync_labels(&self,kind:&str)->Result<(),String>{
+        let (pairs,parents,listed)={let conn=self.0.db.lock().map_err(|e|e.to_string())?;let (relation,label,table)=if kind=="category" {("asset_categories","category_id","categories")}else{("asset_keywords","keyword_id","keywords")};let sql=format!("SELECT rel.asset_id,rel.{label} FROM {relation} rel JOIN assets a ON a.id=rel.asset_id WHERE a.is_listed=1 ORDER BY rel.asset_id,rel.{label}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let pairs=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let sql=format!("SELECT id,parent_id FROM {table}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let mut stmt=conn.prepare("SELECT id FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?;let listed=stmt.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(|e|e.to_string())?;(pairs,rows,listed)};
+        self.request("set_labels",build_label_payload(kind,&pairs,&parents,&listed),Duration::from_secs(60))?;Ok(())
     }
 
     pub fn set_app(&self, app: tauri::AppHandle) { *self.0.app.lock().unwrap() = Some(app); }
@@ -214,6 +224,34 @@ impl AiService {
         result_page(result)
     }
 
+    pub fn suggest(&self, asset_ids: Vec<i64>, kind: &str) -> Result<Value, String> {
+        let kind = valid_label_kind(kind)?;
+        if asset_ids.is_empty() { return Ok(json!([])); }
+        let combined = asset_ids.len() > 1;
+        let response = self.request("suggest", json!({"asset_ids":asset_ids,"kind":kind,"limit":5}), Duration::from_secs(60))?;
+        let rows = if combined { response.get("combined").and_then(Value::as_array).cloned().unwrap_or_default() } else { response.get("results").and_then(|v|v.get(asset_ids[0].to_string())).and_then(Value::as_array).cloned().unwrap_or_default() };
+        let conn=self.0.db.lock().map_err(|e|e.to_string())?;
+        let mut out=Vec::new();
+        for row in rows {
+            let Some(id)=row.get("label_id").and_then(Value::as_i64) else {continue};
+            let path=label_path(&conn,kind,id)?;
+            let candidates=if combined { asset_ids.iter().copied().filter(|aid|response.get("results").and_then(|v|v.get(aid.to_string())).and_then(Value::as_array).is_some_and(|items|items.iter().any(|item|item.get("label_id").and_then(Value::as_i64)==Some(id)))).collect::<Vec<_>>() } else { asset_ids.clone() };
+            let rejected=candidates.iter().filter_map(|aid|conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND kind=?2 AND label_id=?3)",rusqlite::params![aid,kind,id],|r|r.get::<_,bool>(0)).ok().filter(|rejected|*rejected).map(|_|*aid)).collect::<std::collections::HashSet<_>>();
+            let accepted=filter_suggest_assets(&candidates,&rejected);
+            if accepted.is_empty() {continue;}
+            let count=if combined {accepted.len() as u64} else {row.get("support").and_then(Value::as_u64).unwrap_or(0)};
+            out.push(json!({"labelId":id,"path":path,"score":row.get("score").and_then(Value::as_f64).unwrap_or(0.0),"count":count,"assetIds":accepted}));
+        }
+        Ok(Value::Array(out))
+    }
+
+    pub fn reject_suggestion(&self, asset_ids:&[i64], kind:&str, label_id:i64)->Result<usize,String>{
+        let kind=valid_label_kind(kind)?; let conn=self.0.db.lock().map_err(|e|e.to_string())?; let mut n=0;
+        for id in asset_ids { n+=conn.execute("INSERT OR IGNORE INTO ai_suggestion_rejections(asset_id,kind,label_id) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",rusqlite::params![id,kind,label_id]).map_err(|e|e.to_string())?; } Ok(n)
+    }
+
+    pub fn suggestion_groups(&self,kind:&str)->Result<Value,String>{let kind=valid_label_kind(kind)?;let result=self.request("suggest_batch",json!({"kind":kind,"asset_ids":"unlabeled"}),Duration::from_secs(300))?;let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();let conn=self.0.db.lock().map_err(|e|e.to_string())?;let mut out=Vec::new();for group in groups{let Some(label_id)=group.get("label_id").and_then(Value::as_i64)else{continue};let ids=group.get("asset_ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect::<Vec<_>>();let mut listed=std::collections::HashSet::new();let mut rejected=std::collections::HashSet::new();for id in &ids{if conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get::<_,bool>(0)).unwrap_or(false){listed.insert(*id);}if conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND kind=?2 AND label_id=?3)",rusqlite::params![id,kind,label_id],|r|r.get::<_,bool>(0)).unwrap_or(false){rejected.insert(*id);}}let accepted=filter_group_assets(&ids,&listed,&rejected);if !accepted.is_empty(){out.push(json!({"labelId":label_id,"path":label_path(&conn,kind,label_id)?,"count":accepted.len(),"assetIds":accepted}));}}out.sort_by(|a,b|b["count"].as_u64().cmp(&a["count"].as_u64()));Ok(Value::Array(out))}
+
     fn request(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, String> {
         let writer = self.0.process.lock().map_err(|e| e.to_string())?.writer.clone().ok_or_else(|| "AI server nie je spustený".to_string())?;
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
@@ -310,6 +348,8 @@ impl AiService {
     }
 
     fn index_catalog(&self) -> Result<(), String> {
+        // Labels first: they don't depend on the index, and stat-ing ~90k files below can take minutes.
+        self.sync_labels("category")?;self.sync_labels("keyword")?;
         let extensions = self.0.formats.extensions(&["image", "raw"]);
         if extensions.is_empty() { return Err("Nie sú nakonfigurované formáty fotografií".into()); }
         let sql = format!("SELECT id,path,size FROM assets WHERE is_listed=1 AND id>0 AND path IS NOT NULL AND trim(path)<>'' AND ext_lower IN ({})", extensions.iter().map(|ext| format!("'{ext}'")).collect::<Vec<_>>().join(","));
@@ -334,6 +374,7 @@ impl AiService {
             + result.get("up_to_date").and_then(Value::as_u64).unwrap_or(0)
             + result.get("failed_before").and_then(Value::as_u64).unwrap_or(0);
         self.emit(&status);
+        drop(status);
         Ok(())
     }
 }
@@ -345,9 +386,48 @@ fn result_page(result: Value) -> Result<AiSearchResult, String> {
     Ok(AiSearchResult { ids, searched })
 }
 
+fn valid_label_kind(kind:&str)->Result<&str,String>{match kind{"category"=>Ok("category"),"keyword"=>Ok("keyword"),_=>Err("Neplatný typ štítku".into())}}
+fn filter_unrejected_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{candidates.iter().copied().filter(|id|!rejected.contains(id)).collect()}
+fn filter_suggest_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected)}
+fn filter_group_assets(candidates:&[i64],listed:&std::collections::HashSet<i64>,rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected).into_iter().filter(|id|listed.contains(id)).collect()}
+fn build_label_payload(kind:&str,pairs:&[(i64,i64)],parents:&[(i64,Option<i64>)],listed:&std::collections::HashSet<i64>)->Value{json!({"kind":kind,"pairs":pairs.iter().filter(|(asset_id,_)|listed.contains(asset_id)).collect::<Vec<_>>(),"parents":parents.iter().map(|(id,parent)|(id.to_string(),parent)).collect::<HashMap<_,_>>()})}
+fn label_path(conn:&rusqlite::Connection,kind:&str,id:i64)->Result<String,String>{
+    let (table,parent_col)=if kind=="category" {("categories","parent_id")} else {("keywords","parent_id")};
+    let mut parts=Vec::new();let mut current=Some(id);let mut seen=std::collections::HashSet::new();
+    while let Some(value)=current {if !seen.insert(value){break;}let sql=format!("SELECT name,{parent_col} FROM {table} WHERE id=?1");let row:Option<(String,Option<i64>)>=conn.query_row(&sql,[value],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;let Some((name,parent))=row else {return Err("AI návrh odkazuje na neexistujúci štítok".into())};parts.push(name);current=parent;}
+    parts.reverse();Ok(parts.join("/"))
+}
+
 fn availability_reason(paths: &Paths) -> Option<String> {
     if !paths.ai_python.as_ref().is_some_and(|path| path.is_file()) { return Some("AI modul nie je nainštalovaný".into()); }
     if !paths.ai_script.is_file() { return Some("AI modul nie je nainštalovaný".into()); }
     if !paths.ai_model.join("open_clip_model.fp16.safetensors").is_file() { return Some("AI model nie je nainštalovaný".into()); }
     None
+}
+
+#[cfg(test)]
+mod suggestion_tests {
+    use super::*;
+
+    #[test]
+    fn suggest_rejections_filter_only_rejected_assets(){
+        let candidates=[1,2,3];let rejected=std::collections::HashSet::from([2]);
+        assert_eq!(filter_suggest_assets(&candidates,&rejected),vec![1,3]);
+        assert!(filter_suggest_assets(&[2],&rejected).is_empty());
+    }
+
+    #[test]
+    fn group_rejections_and_unlisted_assets_are_filtered(){
+        let candidates=[1,2,3];let listed=std::collections::HashSet::from([1,2]);let rejected=std::collections::HashSet::from([2]);
+        assert_eq!(filter_group_assets(&candidates,&listed,&rejected),vec![1]);
+    }
+
+    #[test]
+    fn label_sync_payload_excludes_unlisted_asset_pairs_and_keeps_tree_parents(){
+        let pairs=[(1,11),(2,12),(3,13)];let parents=[(11,None),(12,Some(11)),(13,None)];let listed=std::collections::HashSet::from([1,2]);
+        let payload=build_label_payload("category",&pairs,&parents,&listed);
+        assert_eq!(payload["pairs"],json!([[1,11],[2,12]]));
+        assert_eq!(payload["parents"]["12"],json!(11));
+        assert!(payload["parents"].get("13").is_some());
+    }
 }

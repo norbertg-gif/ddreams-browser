@@ -84,10 +84,14 @@ pub struct KeywordDeleteInfo { pub id: i64, pub name: String, pub assigned_files
 #[derive(Clone, Debug)]
 struct StoredItem { table_name: String, row_key: String, column_name: String, old_value: SqlValue, new_value: SqlValue }
 
-pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool }
+pub type ChangeHook = Arc<dyn Fn(&[String]) + Send + Sync>;
+static JOURNAL_CHANGE_HOOK: std::sync::OnceLock<Mutex<Option<ChangeHook>>> = std::sync::OnceLock::new();
+pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>> }
 
 impl CatalogWriter {
-    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable } }
+    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None) } }
+    pub fn set_change_hook(&self, hook: ChangeHook) { *self.change_hook.lock().unwrap() = Some(hook.clone()); *JOURNAL_CHANGE_HOOK.get_or_init(||Mutex::new(None)).lock().unwrap()=Some(hook); }
+    fn notify_change(&self, kinds:&[String]) { if !kinds.is_empty() { if let Some(hook)=self.change_hook.lock().unwrap().as_ref() { hook(kinds); } } }
     pub fn begin_change(&self, action: impl Into<String>, summary: impl Into<String>) -> ChangeBuilder {
         ChangeBuilder { action: action.into(), summary: summary.into(), items: Vec::new() }
     }
@@ -130,6 +134,7 @@ impl CatalogWriter {
     pub fn commit_change(&self, change: ChangeBuilder) -> Result<i64, String> {
         self.require_write()?;
         if change.items.is_empty() { return Err("A change must contain at least one item".into()); }
+        let kinds=resync_kinds_for_tables(change.items.iter().map(|item|item.table_name.as_str()));
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let mut stored = Vec::with_capacity(change.items.len());
@@ -153,6 +158,7 @@ impl CatalogWriter {
         }
         mark_catalog_modified(&transaction)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        self.notify_change(&kinds);
         Ok(change_id)
     }
 
@@ -494,6 +500,7 @@ impl CatalogWriter {
             statement.query_map([change.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
                 .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
         };
+        let kinds=resync_kinds_for_tables(items.iter().map(|item|item.0.as_str()));
         let mut external_payload=None;
         for (table,key,column,old,new) in &items {
             validate_item(&table, &column)?;
@@ -511,6 +518,7 @@ impl CatalogWriter {
         transaction.execute("UPDATE ddreams_changes SET undone=1 WHERE id=?1", [change.id]).map_err(|e| e.to_string())?;
         mark_catalog_modified(&transaction)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        self.notify_change(&kinds);
         Ok(Some(change))
     }
 
@@ -531,6 +539,12 @@ fn validate_item(table: &str, column: &str) -> Result<(), String> {
         _ => false,
     };
     if allowed { Ok(()) } else { Err(format!("Unsupported journal target: {table}.{column}")) }
+}
+
+fn resync_kinds_for_tables<'a>(tables:impl IntoIterator<Item=&'a str>)->Vec<String>{
+    let mut kinds=std::collections::BTreeSet::new();
+    for table in tables {match table{"asset_categories"|"categories"|"category_roots"=>{kinds.insert("category".to_owned());},"asset_keywords"|"keywords"=>{kinds.insert("keyword".to_owned());},_=>{}}}
+    kinds.into_iter().collect()
 }
 
 #[derive(Default)]
@@ -664,7 +678,7 @@ fn record_column_update(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&s
 
 fn delete_row_snapshot(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),"__snapshot__")?;if matches!(old,SqlValue::Null){return Err(format!("Riadok {table} {id} neexistuje"));}apply_item(tx,table,&id.to_string(),"__snapshot__",&SqlValue::Null)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:"__snapshot__".into(),old_value:old,new_value:SqlValue::Null});Ok(())}
 
-fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;Ok(Some(change_id))}
+fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let kinds=resync_kinds_for_tables(events.iter().map(|item|item.table_name.as_str()));let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;if !kinds.is_empty(){if let Some(callback)=JOURNAL_CHANGE_HOOK.get().and_then(|hook|hook.lock().ok()).and_then(|hook|hook.clone()){callback(&kinds);}}Ok(Some(change_id))}
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
     transaction.execute(
@@ -901,6 +915,14 @@ fn iso_now() -> String {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    #[test]
+    fn journal_change_hook_resync_kind_decision_covers_assignments_and_undo(){
+        assert_eq!(resync_kinds_for_tables(["asset_categories"]),vec!["category"]);
+        assert_eq!(resync_kinds_for_tables(["asset_keywords"]),vec!["keyword"]);
+        assert_eq!(resync_kinds_for_tables(["categories","asset_keywords"]),vec!["category","keyword"]);
+        assert!(resync_kinds_for_tables(["assets","asset_color_overrides"]).is_empty());
+    }
     use crate::db::Db;
     use std::sync::{Arc,Mutex};
 
