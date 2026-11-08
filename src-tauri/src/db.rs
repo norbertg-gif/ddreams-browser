@@ -388,6 +388,7 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
 }
 
 pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
+    if filter.kind == "ai" { return ai_assets_page(db, filter, formats); }
     let conn = db.lock().unwrap();
     let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
     let extra_cols = filter.include_categories as i64 + filter.include_keywords as i64;
@@ -507,6 +508,36 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         total,
         total_size,
     })
+}
+
+fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
+    let mut seen = HashSet::new();
+    let ids = filter.ids.as_deref().unwrap_or_default().iter().copied().filter(|id| *id > 0 && seen.insert(*id)).take(500).collect::<Vec<_>>();
+    if ids.is_empty() { return Ok(AssetPage { items: Vec::new(), total: 0, total_size: 0.0 }); }
+    let requested = ids.iter().enumerate().map(|(index, _)| format!("(?{}, {})", index + 1, index)).collect::<Vec<_>>().join(",");
+    let with_sql = format!("WITH requested(id,ord) AS (VALUES {requested})");
+    let from_sql = "requested r JOIN assets a ON a.id=r.id";
+    let mut where_sql = format!("a.id>0 AND a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
+    let mut args = ids.iter().copied().map(Into::into).collect::<Vec<rusqlite::types::Value>>();
+    if let Some(q) = filter.query.as_ref().filter(|q| !q.trim().is_empty()) {
+        where_sql.push_str(" AND (a.name LIKE ? ESCAPE '\\' OR coalesce(a.caption,'') LIKE ? ESCAPE '\\' OR coalesce(a.notes,'') LIKE ? ESCAPE '\\')");
+        let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
+        args.extend([format!("%{escaped}%").into(), format!("%{escaped}%").into(), format!("%{escaped}%").into()]);
+    }
+    if filter.date_no_date || filter.date_from.is_some() || filter.date_to.is_some() {
+        add_date_filter(&mut where_sql, &mut args, filter, formats);
+    }
+    add_view_filters(&mut where_sql, &mut args, filter, formats);
+    let conn = db.lock().unwrap();
+    let count_sql = format!("{with_sql} SELECT count(*),coalesce(sum(a.size),0) FROM {from_sql} WHERE {where_sql}");
+    let (total,total_size):(i64,f64)=conn.query_row(&count_sql,rusqlite::params_from_iter(args.iter()),|row|Ok((row.get(0)?,row.get(1)?)))?;
+    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let sql = format!("{with_sql} SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY r.ord LIMIT ? OFFSET ?");
+    args.push(filter.limit.clamp(1,500).into());
+    args.push(filter.offset.max(0).into());
+    let mut statement=conn.prepare(&sql)?;
+    let items=statement.query_map(rusqlite::params_from_iter(args.iter()),|row|map_asset(row,filter.include_categories,filter.include_keywords))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(AssetPage { items, total, total_size })
 }
 
 pub fn attach_display_values(db: &Db, assets: &mut [Asset], include_categories: bool, include_keywords: bool) -> rusqlite::Result<()> {
@@ -1030,6 +1061,23 @@ mod feature_tests {
         assert_eq!(links.root_ids,vec![1]);
         assert!(asset_catalog_links(&db,2).unwrap().unwrap().category_ids.is_empty());
         assert!(asset_catalog_links(&db,99).unwrap().is_none());
+    }
+
+    #[test]
+    fn ai_view_preserves_order_applies_filters_and_skips_unknown_ids() {
+        let db=test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,rating,tagged) VALUES
+            (1,'plain.jpg','jpg','jpg',1,10,4,0),(2,'z-last.jpg','jpg','jpg',1,20,4,1),
+            (3,'offline-row.jpg','jpg','jpg',0,30,5,1),(4,'a-first.png','png','png',1,40,3,1);").unwrap();
+        let formats=FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let filter=AssetFilter { kind:"ai".into(),id:None,root_id:None,include_children:false,folder_path:None,ids:Some(vec![4,2,404,3,1,2]),value:None,query:None,sort:"name".into(),descending:true,offset:0,limit:500,rating_mode:Some("atLeast".into()),rating_value:Some(3),label_filter:None,tagged_only:true,file_group:Some("images".into()),include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false };
+        let page=assets_page(&db,&filter,&formats).unwrap();
+        assert_eq!(page.items.iter().map(|asset|asset.id).collect::<Vec<_>>(),vec![4,2]);
+        assert_eq!(page.total,2);assert_eq!(page.total_size,60.0);
+        let mut second=filter.clone();second.offset=1;second.limit=1;
+        let page=assets_page(&db,&second,&formats).unwrap();
+        assert_eq!(page.items.iter().map(|asset|asset.id).collect::<Vec<_>>(),vec![2]);
+        assert_eq!(page.total,2);assert_eq!(page.total_size,60.0);
     }
 }
 

@@ -3,6 +3,8 @@ use std::{collections::HashMap, env, ffi::OsString, path::{Path, PathBuf}};
 
 const DEV_EXIFTOOL: &str = r"G:\Programovanie\photosort\tools\exiftool\exiftool.exe";
 const DEV_CACHE: &str = r"G:\ddreams-work\thumb-cache";
+const DEV_AI_PYTHON: &str = r"G:\Programovanie\photosort\.venv\Scripts\python.exe";
+const DEV_AI_MODEL: &str = r"G:\DDreams\modules\ai\model";
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -15,6 +17,11 @@ pub struct Paths {
     pub formats: Option<PathBuf>,
     pub metadata_view: Option<PathBuf>,
     pub settings: PathBuf,
+    pub ai_script: PathBuf,
+    pub ai_model: PathBuf,
+    pub ai_python: Option<PathBuf>,
+    pub ai_db: PathBuf,
+    pub ai_log: PathBuf,
     pub readonly: bool,
 }
 
@@ -64,8 +71,14 @@ impl Paths {
             candidate.is_file().then_some(candidate)
         });
         let settings = root.join("settings.json");
+        let ai_dir = if portable { root.join("modules").join("ai") } else { cwd_repo(&catalog, cwd).join("ai") };
+        let ai_script = ai_dir.join("ddreams_ai.py");
+        let ai_model = if portable { ai_dir.join("model") } else { PathBuf::from(DEV_AI_MODEL) };
+        let ai_python = if portable { read_ai_python(&ai_dir.join("ai.json")) } else { Some(PathBuf::from(DEV_AI_PYTHON)) };
+        let ai_db = catalog.parent().unwrap_or(cwd).join("ai.sqlite");
+        let ai_log = catalog.parent().unwrap_or(cwd).join("ai.log");
         let readonly = vars.get(&OsString::from("DDREAMS_READONLY")).is_some_and(|value| value == "1");
-        Self { root, portable, catalog, backups, cache, exiftool, formats, metadata_view, settings, readonly }
+        Self { root, portable, catalog, backups, cache, exiftool, formats, metadata_view, settings, ai_script, ai_model, ai_python, ai_db, ai_log, readonly }
     }
 
     pub fn ensure_runtime_dirs(&self) -> std::io::Result<()> {
@@ -84,6 +97,15 @@ impl Paths {
             portable: self.portable, readonly: self.readonly,
         }
     }
+}
+
+fn cwd_repo(catalog: &Path, cwd: &Path) -> PathBuf {
+    catalog.parent().and_then(Path::parent).unwrap_or(cwd).to_path_buf()
+}
+
+fn read_ai_python(path: &Path) -> Option<PathBuf> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+    value.get("python")?.as_str().filter(|value| !value.trim().is_empty()).map(PathBuf::from)
 }
 
 fn display_optional(path: &Option<PathBuf>) -> String {
@@ -142,6 +164,27 @@ mod tests {
         assert_eq!(paths.catalog, root.join(".local/catalog.sqlite"));
         assert_eq!(paths.cache, PathBuf::from(DEV_CACHE));
         assert_eq!(paths.exiftool, PathBuf::from(DEV_EXIFTOOL));
+        assert_eq!(paths.ai_script, root.join("ai/ddreams_ai.py"));
+        assert_eq!(paths.ai_model, PathBuf::from(DEV_AI_MODEL));
+        assert_eq!(paths.ai_python, Some(PathBuf::from(DEV_AI_PYTHON)));
+        assert_eq!(paths.ai_db, root.join(".local/ai.sqlite"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn portable_ai_paths_read_python_from_module_config() {
+        let root = temp_root();
+        let catalog = root.join("catalog/catalog.sqlite");
+        let ai_dir = root.join("modules/ai");
+        std::fs::create_dir_all(catalog.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(&ai_dir).unwrap();
+        std::fs::write(&catalog, []).unwrap();
+        std::fs::write(ai_dir.join("ai.json"), br#"{"python":"C:\\python.exe"}"#).unwrap();
+        let paths = Paths::resolve_with(&root.join("ddreams.exe"), &root, &HashMap::new());
+        assert_eq!(paths.ai_script, ai_dir.join("ddreams_ai.py"));
+        assert_eq!(paths.ai_model, ai_dir.join("model"));
+        assert_eq!(paths.ai_python, Some(PathBuf::from(r"C:\python.exe")));
+        assert_eq!(paths.ai_db, root.join("catalog/ai.sqlite"));
         let _ = std::fs::remove_dir_all(root);
     }
 

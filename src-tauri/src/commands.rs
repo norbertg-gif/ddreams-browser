@@ -1,4 +1,5 @@
 use crate::{
+    ai::{AiState, AiStatus},
     calendar::{CalendarAggregate, CalendarService, DateSource},
     db::{self, AssetFilter, AssetMetadata, Db},
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
@@ -29,6 +30,23 @@ pub struct CalendarState(pub Arc<CalendarService>);
 pub struct CatalogWriterState(pub Arc<CatalogWriter>);
 pub struct FileManagerState(pub Arc<FileManager>);
 pub struct AppInfoState(pub AppInfo);
+
+#[tauri::command]
+pub fn ai_status(state: State<'_, AiState>) -> AiStatus { state.0.status() }
+#[tauri::command]
+pub fn ai_start(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.start() }
+#[tauri::command]
+pub fn ai_stop(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.stop() }
+#[tauri::command]
+pub fn ai_pause(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.pause() }
+#[tauri::command]
+pub fn ai_resume(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.resume() }
+#[tauri::command]
+pub fn ai_reindex(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.reindex() }
+#[tauri::command]
+pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u32>) -> Result<Vec<i64>, String> { state.0.search_text(query, limit) }
+#[tauri::command]
+pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<Vec<i64>, String> { state.0.similar(asset_id, limit) }
 
 #[tauri::command]
 pub fn get_app_info(state: State<'_, AppInfoState>) -> AppInfo { state.0.clone() }

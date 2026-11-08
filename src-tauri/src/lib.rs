@@ -1,3 +1,4 @@
+mod ai;
 mod commands;
 mod backup;
 mod calendar;
@@ -45,10 +46,14 @@ pub fn run() {
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone());
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
     let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
+    let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone());
+    let setup_ai = ai_service.clone();
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
+    let shutdown_ai = ai_service.clone();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(move |app| { setup_ai.set_app(app.handle().clone()); Ok(()) })
         .manage(DatabaseState(db))
         .manage(ExifState(exif))
         .manage(ListingState(listing))
@@ -59,6 +64,7 @@ pub fn run() {
         .manage(CalendarState(calendar))
         .manage(CatalogWriterState(writer))
         .manage(FileManagerState(file_manager))
+        .manage(ai::AiState(ai_service))
         .manage(AppInfoState(info))
         .register_asynchronous_uri_scheme_protocol("thumb", move |_ctx, request, responder| {
             let service = protocol_thumbs.clone();
@@ -115,6 +121,14 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
+            commands::ai_status,
+            commands::ai_start,
+            commands::ai_stop,
+            commands::ai_pause,
+            commands::ai_resume,
+            commands::ai_reindex,
+            commands::ai_search_text,
+            commands::ai_similar,
             commands::get_recent_changes,
             commands::undo_last_change,
             commands::get_file_operation_conflicts,
@@ -167,6 +181,7 @@ pub fn run() {
         .run(move |_app_handle, event| {
             if matches!(event, tauri::RunEvent::Exit) {
                 shutdown_exif.shutdown();
+                let _ = shutdown_ai.stop();
             }
         });
 }

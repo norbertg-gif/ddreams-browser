@@ -20,6 +20,7 @@ $BackupDir = Join-Path $InstallRoot 'backups'
 $CacheDir = Join-Path $InstallRoot 'cache'
 $ModulesDir = Join-Path $InstallRoot 'modules'
 $InstallExifToolDir = Join-Path $ModulesDir 'exiftool'
+$InstallAiDir = Join-Path $ModulesDir 'ai'
 $InstallExifTool = Join-Path $InstallExifToolDir 'exiftool.exe'
 $SourceExifTool = Join-Path $ExifToolSource 'exiftool.exe'
 if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) { throw "ExifTool source not found: $SourceExifTool" }
@@ -38,6 +39,7 @@ if ($runningInstall) { throw 'Close G:\DDreams\ddreams-browser.exe before publis
 foreach ($directory in @($InstallRoot, $CatalogDir, $BackupDir, $CacheDir, $ModulesDir)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
 }
+New-Item -ItemType Directory -Path $InstallAiDir -Force | Out-Null
 Copy-Item -LiteralPath $ReleaseExe -Destination $InstallExe -Force
 Write-Output "Copied app: $InstallExe"
 
@@ -46,6 +48,17 @@ if (-not (Test-Path -LiteralPath $InstallCatalog -PathType Leaf)) {
     Write-Output "Installed catalog: $InstallCatalog"
 } else {
     Write-Output "Preserved existing catalog: $InstallCatalog"
+}
+
+$SourceAiScript = Join-Path $RepoRoot 'ai\ddreams_ai.py'
+if (-not (Test-Path -LiteralPath $SourceAiScript -PathType Leaf)) { throw "AI server script not found: $SourceAiScript" }
+$InstallAiScript = Join-Path $InstallAiDir 'ddreams_ai.py'
+Copy-Item -LiteralPath $SourceAiScript -Destination $InstallAiScript -Force
+Write-Output "Copied AI server: $InstallAiScript"
+$AiConfig = Join-Path $InstallAiDir 'ai.json'
+if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf)) {
+    [IO.File]::WriteAllText($AiConfig, '{"python": "G:\\Programovanie\\photosort\\.venv\\Scripts\\python.exe"}', [Text.UTF8Encoding]::new($false))
+    Write-Output "Created AI config: $AiConfig"
 }
 
 $SourceSupport = Join-Path $ExifToolSource 'exiftool_files'
