@@ -55,6 +55,7 @@ struct AiInner {
     label_generation: AtomicU64,
     last_stderr: Mutex<String>,
     stderr_reader: Mutex<Option<thread::JoinHandle<()>>>,
+    similarity_order_cache: Mutex<HashMap<u64, Vec<i64>>>,
 }
 
 #[derive(Clone)]
@@ -75,6 +76,7 @@ impl AiService {
             colors_attached: AtomicBool::new(false),
             color_learn_generation: AtomicU64::new(0),
             label_generation: AtomicU64::new(0),
+            similarity_order_cache: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -222,6 +224,24 @@ impl AiService {
         if asset_id <= 0 { return Err("Fotka ešte nie je zaindexovaná".into()); }
         let result = self.request("similar", json!({ "asset_id": asset_id, "limit": limit.unwrap_or(200).clamp(1, 1000) }), Duration::from_secs(60))?;
         result_page(result)
+    }
+
+    pub fn duplicate_groups(&self, level:&str)->Result<Value,String>{
+        // Burst neighbours reach cosine 0.999, so pixels alone can't tell a copy from the next frame.
+        // "same" = visually close (≥ 0.95) AND the same base name AND capture times not contradicting.
+        let threshold=match level{"same"=>0.95,"similar"=>0.93,_=>return Err("Neplatná úroveň podobnosti".into())};
+        let result=self.request("duplicate_groups",json!({"threshold":threshold}),Duration::from_secs(300))?;
+        let conn=self.0.db.lock().map_err(|e|e.to_string())?;let rows=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();let mut stmt=conn.prepare("SELECT id,name,exif_date,size FROM assets WHERE is_listed=1").map_err(|e|e.to_string())?;let meta=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,(r.get::<_,String>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<f64>>(3)?)))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<std::collections::HashMap<_,_>>>().map_err(|e|e.to_string())?;let listed=meta.keys().copied().collect::<std::collections::HashSet<_>>();let accepted=filter_duplicate_groups(&rows,&listed);let mut groups=Vec::new();
+        for (index,ids) in accepted{let row=&rows[index];if level=="same"{for part in split_same_groups(&ids,&meta){groups.push(json!({"assetIds":part,"minSim":row.get("min_sim"),"maxSim":row.get("max_sim")}));}}else{groups.push(json!({"assetIds":ids,"minSim":row.get("min_sim"),"maxSim":row.get("max_sim")}));}}
+        groups.sort_by_key(|g|std::cmp::Reverse(g["assetIds"].as_array().map(|a|a.len()).unwrap_or(0)));
+        Ok(json!({"groups":groups}))
+    }
+
+    pub fn order_by_similarity(&self,asset_ids:Vec<i64>)->Result<Vec<i64>,String>{
+        use std::hash::{Hash,Hasher};let mut hasher=std::collections::hash_map::DefaultHasher::new();asset_ids.hash(&mut hasher);let key=hasher.finish();
+        if let Some(ids)=self.0.similarity_order_cache.lock().map_err(|e|e.to_string())?.get(&key).cloned(){return Ok(ids)}
+        let result=self.request("order_by_similarity",json!({"asset_ids":asset_ids}),Duration::from_secs(300))?;let ids=result.get("asset_ids").and_then(Value::as_array).ok_or("AI vrátilo neplatné poradie")?.iter().filter_map(Value::as_i64).collect::<Vec<_>>();
+        let mut cache=self.0.similarity_order_cache.lock().map_err(|e|e.to_string())?;if cache.len()>128{cache.clear()}cache.insert(key,ids.clone());Ok(ids)
     }
 
     pub fn suggest(&self, asset_ids: Vec<i64>, kind: &str) -> Result<Value, String> {
@@ -390,6 +410,31 @@ fn valid_label_kind(kind:&str)->Result<&str,String>{match kind{"category"=>Ok("c
 fn filter_unrejected_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{candidates.iter().copied().filter(|id|!rejected.contains(id)).collect()}
 fn filter_suggest_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected)}
 fn filter_group_assets(candidates:&[i64],listed:&std::collections::HashSet<i64>,rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected).into_iter().filter(|id|listed.contains(id)).collect()}
+/// Splits a visually similar group into "same photo" parts. Two photos are the same when they share
+/// the base name (copies, RAW+JPG pair, `tag`/`-1`/` (2)` variants) and their EXIF capture times don't
+/// differ. File size is no evidence: uncompressed Sony RAW files of a burst have identical sizes.
+/// A reused camera counter has a different time.
+type SameMeta=(String,Option<String>,Option<f64>);
+fn split_same_groups(ids:&[i64],meta:&std::collections::HashMap<i64,SameMeta>)->Vec<Vec<i64>>{
+    let items=ids.iter().filter_map(|id|meta.get(id).map(|m|(*id,base_name(&m.0),m.1.as_deref().map(str::trim).filter(|d|!d.is_empty()).map(str::to_string),m.2))).collect::<Vec<_>>();
+    let mut parent=(0..items.len()).collect::<Vec<_>>();
+    fn root(p:&mut Vec<usize>,mut i:usize)->usize{while p[i]!=i{p[i]=p[p[i]];i=p[i]}i}
+    for a in 0..items.len(){for b in a+1..items.len(){let (x,y)=(&items[a],&items[b]);
+        let times_ok=match (&x.2,&y.2){(Some(t),Some(u))=>t==u,_=>true};
+        if times_ok&&x.1==y.1{let (ra,rb)=(root(&mut parent,a),root(&mut parent,b));if ra!=rb{parent[rb]=ra}}}}
+    let mut parts:Vec<(usize,Vec<i64>)>=Vec::new();
+    for i in 0..items.len(){let r=root(&mut parent,i);match parts.iter_mut().find(|(k,_)|*k==r){Some((_,v))=>v.push(items[i].0),None=>parts.push((r,vec![items[i].0]))}}
+    parts.into_iter().map(|(_,v)|v).filter(|v|v.len()>1).collect()
+}
+fn base_name(name:&str)->String{
+    let mut stem=name.rsplit_once('.').map(|(s,_)|s).unwrap_or(name).trim().to_lowercase();
+    if let Some(open)=stem.rfind(" (") {if stem.ends_with(')')&&stem[open+2..stem.len()-1].chars().all(|c|c.is_ascii_digit()){stem.truncate(open)}}
+    if let Some(dash)=stem.rfind('-') {if dash+1<stem.len()&&stem[dash+1..].chars().all(|c|c.is_ascii_digit()){stem.truncate(dash)}}
+    for suffix in ["tag","_edit","-edit"]{if let Some(s)=stem.strip_suffix(suffix){stem=s.to_string();}}
+    stem
+}
+
+fn filter_duplicate_groups(rows:&[Value],listed:&std::collections::HashSet<i64>)->Vec<(usize,Vec<i64>)>{rows.iter().enumerate().filter_map(|(index,row)|{let ids=row.get("asset_ids").and_then(Value::as_array)?.iter().filter_map(Value::as_i64).filter(|id|listed.contains(id)).collect::<Vec<_>>();(ids.len()>1).then_some((index,ids))}).collect()}
 fn build_label_payload(kind:&str,pairs:&[(i64,i64)],parents:&[(i64,Option<i64>)],listed:&std::collections::HashSet<i64>)->Value{json!({"kind":kind,"pairs":pairs.iter().filter(|(asset_id,_)|listed.contains(asset_id)).collect::<Vec<_>>(),"parents":parents.iter().map(|(id,parent)|(id.to_string(),parent)).collect::<HashMap<_,_>>()})}
 fn label_path(conn:&rusqlite::Connection,kind:&str,id:i64)->Result<String,String>{
     let (table,parent_col)=if kind=="category" {("categories","parent_id")} else {("keywords","parent_id")};
@@ -420,6 +465,26 @@ mod suggestion_tests {
     fn group_rejections_and_unlisted_assets_are_filtered(){
         let candidates=[1,2,3];let listed=std::collections::HashSet::from([1,2]);let rejected=std::collections::HashSet::from([2]);
         assert_eq!(filter_group_assets(&candidates,&listed,&rejected),vec![1]);
+    }
+
+    #[test]
+    fn same_groups_split_by_capture_time_or_base_name(){
+        let m=|n:&str,t:Option<&str>,s:f64|(n.to_string(),t.map(str::to_string),Some(s));
+        let meta=std::collections::HashMap::from([
+            (1,m("NG_1.ARW",Some("2022-07-01T10:00:00"),24.0)),(2,m("NG_1.JPG",Some("2022-07-01T10:00:00"),8.0)),
+            (3,m("NG_2.ARW",Some("2022-07-01T10:00:00"),25.0)),
+            (4,m("scan.tif",None,5.0)),(5,m("scan-1.tif",None,6.0)),(6,m("scan (2).jpg",None,7.0)),
+            (7,m("NG_09734tag.ARW",None,9.0)),(8,m("NG_09734.jpg",None,3.0)),(9,m("other.jpg",None,11.0)),
+            (10,m("NG_7.ARW",Some("2022-07-01T10:00:05"),24.0)),(11,m("NG_8.ARW",Some("2022-07-01T10:00:05"),24.0)),
+            (12,m("NG_5.ARW",Some("2019-01-01T00:00:00"),30.0)),(13,m("NG_5.ARW",Some("2023-01-01T00:00:00"),30.0))]);
+        assert_eq!(split_same_groups(&[1,2,3,4,5,6,7,8,9,10,11,12,13],&meta),vec![vec![1,2],vec![4,5,6],vec![7,8]]);
+    }
+
+    #[test]
+    fn duplicate_groups_drop_unlisted_members_and_singletons(){
+        let rows=vec![json!({"asset_ids":[1,2,3],"min_sim":0.95}),json!({"asset_ids":[4,5]})];let listed=std::collections::HashSet::from([1,3,4]);
+        let groups=filter_duplicate_groups(&rows,&listed);
+        assert_eq!(groups,vec![(0,vec![1,3])]);
     }
 
     #[test]

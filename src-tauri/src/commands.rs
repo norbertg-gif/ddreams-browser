@@ -49,6 +49,8 @@ pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u3
 #[tauri::command]
 pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.similar(asset_id, limit) }
 #[tauri::command]
+pub fn ai_duplicate_groups(state:State<'_,AiState>,level:String)->Result<Value,String>{state.0.duplicate_groups(&level)}
+#[tauri::command]
 pub fn ai_suggest(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String)->Result<Value,String>{state.0.suggest(asset_ids,&kind)}
 #[tauri::command]
 pub fn ai_reject_suggestion(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String,label_id:i64)->Result<usize,String>{state.0.reject_suggestion(&asset_ids,&kind,label_id)}
@@ -258,8 +260,15 @@ pub fn get_assets(
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
     formats: State<'_, FormatsState>,
+    ai: State<'_, AiState>,
     filter: AssetFilter,
 ) -> Result<db::AssetPage, String> {
+    if filter.sort == "similarity" {
+        let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
+        let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
+        loop {base.offset=offset;let page=if filter.kind=="folder"{listing.0.page(&base)?}else{db::assets_page(&state.0,&base,&formats.0).map_err(|e|e.to_string())?};total=page.total;total_size=page.total_size;let count=page.items.len();all.extend(page.items);offset+=count as i64;if count<500||offset>=total{break}}
+        let order=if ai.0.status().available{Some(ai.0.order_by_similarity(all.iter().filter(|a|!a.is_directory).map(|a|a.id).collect())?)}else{None};let all=apply_similarity_order(all,order.as_deref());let items=all.into_iter().skip(filter.offset.max(0) as usize).take(filter.limit.clamp(1,500) as usize).collect();return Ok(db::AssetPage{items,total,total_size});
+    }
     if filter.kind == "folder" { return listing.0.page(&filter); }
     db::assets_page(&state.0, &filter, &formats.0).map_err(|e| e.to_string())
 }
@@ -417,6 +426,20 @@ fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
     add("Bits per pixel", a.bpp.map(|v| v.to_string()));
     add("File modified", a.file_modified.clone());
     tags
+}
+
+fn apply_similarity_order(mut assets:Vec<db::Asset>,order:Option<&[i64]>)->Vec<db::Asset>{
+    let mut dirs=assets.iter().filter(|a|a.is_directory).cloned().collect::<Vec<_>>();let mut files=assets.drain(..).filter(|a|!a.is_directory).collect::<Vec<_>>();dirs.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    if let Some(order)=order{let positions=order.iter().enumerate().map(|(i,id)|(*id,i)).collect::<std::collections::HashMap<_,_>>();files.sort_by_key(|a|positions.get(&a.id).copied().unwrap_or(usize::MAX));}else{files.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));}
+    dirs.extend(files);dirs
+}
+
+#[cfg(test)]
+mod similarity_order_tests{
+    use super::*;
+    fn asset(id:i64,name:&str)->db::Asset{db::Asset{id,folder_id:None,name:name.into(),ext:"jpg".into(),size:None,width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,has_categories:false,display_categories:None,display_keywords:None}}
+    #[test]fn similarity_order_pages_from_cached_ids(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ordered=apply_similarity_order(all,Some(&[3,1,2]));let ids=ordered.into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(&ids[0..2],&[3,1]);assert_eq!(&ids[2..3],&[2]);}
+    #[test]fn unavailable_ai_falls_back_to_name_order(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ids=apply_similarity_order(all,None).into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(ids,vec![2,3,1]);}
 }
 fn live_rows(json: Value, view: &MetadataView, data: Option<&AssetMetadata>) -> Vec<MetadataRow> {
     let Some(obj) = json.as_object() else { return Vec::new(); };

@@ -29,6 +29,8 @@ SIMILARITY_COSINE_FLOOR = 0.60
 SUGGEST_K = 10
 MIN_SCORE = 0.30
 AUTO_GROUP_SCORE = 0.70
+DUP_SAME = 0.95  # candidate level; the app keeps only same capture time / base name
+DUP_SIMILAR = 0.93
 SUGGEST_BATCH_CHUNK = 128
 BATCH_SIZE = 32
 DECODE_THREADS = 6
@@ -848,6 +850,121 @@ class AIService:
         rows.sort(key=lambda row: (-row["count"], row["label_id"]))
         return {"groups": rows}
 
+    def _similarity_scores(self, index: tuple[list[int], Any, dict[int, int]], rows: list[int], cols: list[int]) -> np.ndarray:
+        ids, matrix, positions = index
+        if isinstance(matrix, dict):
+            return np.stack([matrix[ids[a]] for a in rows]) @ np.stack([matrix[ids[b]] for b in cols]).T
+        torch = self._embedder.torch
+        ri = torch.as_tensor(rows, device=matrix.device)
+        ci = torch.as_tensor(cols, device=matrix.device)
+        with torch.inference_mode():
+            return (matrix[ri] @ matrix[ci].T).float().cpu().numpy()
+
+    def _duplicate_groups(self, request: dict[str, Any]) -> dict[str, Any]:
+        threshold = request.get("threshold")
+        if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not -1 <= threshold <= 1:
+            raise RequestError("threshold musí byť číslo od -1 do 1")
+        requested = request.get("asset_ids")
+        if requested is not None and (not isinstance(requested, list) or any(isinstance(a, bool) or not isinstance(a, int) for a in requested)):
+            raise RequestError("asset_ids musí byť zoznam ID")
+        index = self._index_snapshot()
+        ids, matrix, positions = index
+        selected = list(dict.fromkeys(requested if requested is not None else ids))
+        selected = [aid for aid in selected if aid in positions]
+        positions_in_matrix = [positions[aid] for aid in selected]
+        neighbors: list[list[tuple[int, float]]] = [[] for _ in selected]
+        block_size = 2048
+        # Only pairs above the threshold leave the GPU; a per-element Python loop over the
+        # full score rows took ~9 s for 8k photos and would grow quadratically.
+        if isinstance(matrix, dict):
+            sub = np.stack([matrix[a] for a in selected]).astype(np.float32) if selected else np.empty((0, DIMENSION), dtype=np.float32)
+            for start in range(0, len(selected), block_size):
+                score = sub[start:start + block_size] @ sub.T
+                rows, cols = np.nonzero(score >= threshold)
+                for r, c in zip(rows.tolist(), cols.tolist()):
+                    if start + r != c: neighbors[start + r].append((c, float(score[r, c])))
+        elif selected:
+            torch = self._embedder.torch
+            with torch.inference_mode():
+                sub = matrix[torch.as_tensor(positions_in_matrix, device=matrix.device)]
+                for start in range(0, len(selected), block_size):
+                    score = sub[start:start + block_size] @ sub.T
+                    hits = (score >= threshold).nonzero()
+                    values = score[hits[:, 0], hits[:, 1]].float().cpu().tolist()
+                    for (r, c), value in zip(hits.cpu().tolist(), values):
+                        if start + r != c: neighbors[start + r].append((c, value))
+        order = sorted(range(len(selected)), key=lambda i: (-len(neighbors[i]), selected[i]))
+        assigned: set[int] = set()
+        groups = []
+        for seed in order:
+            if seed in assigned: continue
+            members = [(other, sim) for other, sim in neighbors[seed] if other not in assigned]
+            if not members: continue
+            assigned.add(seed)
+            assigned.update(other for other, _ in members)
+            sims = [sim for _, sim in members]
+            groups.append({"asset_ids": [selected[seed], *(selected[other] for other, _ in members)], "min_sim": min(sims), "max_sim": max(sims)})
+        groups.sort(key=lambda g: (-len(g["asset_ids"]), -g["max_sim"], g["asset_ids"][0]))
+        return {"groups": groups}
+
+    def _order_by_similarity(self, request: dict[str, Any]) -> dict[str, Any]:
+        asset_ids = request.get("asset_ids")
+        if not isinstance(asset_ids, list) or any(isinstance(a, bool) or not isinstance(a, int) for a in asset_ids):
+            raise RequestError("asset_ids musí byť zoznam ID")
+        index = self._index_snapshot()
+        ids, matrix, positions = index
+        requested = list(dict.fromkeys(asset_ids))
+        indexed = [aid for aid in requested if aid in positions]
+        unindexed = [aid for aid in requested if aid not in positions]
+        if len(indexed) <= 3000:
+            clusters = [indexed]
+        else:
+            # Deterministic coarse buckets keep the exact nearest-neighbour work bounded.
+            centers = indexed[::max(1, len(indexed) // 64)][:64]
+            center_pos = [positions[a] for a in centers]
+            if isinstance(matrix, dict):
+                center_matrix = np.stack([matrix[a] for a in centers])
+                bucket = np.argmax(np.stack([matrix[a] for a in indexed]) @ center_matrix.T, axis=1)
+            else:
+                torch = self._embedder.torch
+                q = torch.as_tensor([positions[a] for a in indexed], device=matrix.device)
+                c = torch.as_tensor(center_pos, device=matrix.device)
+                with torch.inference_mode(): bucket = torch.argmax(matrix[q] @ matrix[c].T, dim=1).cpu().tolist()
+            clusters = [[aid for aid, group in zip(indexed, bucket) if group == i] for i in range(len(centers))]
+            clusters = [cluster for cluster in clusters if cluster]
+        def chain(values: list[int]) -> list[int]:
+            if len(values) < 3: return values[:]
+            if isinstance(matrix, dict):
+                similarities = np.stack([matrix[a] for a in values]) @ np.stack([matrix[a] for a in values]).T
+            else:
+                torch = self._embedder.torch
+                positions_tensor = torch.as_tensor([positions[a] for a in values], device=matrix.device)
+                with torch.inference_mode(): similarities = (matrix[positions_tensor] @ matrix[positions_tensor].T).float().cpu().numpy()
+            remaining = set(range(1, len(values))); result = [0]
+            while remaining:
+                current = result[-1]
+                candidates = sorted(remaining)
+                nxt = candidates[int(np.argmax(similarities[current, candidates]))]
+                result.append(nxt); remaining.remove(nxt)
+            return [values[i] for i in result]
+        ordered_clusters = [chain(cluster) for cluster in clusters]
+        if len(ordered_clusters) > 1:
+            endpoints = [group[0] for group in ordered_clusters]
+            if isinstance(matrix, dict):
+                cluster_scores = np.stack([matrix[a] for a in endpoints]) @ np.stack([matrix[a] for a in endpoints]).T
+            else:
+                torch = self._embedder.torch
+                endpoint_pos = torch.as_tensor([positions[a] for a in endpoints], device=matrix.device)
+                with torch.inference_mode(): cluster_scores = (matrix[endpoint_pos] @ matrix[endpoint_pos].T).float().cpu().numpy()
+            remaining_clusters = list(range(1, len(ordered_clusters)))
+            cluster_order = [0]
+            while remaining_clusters:
+                current = cluster_order[-1]
+                chosen = int(np.argmax(cluster_scores[current, remaining_clusters]))
+                cluster_order.append(remaining_clusters.pop(chosen))
+            ordered_clusters = [ordered_clusters[i] for i in cluster_order]
+        return {"asset_ids": [aid for group in ordered_clusters for aid in group] + unindexed}
+
     def _collect_batch_groups(self, targets: list[int], candidates: list[int], scores: np.ndarray,
                               labels: dict[int, set[int]], parents: dict[int, int | None], minimum: float,
                               groups: dict[int, list[tuple[int, float]]]) -> None:
@@ -882,6 +999,10 @@ class AIService:
             return self._suggest(request)
         if cmd == "suggest_batch":
             return self._suggest_batch(request)
+        if cmd == "duplicate_groups":
+            return self._duplicate_groups(request)
+        if cmd == "order_by_similarity":
+            return self._order_by_similarity(request)
         if cmd == "pause":
             with self._condition:
                 self._paused = True
@@ -946,7 +1067,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "order_by_similarity"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

@@ -133,6 +133,7 @@ pub fn run() {
             commands::ai_reindex,
             commands::ai_search_text,
             commands::ai_similar,
+            commands::ai_duplicate_groups,
             commands::ai_suggest,
             commands::ai_reject_suggestion,
             commands::ai_suggestion_groups,

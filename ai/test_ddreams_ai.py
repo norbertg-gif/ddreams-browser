@@ -268,6 +268,31 @@ class ServerTests(unittest.TestCase):
         with self.assertRaisesRegex(RequestError, "kind"):
             self.service.execute({"cmd": "suggest", "kind": "unknown", "asset_ids": [ids[0]]})
 
+    def test_duplicate_groups_respect_threshold_without_chaining(self):
+        # Seed 101 has two direct neighbours; 103 is close only to 102.
+        vectors = np.zeros((4, DIMENSION), dtype=np.float32)
+        vectors[0, :2] = [1, 0]
+        vectors[1, :2] = [.9, .4358899]
+        vectors[2, :2] = [.65, .75]
+        vectors[3, :2] = [.9, -.4358899]
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+        self.service._embedder.replace_index([101, 102, 103, 104], vectors)
+        groups = self.service.execute({"cmd": "duplicate_groups", "threshold": .85})["groups"]
+        self.assertEqual(groups[0]["asset_ids"], [101, 102, 104])
+        self.assertTrue(all(len(group["asset_ids"]) >= 2 for group in groups))
+        self.assertTrue(all(group["min_sim"] >= .85 for group in groups))
+
+    def test_order_by_similarity_neighbours_and_unindexed_last(self):
+        vectors = np.zeros((3, DIMENSION), dtype=np.float32)
+        vectors[0, 0] = 1
+        vectors[1, :2] = [.99, .141067]
+        vectors[2, 1] = 1
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+        self.service._embedder.replace_index([201, 202, 203], vectors)
+        result = self.service.execute({"cmd": "order_by_similarity", "asset_ids": [201, 999, 203, 202]})["asset_ids"]
+        self.assertEqual(result[-1], 999)
+        self.assertLessEqual(abs(result.index(201) - result.index(202)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
