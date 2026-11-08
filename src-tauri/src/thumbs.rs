@@ -2,7 +2,7 @@ use crate::{db::Db, exiftool::ExifTool, formats::FormatTable, listing::ListingSe
 use image::{DynamicImage, ImageDecoder, ImageReader, codecs::jpeg::JpegEncoder, metadata::Orientation};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use std::{io::{Cursor, BufReader}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicU64, AtomicUsize, Ordering}}};
+use std::{io::{Cursor, BufReader}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering}}};
 use tokio::sync::Semaphore;
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -149,13 +149,15 @@ fn shell_image(path: &Path, requested: u32) -> Result<DynamicImage, String> {
     converted
 }
 
-pub struct ThumbService { pub db: Db, pub listing: Arc<ListingService>, pub formats: Arc<FormatTable>, chain: PreviewChain, pub cache: PathBuf, pub epoch: AtomicU64, pub workers: Arc<Semaphore> }
+pub struct ThumbService { pub db: Db, pub listing: Arc<ListingService>, pub formats: Arc<FormatTable>, chain: PreviewChain, pub cache: PathBuf, pub epoch: AtomicU64, pub workers: Arc<Semaphore>, writes: [AtomicUsize; 2], evicting: [Arc<AtomicBool>; 2] }
 #[derive(Clone, Debug)]
 pub struct RenderedPreview { pub bytes: Vec<u8>, pub source: String }
 impl ThumbService {
     pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>, cache: PathBuf) -> Arc<Self> {
         let chain=PreviewChain::new(exif.clone());
-        Arc::new(Self{db,listing,formats,chain,cache,epoch:AtomicU64::new(0),workers:Arc::new(Semaphore::new(4))})
+        let service=Arc::new(Self{db,listing,formats,chain,cache:cache.clone(),epoch:AtomicU64::new(0),workers:Arc::new(Semaphore::new(4)),writes:[AtomicUsize::new(0),AtomicUsize::new(0)],evicting:[Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false))]});
+        std::thread::spawn(move || { let _=std::fs::create_dir_all(cache.join("thumbs")); let _=std::fs::create_dir_all(cache.join("viewer")); let _=cleanup_legacy_cache(&cache); let _=evict_cache(&cache.join("thumbs"),THUMBS_LIMIT); let _=evict_cache(&cache.join("viewer"),VIEWER_LIMIT); });
+        service
     }
     pub fn set_epoch(&self, epoch:u64){self.epoch.fetch_max(epoch,Ordering::Relaxed);}
     fn asset_path(&self,id:i64)->Result<(String,String),ThumbnailError>{
@@ -172,30 +174,44 @@ impl ThumbService {
         let (path,ext)=self.asset_path(id)?; if path.is_empty(){return Err(ThumbnailError::Unavailable)}
         let file=Path::new(&path);
         let meta=match std::fs::metadata(file){Ok(m)=>m,Err(e) if e.kind()==std::io::ErrorKind::NotFound=>return Err(ThumbnailError::Offline),Err(_)=>return Err(ThumbnailError::Unavailable)};
-        let target=if size==0{2048}else{size.clamp(48,1200)};
+        let target=cache_bucket(size);
         let modified=meta.modified().ok().and_then(|v|v.duration_since(std::time::UNIX_EPOCH).ok()).map(|v|v.as_nanos()).unwrap_or(0);
-        let key=cache_key(&path,target,modified,meta.len());
-        let cache_file=self.cache.join(format!("{key}.jpg"));let miss_file=self.cache.join(format!("{key}.miss"));let source_file=self.cache.join(format!("{key}.source"));
-        if let Ok(bytes)=std::fs::read(&cache_file){if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}let source=std::fs::read_to_string(source_file).unwrap_or_else(|_|"Cache".into());return Ok(RenderedPreview{bytes,source})}
+        let key=cache_key(&path,target,modified,meta.len());let store=if size==0 {1}else{0};let directory=self.cache.join(if store==1{"viewer"}else{"thumbs"});
+        let cache_file=directory.join(format!("{key}.jpg"));let miss_file=directory.join(format!("{key}.miss"));let source_file=directory.join(format!("{key}.source"));
+        if let Ok(bytes)=std::fs::read(&cache_file){if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}touch_if_stale(&cache_file);let source=std::fs::read_to_string(source_file).unwrap_or_else(|_|"Cache".into());return Ok(RenderedPreview{bytes,source})}
         if miss_file.is_file(){return Err(ThumbnailError::Unsupported)}
         let request=PreviewRequest{path:file.to_path_buf(),size:target};
-        let preview=match self.chain.preview(&request,self.formats.group(&ext)){Ok(v)=>v,Err(ThumbnailError::Unsupported)=>{std::fs::create_dir_all(&self.cache).map_err(|_|ThumbnailError::Unavailable)?;let _=std::fs::write(&miss_file,b"");return Err(ThumbnailError::Unsupported)},Err(e)=>return Err(e)};
+        let preview=match self.chain.preview(&request,self.formats.group(&ext)){Ok(v)=>v,Err(ThumbnailError::Unsupported)=>{std::fs::create_dir_all(&directory).map_err(|_|ThumbnailError::Unavailable)?;let _=std::fs::write(&miss_file,b"");return Err(ThumbnailError::Unsupported)},Err(e)=>return Err(e)};
         let image=if preview.image.width()<=target&&preview.image.height()<=target{preview.image}else{preview.image.thumbnail(target,target)};
         let bytes=encode_jpeg(image).map_err(|_|ThumbnailError::Decode)?;
         if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}
-        std::fs::create_dir_all(&self.cache).map_err(|_|ThumbnailError::Unavailable)?;
+        std::fs::create_dir_all(&directory).map_err(|_|ThumbnailError::Unavailable)?;
         static TEMP_ID:AtomicUsize=AtomicUsize::new(0);
         let temp=cache_file.with_extension(format!("{}.{}.tmp",std::process::id(),TEMP_ID.fetch_add(1,Ordering::Relaxed)));
         let _=std::fs::write(&source_file,preview.source);
         std::fs::write(&temp,&bytes).map_err(|_|ThumbnailError::Unavailable)?;
         if let Err(e)=std::fs::rename(&temp,&cache_file){let _=std::fs::remove_file(&temp);if !cache_file.exists(){return Err(if e.kind()==std::io::ErrorKind::PermissionDenied{ThumbnailError::Unavailable}else{ThumbnailError::Unavailable})}}
         let _=std::fs::remove_file(&miss_file);
+        if self.writes[store].fetch_add(1,Ordering::Relaxed)%200==199 { self.schedule_eviction(store,directory); }
         Ok(RenderedPreview{bytes,source:preview.source.into()})
     }
+    fn schedule_eviction(&self,store:usize,directory:PathBuf){let limit=if store==1{VIEWER_LIMIT}else{THUMBS_LIMIT};let flag=self.evicting[store].clone();if flag.compare_exchange(false,true,Ordering::AcqRel,Ordering::Relaxed).is_ok(){std::thread::spawn(move||{let _=evict_cache(&directory,limit);flag.store(false,Ordering::Release);});}}
 }
 
+const THUMBS_LIMIT:u64=1024*1024*1024; const VIEWER_LIMIT:u64=300*1024*1024;
+pub fn cache_bucket(size:u32)->u32{if size==0{2048}else if size<=160{160}else if size<=320{320}else{480}}
+fn touch_if_stale(path:&Path){if let Ok(meta)=std::fs::metadata(path){if meta.modified().ok().and_then(|v|v.elapsed().ok()).map(|age|age>std::time::Duration::from_secs(86400)).unwrap_or(false){let _=std::fs::OpenOptions::new().write(true).open(path).and_then(|f|f.set_modified(std::time::SystemTime::now()));}}}
+pub fn evict_cache(dir:&Path,limit:u64)->std::io::Result<()> {
+    let mut groups=std::collections::HashMap::<String,(u64,std::time::SystemTime)>::new();let now=std::time::SystemTime::now();
+    for entry in std::fs::read_dir(dir)?{let entry=entry?;let path=entry.path();let name=entry.file_name().to_string_lossy().into_owned();let Some((key,ext))=name.rsplit_once('.') else{continue};if ext=="tmp"{if entry.metadata()?.modified().ok().and_then(|t|now.duration_since(t).ok()).map(|age|age>std::time::Duration::from_secs(3600)).unwrap_or(false){let _=std::fs::remove_file(path);}continue}if !matches!(ext,"jpg"|"source"|"miss")||!is_hash(key){continue}let meta=entry.metadata()?;let group=groups.entry(key.into()).or_insert((0,meta.modified().unwrap_or(std::time::UNIX_EPOCH)));if ext=="jpg"{group.0=meta.len();group.1=meta.modified().unwrap_or(std::time::UNIX_EPOCH);}}
+    let mut total:u64=groups.values().map(|v|v.0).sum();if total<=limit{return Ok(())}let target=limit*80/100;let mut ordered:Vec<_>=groups.into_iter().collect();ordered.sort_by_key(|(_,v)|v.1);for (key,(bytes,_)) in ordered{for ext in ["jpg","source","miss"]{let _=std::fs::remove_file(dir.join(format!("{key}.{ext}")));}total=total.saturating_sub(bytes);if total<=target{break}}Ok(())
+}
+pub fn cleanup_legacy_cache(root:&Path)->std::io::Result<()> {for entry in std::fs::read_dir(root)?{let entry=entry?;if !entry.file_type()?.is_file(){continue}let name=entry.file_name().to_string_lossy().into_owned();if legacy_name(&name){let _=std::fs::remove_file(entry.path());}}Ok(())}
+fn is_hash(s:&str)->bool{s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
+fn legacy_name(s:&str)->bool{let Some((stem,tail))=s.split_once('.')else{return false};if !is_hash(stem){return false}if matches!(tail,"jpg"|"source"|"miss"){return true}let parts:Vec<_>=tail.split('.').collect();parts.len()==3&&parts[2]=="tmp"&&!parts[0].is_empty()&&!parts[1].is_empty()&&parts[0].bytes().all(|b|b.is_ascii_digit())&&parts[1].bytes().all(|b|b.is_ascii_digit())}
+
 pub fn cache_key(path:&str,size:u32,modified:u128,length:u64)->String {
-    Sha256::digest(format!("thumb-v4-real-previews|{path}|{size}|{modified}|{length}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect()
+    Sha256::digest(format!("thumb-v5-buckets|{path}|{size}|{modified}|{length}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect()
 }
 #[cfg(test)]
 pub fn miss_marker_exists(path:&Path)->bool { path.is_file() }
@@ -234,5 +250,10 @@ mod tests {
     #[test] fn chain_preserves_order_and_falls_through(){let first=Arc::new(Fake::new("first","image",false));let second=Arc::new(Fake::new("second","image",true));let chain=PreviewChain::with_sources(vec![first.clone(),second.clone()]);let p=chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("image")).unwrap();assert_eq!(p.source,"second");assert_eq!(first.calls.load(Ordering::Relaxed),1);assert_eq!(second.calls.load(Ordering::Relaxed),1);}
     #[test] fn chain_skips_sources_for_other_groups(){let native=Arc::new(Fake::new("native","image",true));let shell=Arc::new(Fake::new("shell","other",true));let chain=PreviewChain::with_sources(vec![native.clone(),shell.clone()]);assert_eq!(chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("other")).unwrap().source,"shell");assert_eq!(native.calls.load(Ordering::Relaxed),0);}
     #[test] fn cache_miss_marker_round_trip(){let path=std::env::temp_dir().join(format!("ddreams-{}.miss",std::process::id()));let _=std::fs::remove_file(&path);assert!(!miss_marker_exists(&path));std::fs::write(&path,b"").unwrap();assert!(miss_marker_exists(&path));let _=std::fs::remove_file(path);}
-    #[test] fn cache_key_is_versioned_and_size_specific(){assert_ne!(cache_key("a.jpg",180,1,2),cache_key("a.jpg",2048,1,2));}
+    #[test] fn cache_key_is_versioned_and_size_specific(){assert_ne!(cache_key("a.jpg",cache_bucket(180),1,2),cache_key("a.jpg",cache_bucket(2048),1,2));}
+    #[test] fn bucket_mapping_is_fixed(){assert_eq!([cache_bucket(0),cache_bucket(48),cache_bucket(160),cache_bucket(161),cache_bucket(320),cache_bucket(321),cache_bucket(1200)],[2048,160,160,320,320,480,480]);}
+    #[test] fn eviction_removes_oldest_groups_to_eighty_percent(){let dir=temp_dir("evict");std::fs::create_dir_all(&dir).unwrap();let keys=["a".repeat(64),"b".repeat(64),"c".repeat(64)];for (key,age) in keys.iter().zip([300,200,100]){std::fs::write(dir.join(format!("{key}.jpg")),vec![0;10]).unwrap();std::fs::write(dir.join(format!("{key}.source")),b"x").unwrap();let time=std::time::SystemTime::now()-std::time::Duration::from_secs(age);std::fs::OpenOptions::new().write(true).open(dir.join(format!("{key}.jpg"))).unwrap().set_modified(time).unwrap();}evict_cache(&dir,25).unwrap();assert!(!dir.join(format!("{}.jpg",keys[0])).exists());assert!(!dir.join(format!("{}.source",keys[0])).exists());assert!(dir.join(format!("{}.jpg",keys[1])).exists());assert!(dir.join(format!("{}.jpg",keys[2])).exists());let _=std::fs::remove_dir_all(dir);}
+    #[test] fn legacy_cleanup_only_removes_known_flat_cache_names(){let dir=temp_dir("legacy");std::fs::create_dir_all(dir.join("tile-exif")).unwrap();std::fs::write(dir.join(format!("{}.jpg","a".repeat(64))),b"").unwrap();std::fs::write(dir.join(format!("{}.12.3.tmp","b".repeat(64))),b"").unwrap();std::fs::write(dir.join("notes.txt"),b"").unwrap();cleanup_legacy_cache(&dir).unwrap();assert!(!dir.join(format!("{}.jpg","a".repeat(64))).exists());assert!(!dir.join(format!("{}.12.3.tmp","b".repeat(64))).exists());assert!(dir.join("notes.txt").exists());assert!(dir.join("tile-exif").is_dir());let _=std::fs::remove_dir_all(dir);}
+    fn temp_dir(label:&str)->PathBuf{std::env::temp_dir().join(format!("ddreams-{label}-{}-{}",std::process::id(),TEMP_TEST_ID.fetch_add(1,Ordering::Relaxed)))}
+    static TEMP_TEST_ID:AtomicUsize=AtomicUsize::new(0);
 }
