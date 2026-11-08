@@ -179,7 +179,7 @@ class SiglipEmbedder:
         os.environ["HF_HUB_OFFLINE"] = "1"
         import torch
         import open_clip
-        from safetensors.torch import load_file
+        from safetensors import safe_open
         from open_clip.tokenizer import HFTokenizer
 
         self.torch = torch
@@ -189,7 +189,12 @@ class SiglipEmbedder:
             image_interpolation="bicubic", image_resize_mode="squash",
         )
         checkpoint = Path(model_dir) / "open_clip_model.fp16.safetensors"
-        self.model.load_state_dict(load_file(str(checkpoint), device="cuda"), strict=False, assign=True)
+        # Tensor by tensor: safetensors' bulk load_file fails with "invalid python storage"
+        # (or crashes) when the system is short on memory, e.g. while other AI tools run.
+        with safe_open(str(checkpoint), framework="pt", device="cuda") as weights:
+            state = {key: weights.get_tensor(key) for key in weights.keys()}
+        self.model.load_state_dict(state, strict=False, assign=True)
+        del state
         self.model.eval()
         self._logit_scale = self.model.logit_scale.detach().float().exp()
         self._logit_bias = self.model.logit_bias.detach().float()
@@ -384,7 +389,11 @@ class AIService:
             self._emit({"event": "status", **ready_status})
             _stderr(f"SigLIP2 pripravený za {self._model_load_s:.3f} s")
         except Exception as exc:
-            self._model_error = f"Model sa nepodarilo načítať: {exc}"
+            text = str(exc)
+            if "1455" in text or "paging file" in text.lower() or "invalid python storage" in text:
+                self._model_error = "Málo voľnej pamäte na načítanie modelu. Zavri náročné programy (napr. iný AI nástroj) a v paneli AI daj Vypnúť a Zapnúť AI."
+            else:
+                self._model_error = f"Model sa nepodarilo načítať: {exc}"
             self._last_error = self._model_error
             self._model_ready.set()
             _stderr(traceback.format_exc())
