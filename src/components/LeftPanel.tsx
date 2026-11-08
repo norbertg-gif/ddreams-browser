@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import type { Folder, View } from "../types";
 import CalendarPane from "./CalendarPane";
+import Splitter from "./Splitter";
+import { readStored, writeStored } from "../storage";
 
 const shortcuts = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
@@ -12,6 +14,10 @@ type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; 
 
 export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder }: Props) {
   const [tab, setTab] = useState<"folders" | "calendar">("folders");
+  const [shortcutsHeight, setShortcutsHeight] = useState<number | null>(() => readStored<number | null>("ddreams.shortcutsHeight", null));
+  const shortcutsRef = useRef<HTMLElement | null>(null);
+  const paneRef = useRef<HTMLElement | null>(null);
+  useEffect(() => { writeStored("ddreams.shortcutsHeight", shortcutsHeight); }, [shortcutsHeight]);
   const [roots, setRoots] = useState<Folder[]>([]);
   const [expanded, setExpanded] = useState(new Set<number>());
   const [children, setChildren] = useState(new Map<number, Folder[]>());
@@ -74,8 +80,9 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
   }, [activeFolderId, roots]);
 
   const activeSet = new Set([activeFolderId, ...activeFolderIds].filter((v): v is number => v != null));
-  return <aside className="left-pane">
-    <section className="shortcuts-pane"><div className="pane-title">SKRATKY</div>{shortcuts.map(s => <button className="shortcut" key={s.path} onClick={() => void clickShortcut(s.path)}><span>▣</span><span><b>{s.name}</b><small>{s.path}</small></span></button>)}</section>
+  return <aside className="left-pane" ref={paneRef}>
+    <section className="shortcuts-pane" ref={shortcutsRef} style={shortcutsHeight == null ? undefined : { height: shortcutsHeight, flex: "none" }}><div className="pane-title">SKRATKY</div>{shortcuts.map(s => <button className="shortcut" key={s.path} onClick={() => void clickShortcut(s.path)}><span>▣</span><span><b>{s.name}</b><small>{s.path}</small></span></button>)}</section>
+    <Splitter direction="y" value={() => shortcutsHeight ?? shortcutsRef.current?.offsetHeight ?? 120} min={36} max={Math.max(36, (paneRef.current?.offsetHeight ?? 600) - 160)} onChange={setShortcutsHeight} onReset={() => setShortcutsHeight(null)}/>
     <div className="left-tabs"><button className={tab === "folders" ? "active" : ""} onClick={() => setTab("folders")}>Priečinky</button><button className={tab === "calendar" ? "active" : ""} onClick={() => setTab("calendar")}>Kalendár</button></div>
     {tab === "calendar" ? <CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/> : <div className="folder-tree">
       {error && <div className="inline-error">{error}<button onClick={() => setError("")}>×</button></div>}
