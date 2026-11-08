@@ -7,8 +7,9 @@ import "./CategoryManagement.css";
 
 type CategoryMutation = { changeId:number|null; summary:string; categoryId:number|null; parentId:number|null; rootId:number|null; ancestorIds:number[]; deletedCategoryIds:number[]; deletedRootIds:number[] };
 type KeywordMutation = { changeId:number|null;summary:string;keywordId:number|null;parentId:number|null;ancestorIds:number[];deletedKeywordIds:number[] };
-type Props = { primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void; readOnly:boolean; refreshToken:number };
-export default function RightPanel({ primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetCategory, onCategoryChanged, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken }: Props) {
+type ColorItem={value:string;name:string;hex:string;auto:boolean;effective:boolean;manualState:boolean|null};type AssetColorInfo={assetId:number;computed:boolean;colors:ColorItem[]};
+type Props = { primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void; readOnly:boolean; refreshToken:number;aiAvailable:boolean };
+export default function RightPanel({ primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken,aiAvailable }: Props) {
   const [tab, setTab] = useState<"properties" | "catalog">("properties");
   const [metadata, setMetadata] = useState<Metadata | null>(null);
   const [assetLinks,setAssetLinks]=useState<CatalogAssetLinks|null>(null);
@@ -18,6 +19,8 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
   const [rowAnchor, setRowAnchor] = useState("");
   const [copyMenu, setCopyMenu] = useState(false);
   const [copyMessage, setCopyMessage] = useState("");
+  const [assetColors,setAssetColors]=useState<AssetColorInfo[]>([]);
+  const colorIds=selectedIds.length?selectedIds:primaryId==null?[]:[primaryId];
   const metadataRequest = useRef(0);
   const toastTimer = useRef<number | undefined>(undefined);
 
@@ -27,6 +30,7 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
   }, [primaryId, refreshToken]);
+  useEffect(()=>{let active=true;setAssetColors([]);if(!colorIds.length)return;void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])});return()=>{active=false}},[colorIds.join(","),refreshToken]);
   useEffect(()=>{let active=true;setAssetLinks(null);if(primaryId==null)return;void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)});return()=>{active=false}},[primaryId,refreshToken]);
   useEffect(() => writeStored("ddreams.metadataOpen", [...openGroups]), [openGroups]);
   const groups = useMemo(() => {
@@ -95,15 +99,16 @@ export default function RightPanel({ primaryId, selectedIds, includeChildren, on
             </div>)}
           </div>)}
         </div>}
+        {group.name==="Katalóg"&&<div className="meta-row color-properties"><span>Farby</span><b><span className="property-color-chips">{assetColors[0]?.colors.map(color=>{const count=assetColors.filter(asset=>asset.colors.find(c=>c.value===color.value)?.effective).length;const manual=assetColors.some(asset=>asset.colors.find(c=>c.value===color.value)?.manualState!==null);const cls=count===0?"empty":count===assetColors.length?"full":"partial";return <button key={color.value} disabled={readOnly||!colorIds.length} className={`property-color-chip ${cls} ${manual?"manual":"auto"}`} title={`${color.name}${count?` · ${count}/${assetColors.length}`:""}`} onClick={e=>{e.stopPropagation();onSetColors(colorIds,color.value,e.altKey?null:count===assetColors.length?false:true)}}><i style={{background:color.hex}}/></button>})}</span></b>{assetColors.length>0&&assetColors.some(asset=>!asset.computed)&&<small className="color-not-computed">Farby ešte nie sú vypočítané</small>}{!aiAvailable&&<small className="color-not-computed">AI modul nie je nainštalovaný</small>}</div>}
       </section>)}
       <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
-    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} />}
+    </div> : <CatalogPanel onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} aiAvailable={aiAvailable} />}
   </aside>;
 }
 
-function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, primaryId, selectedIds, onSetCategory, onSetKeyword, onCategoryChanged, onKeywordChanged, onCategoryError, refreshToken }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null; selectedIds:number[]; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void;refreshToken:number }) {
+function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, primaryId, selectedIds, onSetCategory, onSetKeyword, onCategoryChanged, onKeywordChanged, onCategoryError, refreshToken,aiAvailable }: { onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null; selectedIds:number[]; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void;refreshToken:number;aiAvailable:boolean }) {
   const [roots,setRoots]=useState<Root[]>([]);
   const [openRoots,setOpenRoots]=useState(new Set<number>());
   const [cats,setCats]=useState(new Map<number,CatalogNode[]>());
@@ -124,6 +129,7 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, pr
   const [keywordQuery,setKeywordQuery]=useState("");
   const [ratings,setRatings]=useState<ValueCount[]>([]);
   const [labels,setLabels]=useState<ValueCount[]>([]);
+  const [colorCounts,setColorCounts]=useState<{value:string;name:string;hex:string;count:number}[]>([]);
   const [special,setSpecial]=useState<ValueCount[]>([]);
   const [links,setLinks]=useState<CatalogAssetLinks|null>(null);
   const [collapsed,setCollapsed]=useState<Record<string,boolean>>(()=>readStored("ddreams.catalogCollapsed",{}));
@@ -163,6 +169,7 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, pr
     load(invoke<ValueCount[]>("get_catalog_values",{kind:"rating",offset:0,limit:20}),values=>{const counts=new Map(values.map(v=>[v.value,v.count]));setRatings(["unrated","1","2","3","4","5"].map(value=>({value,count:counts.get(value)??0})));});
     load(invoke<ValueCount[]>("get_catalog_values",{kind:"label",offset:0,limit:100}),setLabels);
     load(invoke<ValueCount[]>("get_catalog_values",{kind:"special",offset:0,limit:20}),setSpecial);
+    load(invoke<{value:string;name:string;hex:string;count:number}[]>("get_color_counts",{}),setColorCounts);
     load(invoke<CatalogNode[]>("get_catalog_nodes",{kind:"keyword",parentId:null,rootId:null,includeChildren,offset:0,limit:500}),setKeywords);
     for(const rootId of openRoots) load(invoke<CatalogNode[]>("get_catalog_nodes",{kind:"category",parentId:null,rootId,includeChildren,offset:0,limit:500}),nodes=>setCats(p=>new Map(p).set(rootId,nodes)));
     const allCategories=[...cats.values(),...catChildren.values()].flat();
@@ -250,6 +257,7 @@ function CatalogPanel({ onNavigate, includeChildren, onIncludeChildrenChange, pr
     })}</section>
     <section className="catalog-section">{sectionHead("ratings","Hodnotenie")}{!collapsed.ratings&&ratings.map(r=><button className="value-row" key={r.value} onClick={()=>onNavigate({kind:"rating",value:r.value,title:r.value==="unrated"?"Bez hodnotenia":`Hodnotenie ${r.value} ★`})}><span>{r.value==="unrated"?"Bez hodnotenia":"★".repeat(Number(r.value))}</span><small>{r.count}</small></button>)}</section>
     <section className="catalog-section">{sectionHead("labels","Farebné štítky")}{!collapsed.labels&&labels.filter(l=>l.value).map(l=><button className="value-row" key={l.value} onClick={()=>onNavigate({kind:"label",value:l.value,title:`Farebný štítok: ${labelText(l.value)}`})}><span><i className="label-dot" style={{background:labelColor(l.value)}}/>{labelText(l.value)}</span><small>{l.count}</small></button>)}</section>
+    <section className="catalog-section">{sectionHead("colors","FARBY")}{!collapsed.colors&&(aiAvailable?colorCounts.map(color=><button className="value-row" key={color.value} onClick={()=>onNavigate({kind:"color",value:color.value,title:`Farba: ${color.name}`})}><span><i className="label-dot" style={{background:color.hex}}/>{color.name}</span><small>{color.count.toLocaleString("sk-SK")}</small></button>):<small className="color-not-computed">AI modul nie je nainštalovaný</small>)}</section>
      <section className="catalog-section keyword-section" onDragOver={keywordDragOverTop} onDragLeave={()=>setKeywordTopDrop(false)} onDrop={keywordDropTop}>{sectionHead("keywords","Kľúčové slová",keywordTools)}{keywordTopDrop&&<div className="category-top-drop">Presunúť na najvyššiu úroveň</div>}{!collapsed.keywords&&filteredKeywords.map(node=><KeywordNode key={node.id} node={node} depth={0} open={openKeywords} childrenMap={keywordChildren} onToggle={toggleKeyword} onNavigate={navigateKeyword} onLabelClick={delayLabelClick} onLabelDoubleClick={cancelLabelClick} assignedIds={new Set(links?.keywordIds??[])} ancestorIds={new Set(links?.keywordAncestorIds??[])} showSquare={showAssignSquares} count={keywordAssignedCount} total={keywordSelectionCounts.totalFiles} disabled={!selectedIds.length} onAssign={assignKeyword} onActivate={setActiveKeyword} onContextMenu={keywordContext} onDragStart={keywordDragStart} highlightId={highlightKeyword} dropTarget={keywordDropTarget} onDragOver={keywordDragOver} onDragLeave={()=>setKeywordDropTarget(null)} onDrop={keywordDrop}/>)}</section>
      {keywordMenu&&<div className="category-context-menu" style={{left:Math.min(keywordMenu.x,window.innerWidth-250),top:Math.min(keywordMenu.y,window.innerHeight-280)}} onMouseLeave={()=>setKeywordMenu(null)}>
        <button onClick={()=>{setKeywordMenu(null);setKeywordDialog({kind:"create",parentId:null,name:""})}}>Nové kľúčové slovo…</button>

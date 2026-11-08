@@ -1,5 +1,5 @@
 use crate::{
-    ai::{AiState, AiStatus},
+    ai::{AiSearchResult, AiState, AiStatus},
     calendar::{CalendarAggregate, CalendarService, DateSource},
     db::{self, AssetFilter, AssetMetadata, Db},
     display_metadata::{self, CacheEntry, DisplayMetadataCache, TileExifItem, TileExifValues},
@@ -18,6 +18,7 @@ use serde_json::Value;
 use std::{path::{Path, PathBuf}, sync::Arc};
 use tauri::State;
 use tauri::Emitter;
+use rusqlite::OptionalExtension;
 
 pub struct DatabaseState(pub Db);
 pub struct ExifState(pub Arc<ExifTool>);
@@ -44,9 +45,56 @@ pub fn ai_resume(state: State<'_, AiState>) -> Result<AiStatus, String> { state.
 #[tauri::command]
 pub fn ai_reindex(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.reindex() }
 #[tauri::command]
-pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u32>) -> Result<Vec<i64>, String> { state.0.search_text(query, limit) }
+pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.search_text(query, limit) }
 #[tauri::command]
-pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<Vec<i64>, String> { state.0.similar(asset_id, limit) }
+pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.similar(asset_id, limit) }
+
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct ColorCount { pub value:String,pub name:String,pub hex:String,pub count:usize }
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct AssetColorState { pub value:String,pub name:String,pub hex:String,pub auto:bool,pub effective:bool,pub manual_state:Option<bool> }
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct AssetColors { pub asset_id:i64,pub computed:bool,pub colors:Vec<AssetColorState> }
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct ColorImportResult { pub done:bool,pub matched:usize,pub ambiguous:usize,pub missing:usize }
+
+#[tauri::command]
+pub fn get_photosort_color_import_status(db:State<'_,DatabaseState>)->bool{db.0.lock().ok().and_then(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).ok()).unwrap_or(false)}
+
+#[tauri::command]
+pub fn set_asset_colors(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,color:String,state:Option<bool>)->Result<usize,String>{let count=writer.0.set_asset_colors(&asset_ids,&color,state,"Oprava farby")?;if count>0{ai.0.learn_colors_debounced();}Ok(count)}
+
+#[tauri::command]
+pub fn get_asset_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,asset_ids:Vec<i64>)->Result<Vec<AssetColors>,String>{
+    let attached=ai.0.ensure_colors_attached();let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let mut out=Vec::new();let mut seen=std::collections::HashSet::new();
+    for id in asset_ids.into_iter().filter(|id|*id>0).filter(|id|seen.insert(*id)).take(500){let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;if !listed{continue;}
+        let auto_json:Option<String>=if attached{conn.query_row("SELECT auto FROM ai.colors WHERE asset_id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?}else{None};let auto=auto_json.as_deref().and_then(|v|serde_json::from_str::<Vec<String>>(v).ok()).unwrap_or_default();
+        let overrides=conn.prepare("SELECT color,state FROM asset_color_overrides WHERE asset_id=?1").map_err(|e|e.to_string())?.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+        let effective=crate::colors::effective_colors(&auto,&overrides);let colors=crate::colors::PALETTE.iter().map(|c|{let manual=overrides.iter().find(|o|o.0==c.value).map(|o|o.1!=0);AssetColorState{value:c.value.into(),name:c.name.into(),hex:c.hex.into(),auto:auto.iter().any(|v|v==c.value),effective:effective.iter().any(|v|v==c.value),manual_state:manual}}).collect();out.push(AssetColors{asset_id:id,computed:auto_json.is_some(),colors});}
+    Ok(out)
+}
+
+#[tauri::command]
+pub fn get_color_counts(db:State<'_,DatabaseState>,ai:State<'_,AiState>)->Result<Vec<ColorCount>,String>{
+    let attached=ai.0.ensure_colors_attached();let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let mut counts=std::collections::HashMap::<String,usize>::new();
+    let sql=if attached{"SELECT a.id,c.auto FROM assets a LEFT JOIN ai.colors c ON c.asset_id=a.id WHERE a.is_listed=1 AND a.id>0"}else{"SELECT a.id,NULL FROM assets a WHERE a.is_listed=1 AND a.id>0"};let rows=conn.prepare(sql).map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    let overrides=conn.prepare("SELECT asset_id,color,state FROM asset_color_overrides").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let mut by_id=std::collections::HashMap::<i64,Vec<(String,i64)>>::new();for(id,color,state)in overrides{by_id.entry(id).or_default().push((color,state));}
+    for(id,json)in rows{let auto=json.as_deref().and_then(|v|serde_json::from_str::<Vec<String>>(v).ok()).unwrap_or_default();let effective=crate::colors::effective_colors(&auto,by_id.get(&id).map(Vec::as_slice).unwrap_or(&[]));for color in effective{*counts.entry(color).or_default()+=1;}}
+    Ok(crate::colors::PALETTE.iter().map(|c|ColorCount{value:c.value.into(),name:c.name.into(),hex:c.hex.into(),count:*counts.get(c.value).unwrap_or(&0)}).collect())
+}
+
+#[tauri::command]
+pub fn import_photosort_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,writer:State<'_,CatalogWriterState>)->Result<ColorImportResult,String>{
+    let Some(path)=ai.0.photosort_corrections_path() else{return Err("Photosort learned priečinok nie je dostupný".into())};let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let done:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).unwrap_or(false);if done{return Ok(ColorImportResult{done:true,matched:0,ambiguous:0,missing:0});}
+    let input=std::fs::read_to_string(&path).map_err(|e|format!("Nepodarilo sa načítať opravy Photosortu: {e}"))?;let corrections:serde_json::Map<String,Value>=serde_json::from_str(&input).map_err(|e|e.to_string())?;let rows=conn.prepare("SELECT id,name FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(conn);
+    let mut imported=Vec::new();let(mut matched,mut ambiguous,mut missing)=(0,0,0);
+    for(name,record)in corrections{match crate::colors::unique_name_match(&name,&rows){Ok(Some(id))=>{matched+=1;let colors=record.get("colors").and_then(Value::as_array).map(|v|v.iter().filter_map(Value::as_str).collect::<std::collections::HashSet<_>>()).unwrap_or_default();for c in crate::colors::PALETTE{imported.push((id,c.value.to_string(),colors.contains(c.value)));}},Ok(None)=>missing+=1,Err(())=>ambiguous+=1}}
+    writer.0.import_asset_colors(&imported,"Import farieb z photosortu")?;let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;conn.execute("INSERT OR REPLACE INTO ddreams_meta(key,value) VALUES('photosort_colors_imported','1')",[]).map_err(|e|e.to_string())?;drop(conn);ai.0.learn_colors_debounced();Ok(ColorImportResult{done:true,matched,ambiguous,missing})
+}
 
 #[tauri::command]
 pub fn get_app_info(state: State<'_, AppInfoState>) -> AppInfo { state.0.clone() }
@@ -57,8 +105,8 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
 }
 
 #[tauri::command]
-pub async fn undo_last_change(state: State<'_, FileManagerState>) -> Result<Option<ChangeSummary>, String> {
-    let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())?
+pub async fn undo_last_change(state: State<'_, FileManagerState>,ai:State<'_,AiState>) -> Result<Option<ChangeSummary>, String> {
+    let manager=state.0.clone();let change=tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())??;if change.as_ref().is_some_and(|item|item.action=="set_asset_colors"||item.action=="import_photosort_colors"){ai.0.learn_colors_debounced();}Ok(change)
 }
 
 #[tauri::command]

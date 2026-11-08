@@ -14,7 +14,7 @@ pub fn catalog_path() -> PathBuf {
 
 pub fn open_catalog(path: &Path, readonly: bool) -> rusqlite::Result<Connection> {
     if readonly { return open_read_only(path); }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI)?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -25,7 +25,7 @@ pub fn open_catalog(path: &Path, readonly: bool) -> rusqlite::Result<Connection>
 pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open_with_flags(
         path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
     conn.pragma_update(None, "query_only", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(4))?;
@@ -390,6 +390,7 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
 pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
     if filter.kind == "ai" { return ai_assets_page(db, filter, formats); }
     let conn = db.lock().unwrap();
+    let ai_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
     let extra_cols = filter.include_categories as i64 + filter.include_keywords as i64;
     let mut from_sql = String::from("assets a");
@@ -442,6 +443,15 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         "label" => {
             where_sql.push_str(" AND coalesce(a.label,'')=?");
             args.push(filter.value.clone().unwrap_or_default().into());
+        }
+        "color" => {
+            let color=filter.value.as_deref().unwrap_or("");
+            if !crate::colors::PALETTE.iter().any(|entry|entry.value==color) { where_sql.push_str(" AND 0"); }
+            else if !ai_attached { where_sql.push_str(" AND EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1)");args.push(color.to_owned().into()); }
+            else {
+                where_sql.push_str(" AND (EXISTS(SELECT 1 FROM ai.colors c,json_each(c.auto) j WHERE c.asset_id=a.id AND j.value=? AND coalesce((SELECT o.state FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=?),1)=1) OR EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1))");
+                args.extend([color.to_owned().into(),color.to_owned().into(),color.to_owned().into()]);
+            }
         }
         "special" => match filter.value.as_deref().unwrap_or("") {
             "all_photos" => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["image", "raw"]))),
@@ -1078,6 +1088,14 @@ mod feature_tests {
         let page=assets_page(&db,&second,&formats).unwrap();
         assert_eq!(page.items.iter().map(|asset|asset.id).collect::<Vec<_>>(),vec![2]);
         assert_eq!(page.total,2);assert_eq!(page.total_size,60.0);
+    }
+
+    #[test]
+    fn color_view_uses_effective_colors_and_normal_paging_filters() {
+        let db=test_db();let conn=db.lock().unwrap();conn.execute_batch("CREATE TABLE asset_color_overrides(asset_id INTEGER,color TEXT,state INTEGER,PRIMARY KEY(asset_id,color));ATTACH DATABASE ':memory:' AS ai;CREATE TABLE ai.colors(asset_id INTEGER PRIMARY KEY,auto TEXT);INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,rating) VALUES(1,'a.jpg','jpg','jpg',1,10,4),(2,'b.jpg','jpg','jpg',1,20,2),(3,'c.jpg','jpg','jpg',1,30,5),(4,'hidden.jpg','jpg','jpg',0,40,5);INSERT INTO ai.colors VALUES(1,'[\"červená\"]'),(2,'[]'),(3,'[\"červená\"]');INSERT INTO asset_color_overrides VALUES(2,'červená',1),(3,'červená',0);").unwrap();drop(conn);
+        let formats=FormatTable::parse(include_str!("../formats.json")).unwrap();let mut filter=test_filter("color","červená");filter.limit=1;filter.rating_mode=Some("atLeast".into());filter.rating_value=Some(3);
+        let first=assets_page(&db,&filter,&formats).unwrap();assert_eq!(first.total,1);assert_eq!(first.total_size,10.0);assert_eq!(first.items[0].id,1);
+        filter.rating_mode=None;filter.offset=1;let second=assets_page(&db,&filter,&formats).unwrap();assert_eq!(second.total,2);assert_eq!(second.items[0].id,2);
     }
 }
 

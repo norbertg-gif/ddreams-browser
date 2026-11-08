@@ -2,6 +2,7 @@ mod ai;
 mod commands;
 mod backup;
 mod calendar;
+mod colors;
 mod db;
 mod display_metadata;
 mod exiftool;
@@ -47,6 +48,7 @@ pub fn run() {
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
     let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
     let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone());
+    let _=ai_service.ensure_colors_attached();
     let setup_ai = ai_service.clone();
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
@@ -129,6 +131,11 @@ pub fn run() {
             commands::ai_reindex,
             commands::ai_search_text,
             commands::ai_similar,
+            commands::set_asset_colors,
+            commands::get_asset_colors,
+            commands::get_color_counts,
+            commands::import_photosort_colors,
+            commands::get_photosort_color_import_status,
             commands::get_recent_changes,
             commands::undo_last_change,
             commands::get_file_operation_conflicts,

@@ -92,6 +92,41 @@ impl CatalogWriter {
         ChangeBuilder { action: action.into(), summary: summary.into(), items: Vec::new() }
     }
 
+    pub fn set_asset_colors(&self, asset_ids: &[i64], color: &str, state: Option<bool>, summary: &str) -> Result<usize, String> {
+        const PALETTE: [&str;13] = ["červená","oranžová","hnedá","žltá","zelená","tyrkysová","modrá","fialová","ružová","biela","sivá","čierna","čiernobiela"];
+        self.require_write()?;
+        if !PALETTE.contains(&color) { return Err("Neznáma farba".into()); }
+        let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let mut change=ChangeBuilder{action:"set_asset_colors".into(),summary:summary.into(),items:Vec::new()};
+        let new_value=state.map(|value|Value::from(if value {1} else {0})).unwrap_or(Value::Null);
+        let mut seen=std::collections::HashSet::new();
+        for id in asset_ids.iter().copied().filter(|id|*id>0).filter(|id|seen.insert(*id)) {
+            let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !listed { continue; }
+            let old:Option<i64>=conn.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+            let old_value=old.map(Value::from).unwrap_or(Value::Null);
+            if old_value!=new_value { change.record("asset_color_overrides",&format!("{id}:{color}"),"__exists__",old_value,new_value.clone()); }
+        }
+        drop(conn);
+        let count=change.items.len();
+        if count>0 { self.commit_change(change)?; }
+        Ok(count)
+    }
+
+    pub fn import_asset_colors(&self, rows: &[(i64,String,bool)], summary: &str) -> Result<usize,String> {
+        self.require_write()?;
+        let mut change=ChangeBuilder{action:"import_photosort_colors".into(),summary:summary.into(),items:Vec::new()};
+        let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        for (id,color,state) in rows {
+            let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if !listed {continue;}
+            let old:Option<i64>=conn.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;
+            let new_value=Value::from(if *state {1} else {0});let old_value=old.map(Value::from).unwrap_or(Value::Null);
+            if old_value!=new_value {change.record("asset_color_overrides",&format!("{id}:{color}"),"__exists__",old_value,new_value);}
+        }
+        drop(conn);let count=change.items.len();if count>0{self.commit_change(change)?;}Ok(count)
+    }
+
     pub fn commit_change(&self, change: ChangeBuilder) -> Result<i64, String> {
         self.require_write()?;
         if change.items.is_empty() { return Err("A change must contain at least one item".into()); }
@@ -491,7 +526,7 @@ fn validate_item(table: &str, column: &str) -> Result<(), String> {
         "categories" => matches!(column, "name" | "parent_id" | "root_id" | "__snapshot__"),
         "category_roots" => matches!(column, "name" | "__snapshot__"),
         "keywords" => matches!(column, "name" | "parent_id" | "__snapshot__"),
-        "asset_categories" | "asset_keywords" => column == "__exists__",
+        "asset_categories" | "asset_keywords" | "asset_color_overrides" => column == "__exists__",
         "__file_ops" => column == "__payload__",
         _ => false,
     };
@@ -773,8 +808,11 @@ fn link_ids(row_key: &str) -> Result<(i64,i64), String> {
     Ok((key_id(left)?, key_id(right)?))
 }
 
+fn color_key(row_key:&str)->Result<(i64,&str),String>{let (id,color)=row_key.split_once(':').ok_or("Color row key must be asset_id:color")?;let id=key_id(id)?;if id<=0{return Err("Color row key asset_id must be positive".into());}Ok((id,color))}
+
 fn read_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column: &str) -> Result<SqlValue, String> {
     if column == "__snapshot__" { return read_snapshot(transaction, table, row_key); }
+    if table == "asset_color_overrides" { let (id,color)=color_key(row_key)?;let state:Option<i64>=transaction.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;return Ok(state.map(SqlValue::Integer).unwrap_or(SqlValue::Null)); }
     if table == "asset_categories" || table == "asset_keywords" {
         let (asset_id, target_id) = link_ids(row_key)?;
         let target_column = if table == "asset_categories" { "category_id" } else { "keyword_id" };
@@ -787,6 +825,7 @@ fn read_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column: 
 
 fn apply_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column: &str, value: &SqlValue) -> Result<(), String> {
     if column == "__snapshot__" { return restore_snapshot(transaction, table, row_key, value); }
+    if table == "asset_color_overrides" { let (id,color)=color_key(row_key)?;match value { SqlValue::Null=>{transaction.execute("DELETE FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color)).map_err(|e|e.to_string())?;},SqlValue::Integer(state @ (0|1))=>{transaction.execute("INSERT OR REPLACE INTO asset_color_overrides(asset_id,color,state) VALUES(?1,?2,?3)",(id,color,state)).map_err(|e|e.to_string())?;},_=>return Err("Invalid color override state".into()) }return Ok(()); }
     if table == "asset_categories" || table == "asset_keywords" {
         let (asset_id,target_id) = link_ids(row_key)?;
         let target_column = if table == "asset_categories" { "category_id" } else { "keyword_id" };
@@ -892,6 +931,16 @@ mod tests {
         let undone=writer.undo_last().unwrap().unwrap(); assert_eq!(undone.id,id);
         assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),2);
         assert!(writer.recent_changes(5).unwrap()[0].undone);
+    }
+
+    #[test]
+    fn color_override_change_is_journaled_and_undo_removes_it() {
+        let db=write_fixture();db.lock().unwrap().execute_batch("CREATE TABLE asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL,PRIMARY KEY(asset_id,color));").unwrap();
+        let writer=CatalogWriter::new(db.clone(),true);
+        assert_eq!(writer.set_asset_colors(&[1,999],"zelená",Some(true),"Farba: zelená").unwrap(),1);
+        assert_eq!(db.lock().unwrap().query_row("SELECT state FROM asset_color_overrides WHERE asset_id=1 AND color='zelená'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        writer.undo_last().unwrap();
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_color_overrides",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[test]

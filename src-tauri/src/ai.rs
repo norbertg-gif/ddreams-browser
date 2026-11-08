@@ -23,6 +23,10 @@ pub struct AiStatus {
     pub last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSearchResult { pub ids: Vec<i64>, pub searched: u64 }
+
 impl AiStatus {
     fn unavailable(reason: String) -> Self {
         Self { available: false, reason: Some(reason), state: "off".into(), indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None }
@@ -45,6 +49,8 @@ struct AiInner {
     next_id: AtomicU64,
     stopping: AtomicBool,
     auto_index_started: AtomicBool,
+    colors_attached: AtomicBool,
+    color_learn_generation: AtomicU64,
     last_stderr: Mutex<String>,
     stderr_reader: Mutex<Option<thread::JoinHandle<()>>>,
 }
@@ -64,10 +70,36 @@ impl AiService {
             paths, db, formats, app: Mutex::new(None), process: Mutex::new(ProcessState { child: None, writer: None }),
             status: Mutex::new(status), pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1), stopping: AtomicBool::new(false),
             auto_index_started: AtomicBool::new(false), last_stderr: Mutex::new(String::new()), stderr_reader: Mutex::new(None),
+            colors_attached: AtomicBool::new(false),
+            color_learn_generation: AtomicU64::new(0),
         }))
     }
 
     pub fn status(&self) -> AiStatus { self.0.status.lock().unwrap().clone() }
+
+    pub fn ensure_colors_attached(&self) -> bool {
+        if self.0.colors_attached.load(Ordering::Relaxed) { return self.has_colors_table(); }
+        if !self.0.paths.ai_db.is_file() { return false; }
+        let path=self.0.paths.ai_db.to_string_lossy().replace('\\',"/").replace(' ',"%20");
+        let uri=format!("file:{path}?mode=ro");
+        let Ok(conn)=self.0.db.lock() else{return false};
+        if conn.execute("ATTACH DATABASE ?1 AS ai",[uri]).is_ok() { self.0.colors_attached.store(true,Ordering::Relaxed);drop(conn);self.has_colors_table() } else { false }
+    }
+
+    fn has_colors_table(&self)->bool{self.0.db.lock().ok().and_then(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).ok()).unwrap_or(false)}
+
+    pub fn photosort_corrections_path(&self) -> Option<PathBuf> { self.0.paths.ai_seed_colors.as_ref().map(|path|path.join("color_corrections.json")) }
+
+    pub fn learn_colors_debounced(&self) {
+        let generation=self.0.color_learn_generation.fetch_add(1,Ordering::Relaxed)+1;
+        let service=self.clone();
+        let _=thread::Builder::new().name("ai-color-learn-debounce".into()).spawn(move||{
+            thread::sleep(Duration::from_secs(2));
+            if service.0.color_learn_generation.load(Ordering::Relaxed)!=generation || !service.status().available { return; }
+            let rows={let Ok(conn)=service.0.db.lock()else{return};let Ok(mut stmt)=conn.prepare("SELECT asset_id,color,state FROM asset_color_overrides ORDER BY asset_id,color")else{return};let Ok(rows)=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?)))else{return};rows.filter_map(Result::ok).map(|(asset_id,color,state)|json!({"asset_id":asset_id,"color":color,"state":state!=0})).collect::<Vec<_>>()};
+            if service.0.process.lock().ok().and_then(|p|p.writer.clone()).is_some(){let _=service.request("learn_colors",json!({"corrections":rows}),Duration::from_secs(60));}
+        });
+    }
 
     pub fn set_app(&self, app: tauri::AppHandle) { *self.0.app.lock().unwrap() = Some(app); }
 
@@ -86,7 +118,9 @@ impl AiService {
             File::create(&log_path).map_err(|e| e.to_string())?;
         }
         let mut command = Command::new(python);
-        command.arg("-I").arg(&self.0.paths.ai_script).arg("--model").arg(&self.0.paths.ai_model).arg("--db").arg(&self.0.paths.ai_db)
+        command.arg("-I").arg(&self.0.paths.ai_script).arg("--model").arg(&self.0.paths.ai_model).arg("--db").arg(&self.0.paths.ai_db);
+        if let Some(seed) = &self.0.paths.ai_seed_colors { command.arg("--seed-colors").arg(seed); }
+        command
             .env("PYTHONIOENCODING", "utf-8").env("HF_HUB_OFFLINE", "1")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         #[cfg(windows)]
@@ -169,15 +203,15 @@ impl AiService {
         Ok(self.status())
     }
 
-    pub fn search_text(&self, query: String, limit: Option<u32>) -> Result<Vec<i64>, String> {
+    pub fn search_text(&self, query: String, limit: Option<u32>) -> Result<AiSearchResult, String> {
         let result = self.request("search_text", json!({ "query": query, "limit": limit.unwrap_or(200).clamp(1, 1000) }), Duration::from_secs(30))?;
-        result_ids(result)
+        result_page(result)
     }
 
-    pub fn similar(&self, asset_id: i64, limit: Option<u32>) -> Result<Vec<i64>, String> {
+    pub fn similar(&self, asset_id: i64, limit: Option<u32>) -> Result<AiSearchResult, String> {
         if asset_id <= 0 { return Err("Fotka ešte nie je zaindexovaná".into()); }
         let result = self.request("similar", json!({ "asset_id": asset_id, "limit": limit.unwrap_or(200).clamp(1, 1000) }), Duration::from_secs(60))?;
-        result_ids(result)
+        result_page(result)
     }
 
     fn request(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, String> {
@@ -223,6 +257,7 @@ impl AiService {
                 self.update_status(&message);
                 if message.get("event").and_then(Value::as_str) == Some("status") && message.get("state").and_then(Value::as_str) == Some("ready")
                     && !self.0.auto_index_started.swap(true, Ordering::Relaxed) {
+                    let _=self.ensure_colors_attached();
                     let service = self.clone();
                     let _ = thread::Builder::new().name("ai-auto-index".into()).spawn(move || {
                         if let Err(error) = service.index_catalog() { service.set_error(error); }
@@ -303,9 +338,11 @@ impl AiService {
     }
 }
 
-fn result_ids(result: Value) -> Result<Vec<i64>, String> {
-    let rows = result.as_array().ok_or_else(|| "AI server vrátil neplatný zoznam".to_string())?;
-    Ok(rows.iter().filter_map(|row| row.get("asset_id").and_then(Value::as_i64)).collect())
+fn result_page(result: Value) -> Result<AiSearchResult, String> {
+    let rows = result.get("results").and_then(Value::as_array).ok_or_else(|| "AI server vrátil neplatný zoznam".to_string())?;
+    let ids = rows.iter().map(|row| row.get("asset_id").and_then(Value::as_i64).ok_or_else(|| "AI server vrátil neplatné asset_id".to_string())).collect::<Result<Vec<_>,_>>()?;
+    let searched = result.get("searched").and_then(Value::as_u64).ok_or_else(|| "AI server nevrátil počet prehľadaných fotiek".to_string())?;
+    Ok(AiSearchResult { ids, searched })
 }
 
 fn availability_reason(paths: &Paths) -> Option<String> {

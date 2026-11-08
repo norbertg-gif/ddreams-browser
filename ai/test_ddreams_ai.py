@@ -8,8 +8,9 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 
-from ddreams_ai import AIService, DIMENSION, RequestError
+from ddreams_ai import AIService, COLOR_PALETTE, DIMENSION, RequestError, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
 
 
 class FakeEmbedder:
@@ -46,14 +47,14 @@ class FakeEmbedder:
     def search_text(self, query, limit):
         target = self.vector(query)
         scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in self.vectors.items()), key=lambda pair: (-pair[1], pair[0]))
-        return [{"asset_id": aid, "score": score} for aid, score in scores[:limit]]
+        return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01} for aid, score in scores[:limit] if score >= 0.2], "searched": len(self.vectors)}
 
     def similar(self, asset_id, limit):
         if asset_id not in self.vectors:
             raise RequestError("Fotka ešte nie je zaindexovaná")
         target = self.vectors[asset_id]
         scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in self.vectors.items() if aid != asset_id), key=lambda pair: (-pair[1], pair[0]))
-        return [{"asset_id": aid, "score": score} for aid, score in scores[:limit]]
+        return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01} for aid, score in scores[:limit] if score >= 0.6], "searched": len(self.vectors)}
 
 
 class ServerTests(unittest.TestCase):
@@ -100,11 +101,65 @@ class ServerTests(unittest.TestCase):
         self.index([east1, east2, west])
         self.wait_idle()
         result = self.service.execute({"cmd": "search_text", "query": "east", "limit": 3})
-        self.assertEqual(sorted([east1["asset_id"], east2["asset_id"]]) + [west["asset_id"]], [row["asset_id"] for row in result])
+        self.assertEqual({east1["asset_id"], east2["asset_id"]}, {row["asset_id"] for row in result["results"]})
+        self.assertEqual(3, result["searched"])
         similar = self.service.execute({"cmd": "similar", "asset_id": east1["asset_id"]})
-        self.assertNotIn(east1["asset_id"], [row["asset_id"] for row in similar])
+        self.assertNotIn(east1["asset_id"], [row["asset_id"] for row in similar["results"]])
         hello = self.service.execute({"cmd": "hello"})
         self.assertEqual((1, "ViT-L-16-SigLIP2-256", DIMENSION), (hello["protocol"], hello["model"], hello["dim"]))
+
+    def test_search_cutoff_and_decode_only_color_pass(self):
+        item = self.make_file("east-colors.jpg")
+        self.index([item]); self.wait_idle()
+        self.assertEqual(self.index([item])['queued'], 0)
+        self.service.db.execute("DELETE FROM colors WHERE asset_id=?", (item["asset_id"],)); self.service.db.commit()
+        self.assertEqual(self.index([item])['queued'], 1)
+        queued = self.service._queue[0]
+        self.assertTrue(queued["colors_only"])
+        self.service._queue.clear()
+        embedder = self.service._embedder
+        embedder.vectors.clear()
+        self.assertEqual(self.service.execute({"cmd": "search_text", "query": "unrelated", "limit": 5})["results"], [])
+
+    def test_relative_text_cutoff_keeps_low_probability_true_matches(self):
+        self.assertAlmostEqual(text_probability_cutoff(0.39), 0.0195)
+        self.assertAlmostEqual(text_probability_cutoff(0.015), 0.003)
+        probs = [0.39, 0.16, 0.074, 0.015, 0.006, 0.0006]
+        cutoff = text_probability_cutoff(max(probs))
+        self.assertEqual([p for p in probs if p >= cutoff], [0.39, 0.16, 0.074])
+        floor_cutoff = text_probability_cutoff(0.015)
+        self.assertEqual([p for p in probs if p >= floor_cutoff], [0.39, 0.16, 0.074, 0.015, 0.006])
+
+    def test_color_algorithm_matches_photosort_synthetic(self):
+        import sys
+        photosort = Path(r"G:\Programovanie\photosort")
+        if not (photosort / "photosort/colors.py").exists(): self.skipTest("photosort source missing")
+        sys.path.insert(0, str(photosort))
+        from photosort.colors import dominant_colors as reference
+        for rgb in ((220, 20, 30), (130, 130, 130), (255, 255, 255), (0, 0, 0)):
+            image = Image.new("RGB", (12, 10), rgb)
+            expected, shares = reference(image, return_shares=True)
+            ours = palette_counts(image)
+            self.assertEqual(expected, dominant_colors(ours))
+            self.assertEqual(set(shares), set(ours))
+            for key in shares: self.assertAlmostEqual(shares[key], ours[key], places=7)
+
+    def test_learned_thresholds_match_photosort_corrections(self):
+        import sys
+        root = Path(r"G:\Programovanie\photosort")
+        corrections_path = root / "learned/color_corrections.json"
+        if not corrections_path.exists(): self.skipTest("photosort learned corrections missing")
+        sys.path.insert(0, str(root))
+        from photosort.colors import learn_color_thresholds as reference
+        corrections = json.loads(corrections_path.read_text(encoding="utf-8"))
+        samples = {color: [(float(row.get("shares", {}).get(color, 0)), color in row.get("colors", []))
+                           for row in corrections.values() if isinstance(row, dict)] for color in COLOR_PALETTE}
+        expected = reference(corrections, path=self.root / "reference.json")
+        actual = learn_thresholds(samples)
+        self.assertEqual(set(expected), set(actual))
+        for color in expected:
+            self.assertAlmostEqual(expected[color]["threshold"], actual[color]["threshold"], places=12)
+            self.assertEqual(expected[color]["examples"], actual[color]["examples"])
 
     def test_unknown_command_and_bad_arguments(self):
         with self.assertRaisesRegex(RequestError, "Neznámy príkaz"):

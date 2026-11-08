@@ -5,6 +5,7 @@ const DEV_EXIFTOOL: &str = r"G:\Programovanie\photosort\tools\exiftool\exiftool.
 const DEV_CACHE: &str = r"G:\ddreams-work\thumb-cache";
 const DEV_AI_PYTHON: &str = r"G:\Programovanie\photosort\.venv\Scripts\python.exe";
 const DEV_AI_MODEL: &str = r"G:\DDreams\modules\ai\model";
+const PHOTOSORT_LEARNED: &str = r"G:\Programovanie\photosort\learned";
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -22,6 +23,7 @@ pub struct Paths {
     pub ai_python: Option<PathBuf>,
     pub ai_db: PathBuf,
     pub ai_log: PathBuf,
+    pub ai_seed_colors: Option<PathBuf>,
     pub readonly: bool,
 }
 
@@ -77,8 +79,10 @@ impl Paths {
         let ai_python = if portable { read_ai_python(&ai_dir.join("ai.json")) } else { Some(PathBuf::from(DEV_AI_PYTHON)) };
         let ai_db = catalog.parent().unwrap_or(cwd).join("ai.sqlite");
         let ai_log = catalog.parent().unwrap_or(cwd).join("ai.log");
+        let learned = PathBuf::from(PHOTOSORT_LEARNED);
+        let ai_seed_colors = learned.is_dir().then_some(learned);
         let readonly = vars.get(&OsString::from("DDREAMS_READONLY")).is_some_and(|value| value == "1");
-        Self { root, portable, catalog, backups, cache, exiftool, formats, metadata_view, settings, ai_script, ai_model, ai_python, ai_db, ai_log, readonly }
+        Self { root, portable, catalog, backups, cache, exiftool, formats, metadata_view, settings, ai_script, ai_model, ai_python, ai_db, ai_log, ai_seed_colors, readonly }
     }
 
     pub fn ensure_runtime_dirs(&self) -> std::io::Result<()> {

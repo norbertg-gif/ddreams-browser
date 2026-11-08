@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import ctypes
+import hashlib
 import io
 import json
 import os
@@ -20,8 +21,98 @@ import numpy as np
 MODEL_NAME = "ViT-L-16-SigLIP2-256"
 DIMENSION = 1024
 SCHEMA_VERSION = "1"
+COLOR_VERSION = 1
+TEXT_PROB_FLOOR = 0.003
+TEXT_PROB_RELATIVE = 0.05
+SIMILARITY_COSINE_FLOOR = 0.60
 BATCH_SIZE = 32
 DECODE_THREADS = 6
+CHROMATIC_COLORS = ("červená", "oranžová", "hnedá", "žltá", "zelená", "tyrkysová", "modrá", "fialová", "ružová")
+NEUTRAL_COLORS = ("biela", "sivá", "čierna")
+COLOR_PALETTE = CHROMATIC_COLORS + NEUTRAL_COLORS + ("čiernobiela",)
+COLOR_DEFAULTS = {color: 0.45 if color in NEUTRAL_COLORS else 0.06 for color in COLOR_PALETTE}
+
+
+def text_probability_cutoff(top_prob: float) -> float:
+    return max(TEXT_PROB_FLOOR, TEXT_PROB_RELATIVE * top_prob)
+
+
+def _hsv(rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    values = np.asarray(rgb, dtype=np.float32) / 255.0
+    maximum, minimum = values.max(axis=2), values.min(axis=2)
+    delta = maximum - minimum
+    red, green, blue = values[..., 0], values[..., 1], values[..., 2]
+    hue = np.zeros_like(maximum)
+    nonzero = delta > 1e-6
+    mask = nonzero & (maximum == red)
+    hue[mask] = np.mod((green[mask] - blue[mask]) / delta[mask], 6)
+    mask = nonzero & (maximum == green)
+    hue[mask] = (blue[mask] - red[mask]) / delta[mask] + 2
+    mask = nonzero & (maximum == blue)
+    hue[mask] = (red[mask] - green[mask]) / delta[mask] + 4
+    hue *= 60.0
+    saturation = np.divide(delta, maximum, out=np.zeros_like(delta), where=maximum > 1e-6)
+    return hue, saturation, maximum
+
+
+def palette_counts(image: Any) -> dict[str, float]:
+    """Measure shares on the indexer's decoded image (max 512 px), with no extra photo read."""
+    if not hasattr(image, "convert"):
+        return {}
+    rgb = np.asarray(image.convert("RGB"), dtype=np.uint8)
+    hue, saturation, value = _hsv(rgb)
+    if float(saturation.mean()) <= 0.035:
+        return {"čiernobiela": 1.0}
+    warm = (hue >= 10) & (hue < 50)
+    pale = warm & (saturation < 0.35) & (value >= 0.65)
+    neutral = (saturation < 0.20) | (value <= 0.17) | pale
+    brown = ~neutral & warm & ((value < 0.65) | (saturation < 0.50))
+    light_red = (hue < 15) | (hue >= 345)
+    pink = ~neutral & light_red & (saturation < 0.50) & (value >= 0.65)
+    chroma = ~neutral & ~brown & ~pink
+    masks = {
+        "čierna": neutral & (value <= 0.17), "biela": neutral & (value >= 0.84),
+        "sivá": neutral & (value > 0.17) & (value < 0.84), "hnedá": brown,
+        "červená": chroma & light_red, "oranžová": chroma & (hue >= 15) & (hue < 40),
+        "žltá": chroma & (hue >= 40) & (hue < 70), "zelená": chroma & (hue >= 70) & (hue < 155),
+        "tyrkysová": chroma & (hue >= 155) & (hue < 195), "modrá": chroma & (hue >= 195) & (hue < 255),
+        "fialová": chroma & (hue >= 255) & (hue < 290), "ružová": pink | (chroma & (hue >= 290) & (hue < 345)),
+    }
+    weights = np.where((saturation >= 0.60) & (value >= 0.30), 3.0, 1.0)
+    return {name: float(weights[mask].sum()) / saturation.size for name, mask in masks.items() if mask.any()}
+
+
+def dominant_colors(shares: dict[str, float], thresholds: dict[str, float] | None = None) -> list[str]:
+    if "čiernobiela" in shares:
+        return ["čiernobiela"]
+    thresholds = thresholds or COLOR_DEFAULTS
+    ranked = sorted(shares.items(), key=lambda item: (-item[1], COLOR_PALETTE.index(item[0])))
+    selected = [name for name, share in ranked if share >= thresholds.get(name, COLOR_DEFAULTS[name])]
+    return selected[:4] or [name for name, _ in ranked[:1]]
+
+
+def learn_thresholds(samples: dict[str, list[tuple[float, bool]]]) -> dict[str, dict[str, float | int]]:
+    learned = {}
+    for color in COLOR_PALETTE:
+        examples = samples.get(color, [])
+        positives = sum(label for _, label in examples)
+        negatives = len(examples) - positives
+        default = COLOR_DEFAULTS[color]
+        threshold = default
+        eligible = len(examples) >= 5 and positives and negatives
+        if eligible:
+            values = sorted({max(0.0, min(1.0, share)) for share, _ in examples})
+            candidates = [0.0, 0.70]
+            candidates.extend((left + right) / 2 for left, right in zip(values, values[1:]))
+            raw = max(candidates, key=lambda value: (
+                (sum(score >= value for score, label in examples if label) / positives +
+                 sum(score < value for score, label in examples if not label) / negatives) / 2,
+                -abs(value - default)))
+            raw = max(0.01, min(0.70, raw))
+            threshold = max(0.01, min(0.70, default + (raw - default) * len(examples) / (len(examples) + 10)))
+        learned[color] = {"default": default, "threshold": threshold, "examples": len(examples) if eligible else 0,
+                          "positive": positives, "negative": negatives}
+    return learned
 
 
 class RequestError(ValueError):
@@ -100,6 +191,8 @@ class SiglipEmbedder:
         checkpoint = Path(model_dir) / "open_clip_model.fp16.safetensors"
         self.model.load_state_dict(load_file(str(checkpoint), device="cuda"), strict=False, assign=True)
         self.model.eval()
+        self._logit_scale = self.model.logit_scale.detach().float().exp()
+        self._logit_bias = self.model.logit_bias.detach().float()
         config = open_clip.get_model_config(MODEL_NAME)
         text_cfg = config["text_cfg"]
         kwargs = text_cfg.get("tokenizer_kwargs", {})
@@ -147,32 +240,43 @@ class SiglipEmbedder:
             self._matrix = self._matrix[self.torch.as_tensor(keep, device="cuda")].contiguous()
             self._ids = self._ids[keep]
 
-    def search_text(self, query: str, limit: int) -> list[dict[str, Any]]:
+    def search_text(self, query: str, limit: int) -> dict[str, Any]:
         with self._lock:
             if not len(self._ids):
-                return []
+                return {"results": [], "searched": 0}
             scores = self._matrix @ self._text_vector(query).reshape(-1)
-            count = min(limit, len(self._ids))
-            values, positions = self.torch.topk(scores, count)
-            return [{"asset_id": int(self._ids[int(i)]), "score": float(s)} for s, i in zip(values.cpu().tolist(), positions.cpu().tolist())]
+            probs = self.torch.sigmoid(self._logit_scale * scores.float() + self._logit_bias)
+            top_prob = float(probs.max().item())
+            cutoff = text_probability_cutoff(top_prob)
+            values, positions = self.torch.topk(scores, len(self._ids))
+            result = []
+            for score, position in zip(values.cpu().tolist(), positions.cpu().tolist()):
+                prob = float(probs[position].item())
+                if prob >= cutoff:
+                    result.append({"asset_id": int(self._ids[position]), "score": float(score), "prob": prob})
+                    if len(result) >= limit: break
+            return {"results": result, "searched": len(self._ids)}
 
-    def similar(self, asset_id: int, limit: int) -> list[dict[str, Any]]:
+    def similar(self, asset_id: int, limit: int) -> dict[str, Any]:
         with self._lock:
             matches = np.flatnonzero(self._ids == asset_id)
             if not len(matches):
                 raise RequestError("Fotka ešte nie je zaindexovaná")
             scores = self._matrix @ self._matrix[int(matches[0])]
             scores[int(matches[0])] = -2.0
-            count = min(limit, max(0, len(self._ids) - 1))
-            values, positions = self.torch.topk(scores, count)
-            return [{"asset_id": int(self._ids[int(i)]), "score": float(s)} for s, i in zip(values.cpu().tolist(), positions.cpu().tolist())]
+            probs = self.torch.sigmoid(self._logit_scale * scores.float() + self._logit_bias)
+            values, positions = self.torch.topk(scores, min(limit, max(0, len(self._ids) - 1)))
+            result = [{"asset_id": int(self._ids[int(i)]), "score": float(s), "prob": float(probs[int(i)].item())}
+                      for s, i in zip(values.cpu().tolist(), positions.cpu().tolist()) if float(s) >= SIMILARITY_COSINE_FLOOR]
+            return {"results": result, "searched": len(self._ids)}
 
 
 class AIService:
     def __init__(self, db_path: str | os.PathLike[str], model_dir: str | os.PathLike[str], *,
                  embedder_factory: Callable[[str | os.PathLike[str]], Any] | None = None,
                  decoder: Callable[[dict[str, Any]], Any] = decode_photo,
-                 output: Callable[[dict[str, Any]], None] | None = None):
+                 output: Callable[[dict[str, Any]], None] | None = None,
+                 seed_colors: str | os.PathLike[str] | None = None):
         self.db_path = str(db_path)
         self.model_dir = str(model_dir)
         self.model_name = MODEL_NAME
@@ -186,6 +290,7 @@ class AIService:
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS embeddings(asset_id INTEGER PRIMARY KEY, model TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS failures(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, error TEXT NOT NULL, at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS colors(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, shares TEXT NOT NULL, auto TEXT NOT NULL, version INTEGER NOT NULL);
         """)
         self.db_lock = threading.RLock()
         meta = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
@@ -194,6 +299,12 @@ class AIService:
             self.db.execute("DELETE FROM failures")
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('model',?)", (self.model_name,))
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version',?)", (SCHEMA_VERSION,))
+        color_meta = meta.get("color_thresholds")
+        if color_meta:
+            self.color_thresholds = json.loads(color_meta)
+        else:
+            self.color_thresholds = self._seed_color_thresholds(seed_colors)
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('color_thresholds',?)", (json.dumps(self.color_thresholds, ensure_ascii=False),))
         self.db.commit()
         self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
         self._condition = threading.Condition()
@@ -215,6 +326,29 @@ class AIService:
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
+
+    def _seed_color_thresholds(self, seed_dir: str | os.PathLike[str] | None) -> dict[str, dict[str, float | int]]:
+        previous = {}
+        root = Path(seed_dir) if seed_dir else None
+        if root:
+            try:
+                data = json.loads((root / "color_thresholds.json").read_text(encoding="utf-8"))
+                previous = {color: data[color] for color in COLOR_PALETTE if isinstance(data.get(color), dict)}
+            except (OSError, ValueError, TypeError):
+                previous = {}
+        if previous:
+            return {color: {"default": COLOR_DEFAULTS[color], "threshold": float(previous.get(color, {}).get("threshold", COLOR_DEFAULTS[color])),
+                            "examples": int(previous.get(color, {}).get("examples", 0)), "positive": int(previous.get(color, {}).get("positive", 0)),
+                            "negative": int(previous.get(color, {}).get("negative", 0))} for color in COLOR_PALETTE}
+        if root:
+            try:
+                corrections = json.loads((root / "color_corrections.json").read_text(encoding="utf-8"))
+                samples = {color: [(float(row.get("shares", {}).get(color, 0)), color in row.get("colors", []))
+                                   for row in corrections.values() if isinstance(row, dict)] for color in COLOR_PALETTE}
+                return learn_thresholds(samples)
+            except (OSError, ValueError, TypeError, AttributeError):
+                pass
+        return learn_thresholds({})
 
     def _emit(self, obj: dict[str, Any]) -> None:
         try:
@@ -321,20 +455,25 @@ class AIService:
                     marks = ",".join("?" for _ in remove)
                     self.db.execute(f"DELETE FROM embeddings WHERE asset_id IN ({marks})", tuple(remove))
                     self.db.execute(f"DELETE FROM failures WHERE asset_id IN ({marks})", tuple(remove))
+                    self.db.execute(f"DELETE FROM colors WHERE asset_id IN ({marks})", tuple(remove))
                 self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
             old = {int(a): (str(m), int(s), int(t)) for a, m, s, t in self.db.execute("SELECT asset_id,model,size,mtime_ns FROM embeddings")}
             failed_old = {int(a): (int(s), int(t)) for a, s, t in self.db.execute("SELECT asset_id,size,mtime_ns FROM failures")}
+            color_old = {int(a): (int(s), int(t), int(v)) for a, s, t, v in self.db.execute("SELECT asset_id,size,mtime_ns,version FROM colors")}
             queued, upto, failed_before = [], 0, 0
             for item in items:
                 aid, size, mtime = item["asset_id"], item["size"], item["mtime_ns"]
                 if old.get(aid) == (self.model_name, size, mtime):
                     upto += 1
+                    if color_old.get(aid) != (size, mtime, COLOR_VERSION):
+                        queued.append({**item, "colors_only": True})
                 elif failed_old.get(aid) == (size, mtime):
                     failed_before += 1
                 else:
-                    queued.append(item)
+                    queued.append({**item, "colors_only": False})
                     if aid in failed_old:
                         self.db.execute("DELETE FROM failures WHERE asset_id=?", (aid,))
+            queued.sort(key=lambda item: hashlib.sha256(str(item["asset_id"]).encode("ascii")).digest())
             self.db.commit()
         if removed and self._embedder is not None:
             self._embedder.remove_index(list(current - ids))
@@ -366,36 +505,37 @@ class AIService:
             pool.shutdown(wait=True)
 
     def _process_batch(self, batch: list[dict[str, Any]], generation: int, pool: concurrent.futures.ThreadPoolExecutor) -> None:
-        success, errors, offline = [], [], []
-        futures = {}
-        for item in batch:
-            if not os.path.isfile(item["path"]):
-                offline.append(item)
-            else:
-                futures[pool.submit(self.decoder, item)] = item
+        success, errors, offline, color_rows = [], [], [], []
+        futures = {pool.submit(self.decoder, item): item for item in batch if os.path.isfile(item["path"])}
+        offline.extend(item for item in batch if not os.path.isfile(item["path"]))
         decoded, decoded_items = [], []
         for future, item in futures.items():
             try:
-                decoded.append(future.result())
+                image = future.result()
+                decoded.append(image)
                 decoded_items.append(item)
+                shares = palette_counts(image)
+                color_rows.append((item, shares, dominant_colors(shares, {name: float(value["threshold"]) for name, value in self.color_thresholds.items()})))
             except Exception as exc:
                 if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) in {21, 53, 67, 1167}:
                     offline.append(item)
                 else:
                     errors.append((item, f"{type(exc).__name__}: {exc}"))
-        vectors = np.empty((0, DIMENSION), dtype=np.float32)
-        if decoded:
+        embed_positions = [index for index, item in enumerate(decoded_items) if not item.get("colors_only")]
+        embed_images = [decoded[index] for index in embed_positions]
+        embed_items = [decoded_items[index] for index in embed_positions]
+        if embed_images:
             try:
-                vectors = np.asarray(self._embedder.encode_images(decoded), dtype=np.float32)
+                vectors = np.asarray(self._embedder.encode_images(embed_images), dtype=np.float32)
                 if vectors.ndim == 1:
                     vectors = vectors.reshape(1, -1)
-                if vectors.shape != (len(decoded), DIMENSION):
+                if vectors.shape != (len(embed_images), DIMENSION):
                     raise ValueError(f"Model vrátil embeddingy s rozmerom {vectors.shape}")
                 norms = np.linalg.norm(vectors, axis=1, keepdims=True)
                 vectors = vectors / np.maximum(norms, 1e-12)
-                success = list(zip(decoded_items, vectors))
+                success = list(zip(embed_items, vectors))
             except Exception as exc:
-                errors.extend((item, f"{type(exc).__name__}: {exc}") for item in decoded_items)
+                errors.extend((item, f"{type(exc).__name__}: {exc}") for item in embed_items)
         new_indexed_count = self.indexed_count
         with self.db_lock:
             with self._condition:
@@ -405,6 +545,9 @@ class AIService:
                     self.db.execute("INSERT OR REPLACE INTO embeddings(asset_id,model,size,mtime_ns,dim,vector) VALUES(?,?,?,?,?,?)",
                                     (item["asset_id"], self.model_name, item["size"], item["mtime_ns"], DIMENSION, np.asarray(vector, dtype=np.float16).tobytes()))
                     self.db.execute("DELETE FROM failures WHERE asset_id=?", (item["asset_id"],))
+                for item, shares, auto in color_rows:
+                    self.db.execute("INSERT OR REPLACE INTO colors(asset_id,size,mtime_ns,shares,auto,version) VALUES(?,?,?,?,?,?)",
+                                    (item["asset_id"], item["size"], item["mtime_ns"], json.dumps(shares, ensure_ascii=False), json.dumps(auto, ensure_ascii=False), COLOR_VERSION))
                 for item, error in errors:
                     self.db.execute("INSERT OR REPLACE INTO failures(asset_id,size,mtime_ns,error,at) VALUES(?,?,?,?,?)",
                                     (item["asset_id"], item["size"], item["mtime_ns"], error[:2000], time.time()))
@@ -419,7 +562,7 @@ class AIService:
         final = False
         with self._condition:
             if generation == self._generation:
-                self._done += len(success)
+                self._done += len(success) + sum(item.get("colors_only", False) for item, _, _ in color_rows)
                 self._failed += len(errors)
                 self._offline += len(offline)
                 self.indexed_count = new_indexed_count
@@ -444,6 +587,33 @@ class AIService:
             raise RequestError("Server sa vypína")
         return self._embedder
 
+    def _learn_colors(self, request: dict[str, Any]) -> dict[str, Any]:
+        corrections = request.get("corrections")
+        if not isinstance(corrections, list):
+            raise RequestError("corrections musí byť zoznam")
+        samples: dict[str, list[tuple[float, bool]]] = {color: [] for color in COLOR_PALETTE}
+        with self.db_lock:
+            for correction in corrections:
+                if not isinstance(correction, dict) or not isinstance(correction.get("asset_id"), int) or isinstance(correction.get("asset_id"), bool):
+                    raise RequestError("Každá oprava musí obsahovať asset_id")
+                color, state = correction.get("color"), correction.get("state")
+                if color not in COLOR_PALETTE or not isinstance(state, bool):
+                    raise RequestError("Oprava farby má neplatnú farbu alebo stav")
+                row = self.db.execute("SELECT shares FROM colors WHERE asset_id=?", (correction["asset_id"],)).fetchone()
+                if row is None:
+                    continue
+                shares = json.loads(row[0])
+                samples[color].append((float(shares.get(color, 0.0)), state))
+            self.color_thresholds = learn_thresholds(samples)
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('color_thresholds',?)", (json.dumps(self.color_thresholds, ensure_ascii=False),))
+            rows = self.db.execute("SELECT asset_id,shares FROM colors").fetchall()
+            for asset_id, shares_json in rows:
+                shares = json.loads(shares_json)
+                auto = dominant_colors(shares, {name: float(value["threshold"]) for name, value in self.color_thresholds.items()})
+                self.db.execute("UPDATE colors SET auto=? WHERE asset_id=?", (json.dumps(auto, ensure_ascii=False), asset_id))
+            self.db.commit()
+        return {"thresholds": self.color_thresholds, "examples": sum(len(values) for values in samples.values())}
+
     def execute(self, request: dict[str, Any]) -> dict[str, Any]:
         cmd = request.get("cmd")
         if cmd == "hello":
@@ -453,6 +623,8 @@ class AIService:
             return self.status()
         if cmd == "index":
             return self._index_command(request)
+        if cmd == "learn_colors":
+            return self._learn_colors(request)
         if cmd == "pause":
             with self._condition:
                 self._paused = True
@@ -550,6 +722,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DDreams local SigLIP2 JSON-lines server")
     parser.add_argument("--model", required=True, help="Lokálny priečinok modelu")
     parser.add_argument("--db", required=True, help="Cesta k databáze ai.sqlite")
+    parser.add_argument("--seed-colors", help="Priečinok learned s fotofarbnými korekciami")
     args = parser.parse_args(argv)
     os.environ["HF_HUB_OFFLINE"] = "1"
     try:
@@ -559,7 +732,7 @@ def _main(argv: list[str] | None = None) -> int:
     except (AttributeError, OSError):
         pass
     try:
-        AIService(args.db, args.model).serve()
+        AIService(args.db, args.model, seed_colors=args.seed_colors).serve()
         return 0
     except Exception as exc:
         _stderr(f"Fatálna chyba servera: {exc}")
