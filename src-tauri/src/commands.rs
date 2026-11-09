@@ -561,6 +561,10 @@ pub fn get_preview_source(state: State<'_, ThumbnailState>, asset_id: i64, epoch
 #[tauri::command]
 pub fn folder_exists(path:String)->bool{Path::new(path.trim()).is_dir()}
 
+/// Moves the selected files (with sidecars) to the Recycle Bin; undoable with Ctrl+Z.
+#[tauri::command]
+pub async fn delete_files(state:State<'_,FileManagerState>,asset_ids:Vec<i64>)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids)).await.map_err(|e|e.to_string())?}
+
 #[tauri::command]
 pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::folder_rules::FolderRule>,String>{writer.0.folder_rules()}
 

@@ -72,6 +72,25 @@ pub struct CategoryDeleteInfo { pub id: i64, pub name: String, pub assigned_file
 #[serde(rename_all = "camelCase")]
 pub struct ExclusionImpact { pub files: usize, pub with_categories: usize, pub with_keywords: usize, pub with_rating_label_tagged: usize, pub with_color_overrides: usize }
 
+/// Removes catalogue rows of `ids` (category/keyword/colour links, then the asset row) as journal
+/// events, so undo restores them exactly. Used by folder exclusion and by deleting files.
+fn remove_asset_rows(tx:&Transaction<'_>,ids:&[i64],events:&mut Vec<StoredItem>)->Result<(),String>{
+    for &id in ids {
+        if read_asset_values(tx,id)?.is_none() { continue; }
+        for (table,column) in [("asset_categories","category_id"),("asset_keywords","keyword_id")] {
+            let targets=tx.prepare(&format!("SELECT {column} FROM {table} WHERE asset_id=?1")).and_then(|mut s|s.query_map([id],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
+            for target in targets { let key=format!("{id}:{target}");apply_item(tx,table,&key,"__exists__",&SqlValue::Integer(0))?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(1),new_value:SqlValue::Integer(0)}); }
+        }
+        let has_overrides:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_color_overrides')",[],|r|r.get(0)).map_err(|e|e.to_string())?;
+        if has_overrides {
+            let colors=tx.prepare("SELECT color,state FROM asset_color_overrides WHERE asset_id=?1").and_then(|mut s|s.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
+            for (color,state) in colors { let key=format!("{id}:{color}");apply_item(tx,"asset_color_overrides",&key,"__exists__",&SqlValue::Null)?;events.push(StoredItem{table_name:"asset_color_overrides".into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(state),new_value:SqlValue::Null}); }
+        }
+        delete_row_snapshot(tx,events,"assets",id)?;
+    }
+    Ok(())
+}
+
 /// Catalogue asset ids whose file lies in `folder` or below (whole path components, case-insensitive).
 /// Matched in Rust: SQLite's lower() only folds ASCII (Ľudia ≠ ľudia) and LIKE would treat `_` as a wildcard.
 fn assets_under(conn:&rusqlite::Connection,folder:&str)->Result<Vec<i64>,String>{
@@ -167,15 +186,7 @@ impl CatalogWriter {
         if mode==Some("exclude") {
             removed=assets_under(&tx,&path)?;
             let mut events=Vec::new();
-            for &id in &removed {
-                for (table,column) in [("asset_categories","category_id"),("asset_keywords","keyword_id")] {
-                    let targets=tx.prepare(&format!("SELECT {column} FROM {table} WHERE asset_id=?1")).and_then(|mut s|s.query_map([id],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
-                    for target in targets { let key=format!("{id}:{target}");apply_item(&tx,table,&key,"__exists__",&SqlValue::Integer(0))?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(1),new_value:SqlValue::Integer(0)}); }
-                }
-                let colors=tx.prepare("SELECT color,state FROM asset_color_overrides WHERE asset_id=?1").and_then(|mut s|s.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
-                for (color,state) in colors { let key=format!("{id}:{color}");apply_item(&tx,"asset_color_overrides",&key,"__exists__",&SqlValue::Null)?;events.push(StoredItem{table_name:"asset_color_overrides".into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(state),new_value:SqlValue::Null}); }
-                delete_row_snapshot(&tx,&mut events,"assets",id)?;
-            }
+            remove_asset_rows(&tx,&removed,&mut events)?;
             let summary=format!("Vylúčené z katalógu: {path} ({} {})",removed.len(),slovak_count(removed.len(),"súbor","súbory","súborov"));
             record_stored_change(&tx,events,"exclude_folder",&summary)?;
         }
@@ -575,6 +586,18 @@ impl CatalogWriter {
         for folder_path in created_folders { let _=ensure_folder(&tx,folder_path,&mut paths,&mut roots,&mut events)?; }
         events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});
         let change_id=record_stored_change(&tx,events,action,summary)?;tx.commit().map_err(|e|e.to_string())?;Ok((change_id,remapped))
+    }
+
+    /// Files were moved to the Recycle Bin: remove their catalogue rows and store the file payload,
+    /// all in ONE change, so undo restores the files first and then the rows.
+    pub fn record_file_delete(&self, asset_ids:&[i64], summary:&str, undo_payload:&str)->Result<Option<i64>,String>{
+        self.require_write()?;
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let mut events=Vec::new();
+        remove_asset_rows(&tx,&asset_ids.iter().copied().filter(|id|*id>0).collect::<Vec<_>>(),&mut events)?;
+        events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});
+        let change_id=record_stored_change(&tx,events,"delete_files",summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(change_id)
     }
 
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
