@@ -55,6 +55,12 @@ if (-not (Test-Path -LiteralPath $SourceAiScript -PathType Leaf)) { throw "AI se
 $InstallAiScript = Join-Path $InstallAiDir 'ddreams_ai.py'
 Copy-Item -LiteralPath $SourceAiScript -Destination $InstallAiScript -Force
 Write-Output "Copied AI server: $InstallAiScript"
+# RAW preview plugin (LibRaw via rawpy); uses the Python runtime from modules\ai\ai.json.
+$SourceRawScript = Join-Path $RepoRoot 'raw\ddreams_raw.py'
+$InstallRawDir = Join-Path $ModulesDir 'raw'
+New-Item -ItemType Directory -Path $InstallRawDir -Force | Out-Null
+Copy-Item -LiteralPath $SourceRawScript -Destination (Join-Path $InstallRawDir 'ddreams_raw.py') -Force
+Write-Output "Copied RAW plugin: $(Join-Path $InstallRawDir 'ddreams_raw.py')"
 $AiConfig = Join-Path $InstallAiDir 'ai.json'
 if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf)) {
     [IO.File]::WriteAllText($AiConfig, '{"python": "G:\\Programovanie\\photosort\\.venv\\Scripts\\python.exe"}', [Text.UTF8Encoding]::new($false))

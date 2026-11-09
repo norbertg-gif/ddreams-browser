@@ -179,6 +179,58 @@ class ServerTests(unittest.TestCase):
         self.wait_idle()
         self.assertEqual(self.service.indexed_count, 1)
 
+    def test_append_preserves_queue_and_deduplicates(self):
+        first, second = self.make_file("append-one.jpg"), self.make_file("append-two.jpg")
+        self.service.execute({"cmd": "pause"})
+        self.index([first])
+        generation = self.service._generation
+        result = self.service.execute({"cmd": "index", "items": [first, second], "append": True})
+        self.assertEqual(result["queued"], 1)
+        self.assertEqual(self.service._generation, generation)
+        self.assertEqual({item["asset_id"] for item in self.service._queue}, {first["asset_id"], second["asset_id"]})
+        self.service.execute({"cmd": "resume"})
+        self.wait_idle()
+        self.assertEqual(self.service.indexed_count, 2)
+
+    def test_forget_drops_rows_index_and_queue(self):
+        first, second, third = self.make_file("forget-one.jpg"), self.make_file("forget-two.jpg"), self.make_file("forget-three.jpg")
+        self.index([first, second])
+        self.wait_idle()
+        self.service.execute({"cmd": "pause"})
+        self.service.execute({"cmd": "index", "items": [third], "append": True})
+        result = self.service.execute({"cmd": "forget", "asset_ids": [first["asset_id"], third["asset_id"]]})
+        self.assertEqual(result, {"forgotten": 1})
+        self.assertEqual(self.service.indexed_count, 1)
+        self.assertEqual(self.service._queue, [])
+        ids = [r["asset_id"] for r in self.service.execute({"cmd": "similar", "asset_id": second["asset_id"], "limit": 10})["results"]]
+        self.assertNotIn(first["asset_id"], ids)
+        with self.assertRaises(RequestError):
+            self.service.execute({"cmd": "forget", "asset_ids": "x"})
+
+    def test_append_rejects_prune_and_non_boolean(self):
+        with self.assertRaises(RequestError):
+            self.service.execute({"cmd": "index", "items": [], "append": True, "prune": True})
+        with self.assertRaises(RequestError):
+            self.service.execute({"cmd": "index", "items": [], "append": 1})
+
+    def test_append_keeps_inflight_batch(self):
+        first, second = self.make_file("inflight-east.jpg"), self.make_file("appended-west.jpg")
+        entered, release = threading.Event(), threading.Event()
+        def slow_decoder(item):
+            if item["asset_id"] == first["asset_id"]:
+                entered.set()
+                release.wait(5)
+            return item["path"]
+        self.service.decoder = slow_decoder
+        self.index([first])
+        try:
+            self.assertTrue(entered.wait(5))
+            self.service.execute({"cmd": "index", "items": [second], "append": True})
+        finally:
+            release.set()
+        self.wait_idle()
+        self.assertEqual(set(self.service._embedder.vectors), {first["asset_id"], second["asset_id"]})
+
     def test_failures_cached_until_metadata_changes_and_offline_retry(self):
         bad = self.make_file("bad.jpg")
         offline = {"asset_id": 987654321, "path": str(self.root / "missing.jpg"), "size": 4, "mtime_ns": 5}

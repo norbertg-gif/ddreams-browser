@@ -261,8 +261,12 @@ pub fn get_assets(
     listing: State<'_, ListingState>,
     formats: State<'_, FormatsState>,
     ai: State<'_, AiState>,
+    writer: State<'_, CatalogWriterState>,
     filter: AssetFilter,
 ) -> Result<db::AssetPage, String> {
+    // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
+    // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
+    if filter.kind == "folder" && filter.offset == 0 { let _ = auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter); }
     if filter.sort == "similarity" {
         let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
         let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
@@ -271,6 +275,15 @@ pub fn get_assets(
     }
     if filter.kind == "folder" { return listing.0.page(&filter); }
     db::assets_page(&state.0, &filter, &formats.0).map_err(|e| e.to_string())
+}
+fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
+    let (path,files)=listing.uncatalogued_files(filter)?;
+    if path.is_empty()||files.is_empty()||writer.effective_folder_mode(&path).as_deref()!=Some("include"){return Ok(0);}
+    let candidates=files.into_iter().filter(|a|matches!(formats.group(&a.ext),Some("image"|"raw"|"video"))).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name,ext:a.ext,size:a.size,file_modified:a.file_modified,path:file_path,folder_path})}).collect::<Vec<_>>();
+    if candidates.is_empty(){return Ok(0);}
+    let remaps=writer.catalog_listed_assets(&candidates)?;
+    if !remaps.is_empty(){let _=listing.invalidate_path(&path);ai.index_assets(&remaps.iter().map(|r|r.new_id).collect::<Vec<_>>());}
+    Ok(remaps.len())
 }
 #[tauri::command]
 pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) -> Result<(), String> {
@@ -543,4 +556,26 @@ pub fn get_formats(state: State<'_, FormatsState>) -> FormatTable { state.0.as_r
 #[tauri::command]
 pub fn get_preview_source(state: State<'_, ThumbnailState>, asset_id: i64, epoch: u64) -> Result<String, String> {
     state.0.render(asset_id, 0, epoch).map(|result| result.source).map_err(|e| format!("{e:?}"))
+}
+
+#[tauri::command]
+pub fn folder_exists(path:String)->bool{Path::new(path.trim()).is_dir()}
+
+#[tauri::command]
+pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::folder_rules::FolderRule>,String>{writer.0.folder_rules()}
+
+#[tauri::command]
+pub fn get_folder_rule_state(writer:State<'_,CatalogWriterState>,path:String)->Result<crate::folder_rules::FolderRuleState,String>{writer.0.folder_rule_state(&path)}
+
+#[tauri::command]
+pub fn get_exclusion_impact(writer:State<'_,CatalogWriterState>,path:String)->Result<crate::journal::ExclusionImpact,String>{writer.0.exclusion_impact(&path)}
+
+/// mode: "include" | "exclude" | null (remove the explicit rule). Excluding removes the folder's catalogue rows (undoable).
+#[tauri::command]
+pub fn set_folder_rule(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,listing:State<'_,ListingState>,path:String,mode:Option<String>)->Result<usize,String>{
+    let removed=writer.0.set_folder_rule(&path,mode.as_deref())?;
+    let count=removed.len();
+    if count>0{ai.0.forget(removed);}
+    let _=listing.0.invalidate_path(&path);
+    Ok(count)
 }

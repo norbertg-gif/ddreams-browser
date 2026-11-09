@@ -8,6 +8,7 @@ mod display_metadata;
 mod exiftool;
 mod file_ops;
 mod formats;
+mod folder_rules;
 pub mod journal;
 mod listing;
 mod metadata_view;
@@ -44,7 +45,11 @@ pub fn run() {
     let display_metadata = display_metadata::DisplayMetadataCache::new(paths.cache.clone());
     let listing = listing::ListingService::new(db.clone(), formats.clone());
     let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
-    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone());
+    // RAW plugin lives next to the AI module (modules/raw or <repo>/raw) and uses the same Python runtime.
+    let raw_plugin = paths.ai_python.clone().zip(paths.ai_script.parent().and_then(|p| p.parent()).map(|p| p.join("raw").join("ddreams_raw.py")))
+        .filter(|(python, script)| python.is_file() && script.is_file())
+        .map(|(python, script)| thumbs::RawPluginConfig { python, script });
+    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone(), raw_plugin);
     let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone());
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
     let journal_ai=ai_service.clone();
@@ -171,6 +176,11 @@ pub fn run() {
             commands::get_assets,
             commands::get_formats,
             commands::get_preview_source,
+            commands::folder_exists,
+            commands::get_folder_rules,
+            commands::get_folder_rule_state,
+            commands::get_exclusion_impact,
+            commands::set_folder_rule,
             commands::refresh_folder_listing,
             commands::get_asset_paths,
             commands::asset_action,

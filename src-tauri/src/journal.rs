@@ -68,6 +68,18 @@ pub struct CategoryMutationResult { pub change_id: Option<i64>, pub summary: Str
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CategoryDeleteInfo { pub id: i64, pub name: String, pub assigned_files: usize, pub subcategories: usize }
+#[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionImpact { pub files: usize, pub with_categories: usize, pub with_keywords: usize, pub with_rating_label_tagged: usize, pub with_color_overrides: usize }
+
+/// Catalogue asset ids whose file lies in `folder` or below (whole path components, case-insensitive).
+/// Matched in Rust: SQLite's lower() only folds ASCII (Ľudia ≠ ľudia) and LIKE would treat `_` as a wildcard.
+fn assets_under(conn:&rusqlite::Connection,folder:&str)->Result<Vec<i64>,String>{
+    let prefix=normalize_fs_path(folder)+"\\";
+    let mut stmt=conn.prepare("SELECT id,path FROM assets WHERE path IS NOT NULL ORDER BY id").map_err(|e|e.to_string())?;
+    let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    Ok(rows.into_iter().filter(|(_,path)|normalize_fs_path(path).starts_with(&prefix)).map(|(id,_)|id).collect())
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,14 +98,94 @@ struct StoredItem { table_name: String, row_key: String, column_name: String, ol
 
 pub type ChangeHook = Arc<dyn Fn(&[String]) + Send + Sync>;
 static JOURNAL_CHANGE_HOOK: std::sync::OnceLock<Mutex<Option<ChangeHook>>> = std::sync::OnceLock::new();
-pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>> }
+pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>>, rules: crate::folder_rules::FolderRules }
 
 impl CatalogWriter {
-    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None) } }
+    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None), rules: crate::folder_rules::FolderRules::default() } }
     pub fn set_change_hook(&self, hook: ChangeHook) { *self.change_hook.lock().unwrap() = Some(hook.clone()); *JOURNAL_CHANGE_HOOK.get_or_init(||Mutex::new(None)).lock().unwrap()=Some(hook); }
     fn notify_change(&self, kinds:&[String]) { if !kinds.is_empty() { if let Some(hook)=self.change_hook.lock().unwrap().as_ref() { hook(kinds); } } }
     pub fn begin_change(&self, action: impl Into<String>, summary: impl Into<String>) -> ChangeBuilder {
         ChangeBuilder { action: action.into(), summary: summary.into(), items: Vec::new() }
+    }
+
+    pub fn folder_rules(&self) -> Result<Vec<crate::folder_rules::FolderRule>, String> { let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?; self.rules.list(&conn) }
+    pub fn folder_rule_state(&self, path:&str) -> Result<crate::folder_rules::FolderRuleState, String> { let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?; self.rules.state(&conn,path) }
+    /// Effective rule for a folder path: Some("include") / Some("exclude") / None (legacy, no rule).
+    pub fn effective_folder_mode(&self, path:&str) -> Option<String> { self.folder_rule_state(path).ok().and_then(|s|s.effective) }
+
+    /// Adds files found in an included folder to the catalogue as ONE journaled change (undoable).
+    /// Files already catalogued (by path) are skipped. Returns listing id → new catalogue id.
+    pub fn catalog_listed_assets(&self, listed:&[ListedAsset]) -> Result<Vec<AssetIdRemap>, String> {
+        self.require_write()?;
+        if listed.is_empty() { return Ok(Vec::new()); }
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;
+        let mut events=Vec::new();let mut remaps=Vec::new();
+        for candidate in listed {
+            if candidate.ext.trim().is_empty() || find_asset_by_path(&tx,&candidate.path)?.is_some() { continue; }
+            let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;
+            let id=next_id(&tx,"assets")?;
+            insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false})?;
+            push_insert_snapshot(&tx,&mut events,"assets",id)?;
+            remaps.push(AssetIdRemap{old_id:candidate.temporary_id,new_id:id});
+        }
+        if remaps.is_empty() { return Ok(remaps); }
+        let summary=format!("Pridané do katalógu: {} {}",remaps.len(),slovak_count(remaps.len(),"súbor","súbory","súborov"));
+        record_stored_change(&tx,events,"auto_catalog",&summary)?;
+        tx.commit().map_err(|e|e.to_string())?;
+        Ok(remaps)
+    }
+
+    /// How much catalogue data lives under `path` (shown before excluding the folder).
+    pub fn exclusion_impact(&self, path:&str) -> Result<ExclusionImpact, String> {
+        let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let ids=assets_under(&conn,path)?;
+        let mut impact=ExclusionImpact{files:ids.len(),..Default::default()};
+        for id in ids {
+            let has=|sql:&str|conn.query_row(sql,[id],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string());
+            if has("SELECT EXISTS(SELECT 1 FROM asset_categories WHERE asset_id=?1)")? {impact.with_categories+=1;}
+            if has("SELECT EXISTS(SELECT 1 FROM asset_keywords WHERE asset_id=?1)")? {impact.with_keywords+=1;}
+            if has("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND (coalesce(rating,0)<>0 OR coalesce(label,'')<>'' OR coalesce(tagged,0)<>0))")? {impact.with_rating_label_tagged+=1;}
+            if has("SELECT EXISTS(SELECT 1 FROM asset_color_overrides WHERE asset_id=?1)")? {impact.with_color_overrides+=1;}
+        }
+        Ok(impact)
+    }
+
+    /// Saves (or clears, `mode=None`) the rule for `path`. Excluding removes every catalogue row under the
+    /// folder (assets + category/keyword/colour links) as ONE journaled change, so Ctrl+Z restores it all;
+    /// the rule itself is configuration and stays. Returns the removed asset ids (for the AI index).
+    pub fn set_folder_rule(&self, path:&str, mode:Option<&str>) -> Result<Vec<i64>, String> {
+        self.require_write()?;
+        let path=path.trim().trim_end_matches(['\\','/']).replace('/',"\\");
+        if path.is_empty() { return Err("Cesta priečinka je prázdna".into()); }
+        if !matches!(mode,None|Some("include")|Some("exclude")) { return Err("Neplatné pravidlo priečinka".into()); }
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS ddreams_folder_rules(path TEXT PRIMARY KEY COLLATE NOCASE,mode TEXT NOT NULL CHECK(mode IN ('include','exclude')),created TEXT NOT NULL);").map_err(|e|e.to_string())?;
+        let mut removed=Vec::new();
+        if mode==Some("exclude") {
+            removed=assets_under(&tx,&path)?;
+            let mut events=Vec::new();
+            for &id in &removed {
+                for (table,column) in [("asset_categories","category_id"),("asset_keywords","keyword_id")] {
+                    let targets=tx.prepare(&format!("SELECT {column} FROM {table} WHERE asset_id=?1")).and_then(|mut s|s.query_map([id],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
+                    for target in targets { let key=format!("{id}:{target}");apply_item(&tx,table,&key,"__exists__",&SqlValue::Integer(0))?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(1),new_value:SqlValue::Integer(0)}); }
+                }
+                let colors=tx.prepare("SELECT color,state FROM asset_color_overrides WHERE asset_id=?1").and_then(|mut s|s.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
+                for (color,state) in colors { let key=format!("{id}:{color}");apply_item(&tx,"asset_color_overrides",&key,"__exists__",&SqlValue::Null)?;events.push(StoredItem{table_name:"asset_color_overrides".into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(state),new_value:SqlValue::Null}); }
+                delete_row_snapshot(&tx,&mut events,"assets",id)?;
+            }
+            let summary=format!("Vylúčené z katalógu: {path} ({} {})",removed.len(),slovak_count(removed.len(),"súbor","súbory","súborov"));
+            record_stored_change(&tx,events,"exclude_folder",&summary)?;
+        }
+        match mode {
+            Some(mode)=>{tx.execute("INSERT INTO ddreams_folder_rules(path,mode,created) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET mode=excluded.mode",(&path,mode,iso_now())).map_err(|e|e.to_string())?;}
+            None=>{tx.execute("DELETE FROM ddreams_folder_rules WHERE path=?1",[&path]).map_err(|e|e.to_string())?;}
+        }
+        tx.commit().map_err(|e|e.to_string())?;
+        self.rules.invalidate();
+        Ok(removed)
     }
 
     pub fn set_asset_colors(&self, asset_ids: &[i64], color: &str, state: Option<bool>, summary: &str) -> Result<usize, String> {
@@ -101,6 +193,7 @@ impl CatalogWriter {
         self.require_write()?;
         if !PALETTE.contains(&color) { return Err("Neznáma farba".into()); }
         let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        self.rules.guard(&conn,asset_ids,&[])?;
         let mut change=ChangeBuilder{action:"set_asset_colors".into(),summary:summary.into(),items:Vec::new()};
         let new_value=state.map(|value|Value::from(if value {1} else {0})).unwrap_or(Value::Null);
         let mut seen=std::collections::HashSet::new();
@@ -121,6 +214,7 @@ impl CatalogWriter {
         self.require_write()?;
         let mut change=ChangeBuilder{action:"import_photosort_colors".into(),summary:summary.into(),items:Vec::new()};
         let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        self.rules.guard(&conn,&rows.iter().map(|row|row.0).collect::<Vec<_>>(),&[])?;
         for (id,color,state) in rows {
             let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
             if !listed {continue;}
@@ -137,6 +231,8 @@ impl CatalogWriter {
         let kinds=resync_kinds_for_tables(change.items.iter().map(|item|item.table_name.as_str()));
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let guarded_ids=change.items.iter().filter_map(|item| match item.table_name.as_str() { "assets"|"asset_categories"|"asset_keywords"|"asset_color_overrides"=>item.row_key.split(':').next().and_then(|id|id.parse::<i64>().ok()), _=>None }).collect::<Vec<_>>();
+        self.rules.guard(&transaction,&guarded_ids,&[])?;
         let mut stored = Vec::with_capacity(change.items.len());
         for item in change.items {
             validate_item(&item.table_name, &item.column_name)?;
@@ -178,6 +274,7 @@ impl CatalogWriter {
 
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        self.rules.guard(&transaction,asset_ids,listed_assets)?;
         let mut folder_paths = load_folder_paths(&transaction)?;
         let mut folder_roots = load_folder_roots(&transaction)?;
         let mut events = Vec::<StoredItem>::new();
@@ -262,6 +359,7 @@ impl CatalogWriter {
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let category_path = category_path(&transaction, category_id)?;
+        self.rules.guard(&transaction,asset_ids,listed_assets)?;
         let mut folder_paths = load_folder_paths(&transaction)?;
         let mut folder_roots = load_folder_roots(&transaction)?;
         let mut events = Vec::<StoredItem>::new();
@@ -411,6 +509,7 @@ impl CatalogWriter {
         let candidates=listed_assets.iter().map(|asset|(asset.temporary_id,asset)).collect::<HashMap<_,_>>();
         let mut ids=asset_ids.to_vec();ids.sort_unstable();ids.dedup();if ids.is_empty(){return Err("Nie sú vybrané žiadne súbory".into());}
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        self.rules.guard(&tx,asset_ids,listed_assets)?;
         let name:String=tx.query_row("SELECT name FROM keywords WHERE id=?1",[keyword_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;
         let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;let mut events=Vec::new();let mut remapped_ids=Vec::new();let mut insertions=HashMap::<i64,(ListedAsset,i64)>::new();let mut targets=Vec::new();
         for requested in ids{let id=if requested<0{let Some(candidate)=candidates.get(&requested)else{continue};if candidate.ext.trim().is_empty(){continue;}if let Some(existing)=find_asset_by_path(&tx,&candidate.path)?{if existing!=requested{remapped_ids.push(AssetIdRemap{old_id:requested,new_id:existing});}existing}else if assign{let folder=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;let new_id=next_id(&tx,"assets")?;insertions.insert(new_id,((*candidate).clone(),folder));remapped_ids.push(AssetIdRemap{old_id:requested,new_id});new_id}else{continue}}else{requested};if insertions.contains_key(&id)||read_asset_values(&tx,id)?.is_some(){targets.push(id);}}
@@ -432,6 +531,7 @@ impl CatalogWriter {
     pub fn create_and_assign_keyword(&self,asset_ids:&[i64],listed_assets:&[ListedAsset],parent_id:Option<i64>,name:&str)->Result<SetAssetKeywordsResult,String>{
         self.require_write()?;let name=validated_keyword_name(name)?;let candidates=listed_assets.iter().map(|asset|(asset.temporary_id,asset)).collect::<HashMap<_,_>>();let mut ids=asset_ids.to_vec();ids.sort_unstable();ids.dedup();if ids.is_empty(){return Err("Nie sú vybrané žiadne súbory".into());}
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;if let Some(parent)=parent_id{if !keyword_exists(&tx,parent)?{return Err("Nadradené kľúčové slovo neexistuje".into());}}ensure_unique_keyword_name(&tx,parent_id,&name,None)?;
+        self.rules.guard(&tx,asset_ids,listed_assets)?;
         let keyword_id=next_id(&tx,"keywords")?;tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)",(keyword_id,parent_id,&name)).map_err(|e|e.to_string())?;let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"keywords",keyword_id)?;
         let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;let mut remapped_ids=Vec::new();let mut insertions=HashMap::<i64,(ListedAsset,i64)>::new();let mut targets=Vec::new();
         for requested in ids{let id=if requested<0{let Some(candidate)=candidates.get(&requested)else{continue};if candidate.ext.trim().is_empty(){continue;}if let Some(existing)=find_asset_by_path(&tx,&candidate.path)?{remapped_ids.push(AssetIdRemap{old_id:requested,new_id:existing});existing}else{let folder=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;let new_id=next_id(&tx,"assets")?;insertions.insert(new_id,((*candidate).clone(),folder));remapped_ids.push(AssetIdRemap{old_id:requested,new_id});new_id}}else{requested};if insertions.contains_key(&id)||read_asset_values(&tx,id)?.is_some(){targets.push(id);}}
@@ -939,6 +1039,63 @@ mod tests {
     }
 
     fn keyword_fixture()->Db{let db=write_fixture();db.lock().unwrap().execute_batch("CREATE TABLE keywords(id INTEGER PRIMARY KEY,name TEXT NOT NULL,parent_id INTEGER);INSERT INTO keywords VALUES(10,'Vianoce',NULL),(11,'Deti',10),(12,'Vnúčatá',11),(20,'Rodina',NULL);CREATE TABLE asset_keywords(asset_id INTEGER NOT NULL,keyword_id INTEGER NOT NULL,PRIMARY KEY(asset_id,keyword_id));INSERT INTO asset_keywords VALUES(1,10),(2,12);").unwrap();db}
+
+    fn scope_fixture()->Db{
+        let db=keyword_fixture();
+        db.lock().unwrap().execute_batch("CREATE TABLE asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL,PRIMARY KEY(asset_id,color));
+            INSERT INTO folders VALUES(3,1,1,'Ľudia','F:\\Ľudia');
+            INSERT INTO assets VALUES(3,3,'lily.jpg','jpg','jpg',1,9.0,10,10,24,NULL,NULL,NULL,5,0,NULL,NULL,NULL,NULL,NULL,0,'F:\\Ľudia\\lily.jpg');
+            INSERT INTO assets VALUES(4,2,'p_1%.jpg','jpg','jpg',1,9.0,10,10,24,NULL,NULL,NULL,NULL,0,NULL,NULL,NULL,NULL,NULL,0,'F:\\Photos_old\\p_1%.jpg');
+            INSERT INTO asset_categories VALUES(1,11),(3,11);INSERT INTO asset_color_overrides VALUES(1,'modrá',1),(3,'zelená',0);").unwrap();
+        db
+    }
+    fn dump(db:&Db)->Vec<String>{let conn=db.lock().unwrap();let mut out=Vec::new();for sql in ["SELECT id||':'||coalesce(path,'')||':'||coalesce(rating,'') FROM assets ORDER BY id","SELECT asset_id||':'||category_id FROM asset_categories ORDER BY 1","SELECT asset_id||':'||keyword_id FROM asset_keywords ORDER BY 1","SELECT asset_id||':'||color||':'||state FROM asset_color_overrides ORDER BY 1"]{let mut s=conn.prepare(sql).unwrap();out.extend(s.query_map([],|r|r.get::<_,String>(0)).unwrap().map(|r|r.unwrap()));}out}
+
+    #[test]
+    fn exclusion_removes_folder_rows_and_undo_restores_them(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);let before=dump(&db);
+        assert_eq!(writer.exclusion_impact("f:/photos/").unwrap(),ExclusionImpact{files:2,with_categories:1,with_keywords:2,with_rating_label_tagged:2,with_color_overrides:1});
+        let removed=writer.set_folder_rule("F:\\Photos",Some("exclude")).unwrap();
+        assert_eq!(removed,vec![1,2]);
+        let after=dump(&db);assert!(after.iter().all(|row|!row.starts_with("1:")&&!row.starts_with("2:")),"{after:?}");
+        assert!(after.contains(&"4:F:\\Photos_old\\p_1%.jpg:".to_string()),"component boundary: Photos_old must stay");
+        assert_eq!(writer.folder_rule_state("F:\\Photos\\sub").unwrap().effective.as_deref(),Some("exclude"));
+        assert!(writer.set_asset_values(&[3],&[],&serde_json::Map::from_iter([("rating".to_string(),serde_json::json!(3))])).is_ok());
+        writer.undo_last_with(|_|Ok(())).unwrap();
+        // undo of the rating change above, then of the exclusion
+        writer.undo_last_with(|_|Ok(())).unwrap();
+        assert_eq!(dump(&db),before);
+        assert_eq!(writer.folder_rules().unwrap().len(),1,"the rule is configuration and survives undo");
+    }
+
+    #[test]
+    fn exclusion_matches_non_ascii_paths(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        assert_eq!(writer.set_folder_rule("f:\\ľudia",Some("exclude")).unwrap(),vec![3]);
+    }
+
+    #[test]
+    fn auto_catalog_adds_listed_files_once_and_is_undoable(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let listed=|id:i64,name:&str|ListedAsset{temporary_id:id,name:name.into(),ext:"jpg".into(),size:Some(5.0),file_modified:None,path:format!("F:\\Inbox\\{name}"),folder_path:"F:\\Inbox".into()};
+        let remaps=writer.catalog_listed_assets(&[listed(-10,"a.jpg"),listed(-11,"b.jpg")]).unwrap();
+        assert_eq!(remaps.len(),2);
+        assert!(writer.catalog_listed_assets(&[listed(-12,"a.jpg")]).unwrap().is_empty(),"already catalogued by path");
+        let summary:String=db.lock().unwrap().query_row("SELECT summary FROM ddreams_changes ORDER BY id DESC LIMIT 1",[],|r|r.get(0)).unwrap();
+        assert_eq!(summary,"Pridané do katalógu: 2 súbory");
+        writer.undo_last_with(|_|Ok(())).unwrap();
+        let count:i64=db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE 'F:\\Inbox%'",[],|r|r.get(0)).unwrap();
+        assert_eq!(count,0);
+    }
+
+    #[test]
+    fn excluded_folder_refuses_catalogue_edits(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        writer.set_folder_rule("F:\\Ľudia",Some("include")).unwrap();
+        writer.set_folder_rule("F:\\Photos",Some("exclude")).unwrap();
+        let listed=ListedAsset{temporary_id:-5,name:"new.jpg".into(),ext:"jpg".into(),size:Some(1.0),file_modified:None,path:"F:\\Photos\\new.jpg".into(),folder_path:"F:\\Photos".into()};
+        assert_eq!(writer.set_asset_categories(&[-5],&[listed],11,true).unwrap_err(),"Priečinok je vylúčený z katalógu.");
+    }
 
     fn keyword_rows(db:&Db)->Vec<(i64,i64)>{let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT asset_id,keyword_id FROM asset_keywords ORDER BY asset_id,keyword_id").unwrap();stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()}
 

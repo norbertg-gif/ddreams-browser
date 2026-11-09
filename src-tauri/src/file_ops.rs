@@ -1,7 +1,8 @@
 use crate::{db::Db, journal::{AssetIdRemap, CatalogWriter, FileCatalogCopy, FileCatalogMove}, listing::ListingService};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, fs::{self, File, FileTimes, OpenOptions}, io, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, AtomicUsize, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashSet, fs::{self, File, FileTimes, OpenOptions}, io, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::{SystemTime, UNIX_EPOCH}};
+#[cfg(test)] use std::sync::atomic::AtomicI64;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

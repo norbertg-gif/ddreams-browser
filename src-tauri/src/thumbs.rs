@@ -27,9 +27,16 @@ pub trait PreviewSource: Send + Sync {
 
 pub struct PreviewChain { sources: Vec<Arc<dyn PreviewSource>> }
 impl PreviewChain {
-    pub fn new(exif: Arc<ExifTool>) -> Self {
-        Self { sources: vec![Arc::new(NativeSource), Arc::new(ExifToolSource { exif }), Arc::new(WindowsShellSource::new())] }
+    pub fn new(exif: Arc<ExifTool>, raw_plugin: Option<RawPluginConfig>) -> Self {
+        // LibRaw before the Windows shell: for RAW files without an embedded preview the shell often
+        // times out (8 s) or fails, while LibRaw renders a phone DNG in ~0.5-1.5 s.
+        let mut sources: Vec<Arc<dyn PreviewSource>> = vec![Arc::new(NativeSource), Arc::new(ExifToolSource { exif })];
+        if let Some(config) = raw_plugin { sources.push(Arc::new(LibRawSource::new(config))); }
+        sources.push(Arc::new(WindowsShellSource::new()));
+        Self { sources }
     }
+    /// Identifies which sources can produce previews; when it changes, cached "no preview" markers are stale.
+    fn signature(&self) -> String { self.sources.iter().map(|s| s.name()).collect::<Vec<_>>().join(",") }
     #[cfg(test)]
     pub fn with_sources(sources: Vec<Arc<dyn PreviewSource>>) -> Self { Self { sources } }
     pub fn preview(&self, request: &PreviewRequest, group: Option<&str>) -> Result<Preview, ThumbnailError> {
@@ -54,6 +61,79 @@ impl PreviewSource for ExifToolSource {
     fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> {
         let (bytes, orientation) = self.exif.largest_preview_with_orientation(&request.path).map_err(|_| Miss::Failed)?;
         decode_memory(&bytes, orientation).map_err(|_| Miss::Failed)
+    }
+}
+
+/// External RAW plugin (raw/ddreams_raw.py, LibRaw via rawpy) for RAW files without a usable embedded
+/// preview, e.g. phone DNGs or DxO/Topaz linear DNGs. One long-lived process, started on first use,
+/// JSON lines over stdin/stdout, requests answered concurrently and matched by id.
+#[derive(Clone, Debug)]
+pub struct RawPluginConfig { pub python: PathBuf, pub script: PathBuf }
+type RawReply = std::sync::mpsc::SyncSender<Result<Vec<u8>, String>>;
+struct RawProcess { child: std::process::Child, stdin: std::process::ChildStdin, pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, RawReply>>> }
+pub struct LibRawSource { config: RawPluginConfig, process: std::sync::Mutex<Option<RawProcess>>, next_id: AtomicU64 }
+impl LibRawSource {
+    pub fn new(config: RawPluginConfig) -> Self { Self { config, process: std::sync::Mutex::new(None), next_id: AtomicU64::new(1) } }
+    fn spawn(&self) -> Result<RawProcess, String> {
+        use std::io::BufRead;
+        let mut command = std::process::Command::new(&self.config.python);
+        command.arg("-I").arg(&self.config.script).env("PYTHONIOENCODING", "utf-8")
+            .stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::null());
+        #[cfg(windows)] { use std::os::windows::process::CommandExt; command.creation_flags(0x08000000); }
+        let mut child = command.spawn().map_err(|e| e.to_string())?;
+        let stdin = child.stdin.take().ok_or("RAW plugin has no stdin")?;
+        let stdout = child.stdout.take().ok_or("RAW plugin has no stdout")?;
+        let pending: Arc<std::sync::Mutex<std::collections::HashMap<u64, RawReply>>> = Default::default();
+        let readers = pending.clone();
+        std::thread::Builder::new().name("ddreams-raw-plugin".into()).spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+                let Some(id) = message.get("id").and_then(|v| v.as_u64()) else { continue };
+                let Some(reply) = readers.lock().ok().and_then(|mut p| p.remove(&id)) else { continue };
+                let result = if message.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+                    use base64::Engine;
+                    message.get("jpeg").and_then(|v| v.as_str()).ok_or_else(|| "RAW plugin returned no image".to_string())
+                        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).map_err(|e| e.to_string()))
+                } else { Err(message.get("error").and_then(|v| v.as_str()).unwrap_or("RAW plugin failed").to_string()) };
+                let _ = reply.send(result);
+            }
+            // Process gone: fail everything still waiting so callers don't hang until the timeout.
+            if let Ok(mut waiting) = readers.lock() { for (_, reply) in waiting.drain() { let _ = reply.send(Err("RAW plugin exited".into())); } }
+        }).map_err(|e| e.to_string())?;
+        Ok(RawProcess { child, stdin, pending })
+    }
+    fn render(&self, path: &Path, size: u32) -> Result<Vec<u8>, String> {
+        use std::io::Write;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let (reply, response) = std::sync::mpsc::sync_channel(1);
+        let pending = {
+            let mut process = self.process.lock().map_err(|_| "RAW plugin lock poisoned")?;
+            if process.as_mut().map(|p| !matches!(p.child.try_wait(), Ok(None))).unwrap_or(true) { *process = Some(self.spawn()?); }
+            let running = process.as_mut().ok_or("RAW plugin unavailable")?;
+            running.pending.lock().map_err(|_| "RAW plugin lock poisoned")?.insert(id, reply);
+            let line = serde_json::json!({ "id": id, "path": path.to_string_lossy(), "size": size }).to_string() + "\n";
+            if let Err(error) = running.stdin.write_all(line.as_bytes()).and_then(|_| running.stdin.flush()) {
+                let _ = running.child.kill(); *process = None; return Err(error.to_string());
+            }
+            running.pending.clone()
+        };
+        // Huge files (e.g. a 365 MB upscaled DNG) take ~20 s; the result is cached afterwards.
+        match response.recv_timeout(std::time::Duration::from_secs(90)) {
+            Ok(result) => result,
+            Err(_) => { if let Ok(mut p) = pending.lock() { p.remove(&id); } Err("RAW plugin timed out".into()) }
+        }
+    }
+}
+impl Drop for LibRawSource {
+    fn drop(&mut self) { if let Ok(mut process) = self.process.lock() { if let Some(mut p) = process.take() { let _ = p.child.kill(); } } }
+}
+impl PreviewSource for LibRawSource {
+    fn name(&self) -> &'static str { "LibRaw" }
+    fn supports(&self, group: Option<&str>) -> bool { group == Some("raw") }
+    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> {
+        let bytes = self.render(&request.path, request.size).map_err(|_| Miss::Failed)?;
+        decode_memory(&bytes, None).map_err(|_| Miss::Failed)
     }
 }
 
@@ -153,10 +233,11 @@ pub struct ThumbService { pub db: Db, pub listing: Arc<ListingService>, pub form
 #[derive(Clone, Debug)]
 pub struct RenderedPreview { pub bytes: Vec<u8>, pub source: String }
 impl ThumbService {
-    pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>, cache: PathBuf) -> Arc<Self> {
-        let chain=PreviewChain::new(exif.clone());
+    pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>, cache: PathBuf, raw_plugin: Option<RawPluginConfig>) -> Arc<Self> {
+        let chain=PreviewChain::new(exif.clone(), raw_plugin);
+        let signature=chain.signature();
         let service=Arc::new(Self{db,listing,formats,chain,cache:cache.clone(),epoch:AtomicU64::new(0),workers:Arc::new(Semaphore::new(4)),writes:[AtomicUsize::new(0),AtomicUsize::new(0)],evicting:[Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false))]});
-        std::thread::spawn(move || { let _=std::fs::create_dir_all(cache.join("thumbs")); let _=std::fs::create_dir_all(cache.join("viewer")); let _=cleanup_legacy_cache(&cache); let _=evict_cache(&cache.join("thumbs"),THUMBS_LIMIT); let _=evict_cache(&cache.join("viewer"),VIEWER_LIMIT); });
+        std::thread::spawn(move || { let _=std::fs::create_dir_all(cache.join("thumbs")); let _=std::fs::create_dir_all(cache.join("viewer")); let _=reset_misses_if_chain_changed(&cache,&signature); let _=cleanup_legacy_cache(&cache); let _=evict_cache(&cache.join("thumbs"),THUMBS_LIMIT); let _=evict_cache(&cache.join("viewer"),VIEWER_LIMIT); });
         service
     }
     pub fn set_epoch(&self, epoch:u64){self.epoch.fetch_max(epoch,Ordering::Relaxed);}
@@ -206,6 +287,14 @@ pub fn evict_cache(dir:&Path,limit:u64)->std::io::Result<()> {
     for entry in std::fs::read_dir(dir)?{let entry=entry?;let path=entry.path();let name=entry.file_name().to_string_lossy().into_owned();let Some((key,ext))=name.rsplit_once('.') else{continue};if ext=="tmp"{if entry.metadata()?.modified().ok().and_then(|t|now.duration_since(t).ok()).map(|age|age>std::time::Duration::from_secs(3600)).unwrap_or(false){let _=std::fs::remove_file(path);}continue}if !matches!(ext,"jpg"|"source"|"miss")||!is_hash(key){continue}let meta=entry.metadata()?;let group=groups.entry(key.into()).or_insert((0,meta.modified().unwrap_or(std::time::UNIX_EPOCH)));if ext=="jpg"{group.0=meta.len();group.1=meta.modified().unwrap_or(std::time::UNIX_EPOCH);}}
     let mut total:u64=groups.values().map(|v|v.0).sum();if total<=limit{return Ok(())}let target=limit*80/100;let mut ordered:Vec<_>=groups.into_iter().collect();ordered.sort_by_key(|(_,v)|v.1);for (key,(bytes,_)) in ordered{for ext in ["jpg","source","miss"]{let _=std::fs::remove_file(dir.join(format!("{key}.{ext}")));}total=total.saturating_sub(bytes);if total<=target{break}}Ok(())
 }
+/// `.miss` markers say "no source could preview this file". When the set of sources changes (e.g. the
+/// RAW plugin got installed), those verdicts are stale, so drop them once.
+pub fn reset_misses_if_chain_changed(cache:&Path,signature:&str)->std::io::Result<bool> {
+    let marker=cache.join("preview-chain.txt");
+    if std::fs::read_to_string(&marker).map(|s|s.trim()==signature).unwrap_or(false){return Ok(false)}
+    for dir in ["thumbs","viewer"]{let Ok(entries)=std::fs::read_dir(cache.join(dir)) else{continue};for entry in entries.flatten(){if entry.path().extension().is_some_and(|e|e=="miss"){let _=std::fs::remove_file(entry.path());}}}
+    std::fs::create_dir_all(cache)?;std::fs::write(marker,signature)?;Ok(true)
+}
 pub fn cleanup_legacy_cache(root:&Path)->std::io::Result<()> {for entry in std::fs::read_dir(root)?{let entry=entry?;if !entry.file_type()?.is_file(){continue}let name=entry.file_name().to_string_lossy().into_owned();if legacy_name(&name){let _=std::fs::remove_file(entry.path());}}Ok(())}
 fn is_hash(s:&str)->bool{s.len()==64&&s.bytes().all(|b|b.is_ascii_digit()||(b'a'..=b'f').contains(&b))}
 fn legacy_name(s:&str)->bool{let Some((stem,tail))=s.split_once('.')else{return false};if !is_hash(stem){return false}if matches!(tail,"jpg"|"source"|"miss"){return true}let parts:Vec<_>=tail.split('.').collect();parts.len()==3&&parts[2]=="tmp"&&!parts[0].is_empty()&&!parts[1].is_empty()&&parts[0].bytes().all(|b|b.is_ascii_digit())&&parts[1].bytes().all(|b|b.is_ascii_digit())}
@@ -254,6 +343,16 @@ mod tests {
     #[test] fn bucket_mapping_is_fixed(){assert_eq!([cache_bucket(0),cache_bucket(48),cache_bucket(160),cache_bucket(161),cache_bucket(320),cache_bucket(321),cache_bucket(1200)],[2048,160,160,320,320,480,480]);}
     #[test] fn eviction_removes_oldest_groups_to_eighty_percent(){let dir=temp_dir("evict");std::fs::create_dir_all(&dir).unwrap();let keys=["a".repeat(64),"b".repeat(64),"c".repeat(64)];for (key,age) in keys.iter().zip([300,200,100]){std::fs::write(dir.join(format!("{key}.jpg")),vec![0;10]).unwrap();std::fs::write(dir.join(format!("{key}.source")),b"x").unwrap();let time=std::time::SystemTime::now()-std::time::Duration::from_secs(age);std::fs::OpenOptions::new().write(true).open(dir.join(format!("{key}.jpg"))).unwrap().set_modified(time).unwrap();}evict_cache(&dir,25).unwrap();assert!(!dir.join(format!("{}.jpg",keys[0])).exists());assert!(!dir.join(format!("{}.source",keys[0])).exists());assert!(dir.join(format!("{}.jpg",keys[1])).exists());assert!(dir.join(format!("{}.jpg",keys[2])).exists());let _=std::fs::remove_dir_all(dir);}
     #[test] fn legacy_cleanup_only_removes_known_flat_cache_names(){let dir=temp_dir("legacy");std::fs::create_dir_all(dir.join("tile-exif")).unwrap();std::fs::write(dir.join(format!("{}.jpg","a".repeat(64))),b"").unwrap();std::fs::write(dir.join(format!("{}.12.3.tmp","b".repeat(64))),b"").unwrap();std::fs::write(dir.join("notes.txt"),b"").unwrap();cleanup_legacy_cache(&dir).unwrap();assert!(!dir.join(format!("{}.jpg","a".repeat(64))).exists());assert!(!dir.join(format!("{}.12.3.tmp","b".repeat(64))).exists());assert!(dir.join("notes.txt").exists());assert!(dir.join("tile-exif").is_dir());let _=std::fs::remove_dir_all(dir);}
+    #[test] fn changed_preview_chain_drops_stale_miss_markers_once(){
+        let dir=temp_dir("misses");std::fs::create_dir_all(dir.join("thumbs")).unwrap();std::fs::create_dir_all(dir.join("viewer")).unwrap();
+        let miss=dir.join("thumbs").join(format!("{}.miss","a".repeat(64)));let jpg=dir.join("thumbs").join(format!("{}.jpg","b".repeat(64)));
+        std::fs::write(&miss,b"").unwrap();std::fs::write(&jpg,b"x").unwrap();
+        assert!(reset_misses_if_chain_changed(&dir,"Native,ExifTool,LibRaw,WindowsShell").unwrap());
+        assert!(!miss.exists());assert!(jpg.exists());
+        std::fs::write(&miss,b"").unwrap();
+        assert!(!reset_misses_if_chain_changed(&dir,"Native,ExifTool,LibRaw,WindowsShell").unwrap(),"same chain: markers stay");
+        assert!(miss.exists());let _=std::fs::remove_dir_all(dir);
+    }
     fn temp_dir(label:&str)->PathBuf{std::env::temp_dir().join(format!("ddreams-{label}-{}-{}",std::process::id(),TEMP_TEST_ID.fetch_add(1,Ordering::Relaxed)))}
     static TEMP_TEST_ID:AtomicUsize=AtomicUsize::new(0);
 }

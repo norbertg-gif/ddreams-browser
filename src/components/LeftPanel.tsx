@@ -1,8 +1,9 @@
-import { useEffect, useRef, useState, type MutableRefObject } from "react";
+import { useContext, useEffect, useRef, useState, type MutableRefObject } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
 import type { Folder, View } from "../types";
 import CalendarPane from "./CalendarPane";
+import { FolderRulesContext, effectiveRule, useFolderRules, type FolderRuleAction } from "../folderRules";
 import Splitter from "./Splitter";
 import { readStored, writeStored } from "../storage";
 import { useSpringOpen } from "../hooks/useSpringOpen";
@@ -11,9 +12,10 @@ const shortcuts = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
-type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void };
+type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction };
 
-export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder }: Props) {
+export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule }: Props) {
+  const folderRules = useFolderRules();
   const [tab, setTab] = useState<"folders" | "calendar">("folders");
   const [shortcutsHeight, setShortcutsHeight] = useState<number | null>(() => readStored<number | null>("ddreams.shortcutsHeight", null));
   const shortcutsRef = useRef<HTMLElement | null>(null);
@@ -81,7 +83,7 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
   }, [activeFolderId, roots]);
 
   const activeSet = new Set([activeFolderId, ...activeFolderIds].filter((v): v is number => v != null));
-  return <aside className="left-pane" ref={paneRef}>
+  return <FolderRulesContext.Provider value={{ rules: folderRules, onRule: onFolderRule }}><aside className="left-pane" ref={paneRef}>
     <section className="shortcuts-pane" ref={shortcutsRef} style={shortcutsHeight == null ? undefined : { height: shortcutsHeight, flex: "none" }}><div className="pane-title">SKRATKY</div>{shortcuts.map(s => <button className="shortcut" key={s.path} onClick={() => void clickShortcut(s.path)}><span>▣</span><span><b>{s.name}</b><small>{s.path}</small></span></button>)}</section>
     <Splitter direction="y" value={() => shortcutsHeight ?? shortcutsRef.current?.offsetHeight ?? 120} min={36} max={Math.max(36, (paneRef.current?.offsetHeight ?? 600) - 160)} onChange={setShortcutsHeight} onReset={() => setShortcutsHeight(null)}/>
     <div className="left-tabs"><button className={tab === "folders" ? "active" : ""} onClick={() => setTab("folders")}>Priečinky</button><button className={tab === "calendar" ? "active" : ""} onClick={() => setTab("calendar")}>Kalendár</button></div>
@@ -89,18 +91,19 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
       {error && <div className="inline-error">{error}<button onClick={() => setError("")}>×</button></div>}
       {roots.map(folder => <FolderRow key={folder.id} folder={folder} depth={0} activeIds={activeSet} expanded={expanded} childrenMap={children} loading={loading.has(folder.id)} rowRefs={rowRefs} onToggle={toggle} onNavigate={navigate} onFileDrop={onFileDrop} onCreateFolder={onCreateFolder} />)}
     </div>}
-  </aside>;
+  </aside></FolderRulesContext.Provider>;
 }
 
 function FolderRow({ folder, depth, activeIds, expanded, childrenMap, loading, rowRefs, onToggle, onNavigate, onFileDrop, onCreateFolder }: { folder: Folder; depth: number; activeIds: Set<number>; expanded: Set<number>; childrenMap: Map<number, Folder[]>; loading: boolean; rowRefs: MutableRefObject<Map<number, HTMLDivElement>>; onToggle: (folder: Folder) => void; onNavigate: (folder: Folder) => void; onFileDrop?: (ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void }) {
   const open = expanded.has(folder.id); const nodes = childrenMap.get(folder.id) ?? []; const spring=useSpringOpen(open,true,()=>{void onToggle(folder)});
   const [dropTarget,setDropTarget]=useState(false); const [folderMenu,setFolderMenu]=useState<{x:number;y:number}|null>(null);
+  const { rules, onRule } = useContext(FolderRulesContext); const rule = effectiveRule(rules, folder.path); const explicit = rule && folder.path && rule.path.replace(/[\\/]+$/,"").toLocaleLowerCase("sk") === folder.path.replace(/[\\/]+$/,"").toLocaleLowerCase("sk") ? rule : null;
   return <div>
-    <div ref={el => { if (el) for (const id of folder.folderIds ?? [folder.id]) rowRefs.current.set(id, el); }} className={`tree-row folder-row ${dropTarget?"drop-target":""} ${(folder.folderIds ?? [folder.id]).some(id => activeIds.has(id)) ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 14 }} onDragEnter={spring.onDragEnter} onDragOver={e=>{spring.onDragOver(e);if(!e.dataTransfer.types.includes("application/x-ddreams-asset-ids"))return;e.preventDefault();e.dataTransfer.dropEffect=e.ctrlKey?"copy":"move";setDropTarget(true)}} onDragLeave={e=>{spring.onDragLeave(e);setDropTarget(false)}} onDrop={e=>{spring.onDrop();const raw=e.dataTransfer.getData("application/x-ddreams-asset-ids");if(!raw)return;e.preventDefault();e.stopPropagation();setDropTarget(false);try{const ids=JSON.parse(raw) as number[];if(ids.length&&folder.path)onFileDrop?.(ids,folder.path,e.ctrlKey)}catch{}}} onContextMenu={e=>{e.preventDefault();if(onCreateFolder&&folder.path)setFolderMenu({x:e.clientX,y:e.clientY})}}>
+    <div ref={el => { if (el) for (const id of folder.folderIds ?? [folder.id]) rowRefs.current.set(id, el); }} className={`tree-row folder-row ${dropTarget?"drop-target":""} ${(folder.folderIds ?? [folder.id]).some(id => activeIds.has(id)) ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 14 }} onDragEnter={spring.onDragEnter} onDragOver={e=>{spring.onDragOver(e);if(!e.dataTransfer.types.includes("application/x-ddreams-asset-ids"))return;e.preventDefault();e.dataTransfer.dropEffect=e.ctrlKey?"copy":"move";setDropTarget(true)}} onDragLeave={e=>{spring.onDragLeave(e);setDropTarget(false)}} onDrop={e=>{spring.onDrop();const raw=e.dataTransfer.getData("application/x-ddreams-asset-ids");if(!raw)return;e.preventDefault();e.stopPropagation();setDropTarget(false);try{const ids=JSON.parse(raw) as number[];if(ids.length&&folder.path)onFileDrop?.(ids,folder.path,e.ctrlKey)}catch{}}} onContextMenu={e=>{e.preventDefault();if((onCreateFolder||onRule)&&folder.path)setFolderMenu({x:e.clientX,y:e.clientY})}}>
       <button className="tree-toggle" aria-label={open ? "Zbaliť" : "Rozbaliť"} onClick={() => void onToggle(folder)}>{loading ? "·" : open ? "▾" : "▸"}</button>
-      <button className="tree-label" onClick={() => onNavigate(folder)} title={folder.path ?? folder.name}><span className="folder-icon">▰</span><span className="tree-text">{folder.name || "(bez názvu)"}</span><small>{folder.offline ? "OFFLINE" : depth === 0 ? folder.count || "" : ""}</small></button>
+      <button className="tree-label" onClick={() => onNavigate(folder)} title={folder.path ?? folder.name}><span className="folder-icon">▰</span><span className="tree-text">{folder.name || "(bez názvu)"}</span>{rule&&<span className={`folder-rule-mark ${rule.mode} ${explicit?"explicit":"inherited"}`} title={`${rule.mode==="include"?"Zahrnutý v katalógu":"Vylúčený z katalógu"}${explicit?"":` (podľa ${rule.path})`}`}>{rule.mode==="include"?"●":"⊘"}</span>}<small>{folder.offline ? "OFFLINE" : depth === 0 ? folder.count || "" : ""}</small></button>
     </div>
-    {folderMenu&&createPortal(<div className="category-context-menu" style={{left:Math.min(folderMenu.x,window.innerWidth-240),top:Math.min(folderMenu.y,window.innerHeight-80)}} onMouseLeave={()=>setFolderMenu(null)}><button onClick={()=>{setFolderMenu(null);if(folder.path)onCreateFolder?.(folder.path)}}>Nový priečinok…</button></div>,document.body)}
+    {folderMenu&&createPortal(<div className="category-context-menu" style={{left:Math.min(folderMenu.x,window.innerWidth-240),top:Math.min(folderMenu.y,window.innerHeight-140)}} onMouseLeave={()=>setFolderMenu(null)}>{onCreateFolder&&<button onClick={()=>{setFolderMenu(null);if(folder.path)onCreateFolder?.(folder.path)}}>Nový priečinok…</button>}{onRule&&folder.path&&<>{explicit?.mode!=="include"&&<button onClick={()=>{setFolderMenu(null);onRule(folder.path!,"include")}}>Zahrnúť do katalógu</button>}{explicit?.mode!=="exclude"&&<button onClick={()=>{setFolderMenu(null);onRule(folder.path!,"exclude")}}>Vylúčiť z katalógu…</button>}{explicit&&<button onClick={()=>{setFolderMenu(null);onRule(folder.path!,null)}}>Zrušiť pravidlo</button>}</>}</div>,document.body)}
     {open && nodes.map(child => <FolderRow key={child.id} folder={child} depth={depth + 1} activeIds={activeIds} expanded={expanded} childrenMap={childrenMap} loading={false} rowRefs={rowRefs} onToggle={onToggle} onNavigate={onNavigate} onFileDrop={onFileDrop} onCreateFolder={onCreateFolder} />)}
   </div>;
 }

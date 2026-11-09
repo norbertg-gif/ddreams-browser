@@ -397,6 +397,29 @@ impl AiService {
         drop(status);
         Ok(())
     }
+
+    /// Queues newly catalogued photos without touching the running queue (best effort: AI may be off).
+    pub fn index_assets(&self, asset_ids:&[i64]) {
+        if asset_ids.is_empty() { return; }
+        let extensions=self.0.formats.extensions(&["image","raw"]);
+        let rows={
+            let Ok(conn)=self.0.db.lock() else { return };
+            let mut out=Vec::new();
+            for id in asset_ids { if let Ok(Some((path,ext))) = conn.query_row("SELECT path,ext_lower FROM assets WHERE id=?1 AND is_listed=1 AND path IS NOT NULL",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional() { if extensions.iter().any(|e|e==&ext) { out.push((*id,path)); } } }
+            out
+        };
+        let items=rows.into_iter().filter_map(|(asset_id,path)|{let meta=fs::metadata(&path).ok()?;let mtime_ns=meta.modified().ok()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().min(i64::MAX as u128) as i64;Some(json!({"asset_id":asset_id,"path":path,"size":meta.len().min(i64::MAX as u64),"mtime_ns":mtime_ns}))}).collect::<Vec<_>>();
+        if items.is_empty() { return; }
+        let service=self.clone();
+        let _=thread::Builder::new().name("ai-index-new".into()).spawn(move||{let _=service.request("index",json!({"items":items,"append":true}),Duration::from_secs(60));});
+    }
+
+    /// Removes assets that left the catalogue from the AI index (best effort: AI may be off).
+    pub fn forget(&self, asset_ids:Vec<i64>) {
+        if asset_ids.is_empty() { return; }
+        let service=self.clone();
+        let _=thread::Builder::new().name("ai-forget".into()).spawn(move||{let _=service.request("forget",json!({"asset_ids":asset_ids}),Duration::from_secs(60));});
+    }
 }
 
 fn result_page(result: Value) -> Result<AiSearchResult, String> {

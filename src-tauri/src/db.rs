@@ -316,6 +316,8 @@ fn add_view_filters(where_sql: &mut String, args: &mut Vec<rusqlite::types::Valu
         Some("raw") => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["raw"]))),
         Some("video") => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["video"]))),
         Some("other") => where_sql.push_str(&format!(" AND {}", formats.sql_not_in("a.ext_lower", &["image", "raw", "video"]))),
+        // "media" = what the grid shows by default: photos, RAW and video; other files stay hidden.
+        Some("media") => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["image", "raw", "video"]))),
         _ => {}
     }
 }
@@ -348,6 +350,7 @@ pub fn asset_filter_matches(a: &Asset, f: &AssetFilter, formats: &FormatTable) -
         Some("raw") if group!=Some("raw") => false,
         Some("video") if group!=Some("video") => false,
         Some("other") if matches!(group,Some("image"|"raw"|"video")) => false,
+        Some("media") if !matches!(group,Some("image"|"raw"|"video")) => false,
         _ => true
     }
 }

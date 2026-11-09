@@ -498,14 +498,20 @@ class AIService:
     def _index_command(self, request: dict[str, Any]) -> dict[str, Any]:
         items = self._validate_items(request.get("items"))
         prune = request.get("prune", False)
+        append = request.get("append", False)
         if not isinstance(prune, bool):
             raise RequestError("prune musí byť true alebo false")
+        if not isinstance(append, bool):
+            raise RequestError("append musí byť true alebo false")
+        if append and prune:
+            raise RequestError("append a prune nemožno použiť súčasne")
         ids = {item["asset_id"] for item in items}
-        with self._condition:
-            self._generation += 1
-            generation = self._generation
-            self._queue = []
-            self._condition.notify_all()
+        if not append:
+            with self._condition:
+                self._generation += 1
+                generation = self._generation
+                self._queue = []
+                self._condition.notify_all()
         with self.db_lock:
             removed = 0
             if prune:
@@ -539,14 +545,49 @@ class AIService:
         if removed and self._embedder is not None:
             self._embedder.remove_index(list(current - ids))
         with self._condition:
-            self._generation = generation
-            self._queue = queued
-            self._done = self._failed = self._offline = 0
-            self._total = len(queued)
-            self._started_at = time.monotonic() if queued else None
-            self._last_error = None
+            if append:
+                queued_ids = {item["asset_id"] for item in self._queue}
+                queued = [item for item in queued if item["asset_id"] not in queued_ids]
+                self._queue.extend(queued)
+                self._total += len(queued)
+                if queued and self._started_at is None:
+                    self._started_at = time.monotonic()
+            else:
+                self._generation = generation
+                self._queue = queued
+                self._done = self._failed = self._offline = 0
+                self._total = len(queued)
+                self._started_at = time.monotonic() if queued else None
+                self._last_error = None
             self._condition.notify_all()
         return {"queued": len(queued), "up_to_date": upto, "failed_before": failed_before, "pruned": removed}
+
+    def _forget_command(self, request: dict[str, Any]) -> dict[str, Any]:
+        """Drop assets that left the catalogue (excluded folder): stored rows, search index and queue."""
+        asset_ids = request.get("asset_ids")
+        if not isinstance(asset_ids, list) or any(isinstance(a, bool) or not isinstance(a, int) for a in asset_ids):
+            raise RequestError("asset_ids musí byť zoznam ID")
+        forget = set(asset_ids)
+        if not forget:
+            return {"forgotten": 0}
+        with self.db_lock:
+            known = set()
+            for start in range(0, len(asset_ids), 500):
+                chunk = asset_ids[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                known |= {int(r[0]) for r in self.db.execute(f"SELECT asset_id FROM embeddings WHERE asset_id IN ({marks})", chunk)}
+                for table in ("embeddings", "failures", "colors"):
+                    self.db.execute(f"DELETE FROM {table} WHERE asset_id IN ({marks})", chunk)
+            self.db.commit()
+            self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
+        if known and self._embedder is not None:
+            self._embedder.remove_index(list(known))
+        with self._condition:
+            before = len(self._queue)
+            self._queue = [item for item in self._queue if item["asset_id"] not in forget]
+            self._total = max(0, self._total - (before - len(self._queue)))
+            self._condition.notify_all()
+        return {"forgotten": len(known)}
 
     def _index_loop(self) -> None:
         _set_background_priority()
@@ -991,6 +1032,8 @@ class AIService:
             return self.status()
         if cmd == "index":
             return self._index_command(request)
+        if cmd == "forget":
+            return self._forget_command(request)
         if cmd == "learn_colors":
             return self._learn_colors(request)
         if cmd == "set_labels":

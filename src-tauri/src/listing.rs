@@ -70,9 +70,13 @@ impl ListingService {
             if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
             return (rows, true);
         }};
-        let contexts = db::folder_disk_context(&self.db, folder_ids).unwrap_or_default();
         let parent_folder_id = db::folder_by_path(&self.db, path).ok().flatten().map(|folder| folder.id)
             .or_else(|| match folder_ids { [id] if *id > 0 => Some(*id), _ => None });
+        // Also match against the catalogue folder found by path: a folder catalogued just now (auto-catalogue
+        // of an included folder) isn't among the ids the UI sent with the request.
+        let mut context_ids = folder_ids.to_vec();
+        if let Some(id) = parent_folder_id { if !context_ids.contains(&id) { context_ids.push(id); } }
+        let contexts = db::folder_disk_context(&self.db, &context_ids).unwrap_or_default();
         let mut known = HashMap::<String, Asset>::new();
         for (_, catalog_path, assets) in contexts { if normalize(&catalog_path)==key { for asset in assets { known.insert(asset.name.to_lowercase(), asset); } } }
         let mut rows = Vec::with_capacity(disk.len());
@@ -105,7 +109,7 @@ impl ListingService {
         (rows, false)
     }
 
-    pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
+    fn folder_of_filter(&self, filter: &AssetFilter) -> Result<(String, Vec<i64>), String> {
         let mut path = filter.folder_path.clone().unwrap_or_default();
         if path.is_empty() {
             let id = filter.id.unwrap_or(-1);
@@ -114,6 +118,18 @@ impl ListingService {
             } else if let Some(f) = db::folder_ancestors(&self.db, id).map_err(|e| e.to_string())?.last() { path = f.path.clone().unwrap_or_default(); }
         }
         let ids = filter.ids.clone().unwrap_or_else(|| filter.id.map(|id| match self.asset(id).filter(|a|a.is_directory) { Some(a)=>vec![a.folder_id.unwrap_or(id)],None=>vec![id] }).unwrap_or_default());
+        Ok((path, ids))
+    }
+
+    /// The folder's disk path and its files that are not in the catalogue yet (negative listing ids).
+    pub fn uncatalogued_files(&self, filter: &AssetFilter) -> Result<(String, Vec<Asset>), String> {
+        let (path, ids) = self.folder_of_filter(filter)?;
+        let (rows, _) = self.list(&path, &ids);
+        Ok((path, rows.into_iter().filter(|a| !a.is_directory && a.id < 0 && !a.ext.is_empty() && a.path.is_some()).collect()))
+    }
+
+    pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
+        let (path, ids) = self.folder_of_filter(filter)?;
         let (mut rows, _) = self.list(&path, &ids);
         rows.retain(|a| a.is_directory || (!a.ext.is_empty() && !self.formats.is_hidden(&a.ext)));
         if let Some(q) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) { let q=q.to_lowercase(); rows.retain(|a|a.is_directory||a.name.to_lowercase().contains(&q)||a.caption.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))||a.notes.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))); }
