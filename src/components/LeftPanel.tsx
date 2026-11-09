@@ -5,6 +5,7 @@ import type { Folder, View } from "../types";
 import CalendarPane from "./CalendarPane";
 import Splitter from "./Splitter";
 import { readStored, writeStored } from "../storage";
+import { useSpringOpen } from "../hooks/useSpringOpen";
 
 const shortcuts = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
@@ -92,10 +93,10 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
 }
 
 function FolderRow({ folder, depth, activeIds, expanded, childrenMap, loading, rowRefs, onToggle, onNavigate, onFileDrop, onCreateFolder }: { folder: Folder; depth: number; activeIds: Set<number>; expanded: Set<number>; childrenMap: Map<number, Folder[]>; loading: boolean; rowRefs: MutableRefObject<Map<number, HTMLDivElement>>; onToggle: (folder: Folder) => void; onNavigate: (folder: Folder) => void; onFileDrop?: (ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void }) {
-  const open = expanded.has(folder.id); const nodes = childrenMap.get(folder.id) ?? [];
-  const [dropTarget,setDropTarget]=useState(false); const [folderMenu,setFolderMenu]=useState<{x:number;y:number}|null>(null); const hoverTimer=useRef<number|null>(null);
+  const open = expanded.has(folder.id); const nodes = childrenMap.get(folder.id) ?? []; const spring=useSpringOpen(open,true,()=>{void onToggle(folder)});
+  const [dropTarget,setDropTarget]=useState(false); const [folderMenu,setFolderMenu]=useState<{x:number;y:number}|null>(null);
   return <div>
-    <div ref={el => { if (el) for (const id of folder.folderIds ?? [folder.id]) rowRefs.current.set(id, el); }} className={`tree-row folder-row ${dropTarget?"drop-target":""} ${(folder.folderIds ?? [folder.id]).some(id => activeIds.has(id)) ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 14 }} onDragOver={e=>{if(!e.dataTransfer.types.includes("application/x-ddreams-asset-ids"))return;e.preventDefault();e.dataTransfer.dropEffect=e.ctrlKey?"copy":"move";setDropTarget(true);if(!open&&hoverTimer.current==null)hoverTimer.current=window.setTimeout(()=>{hoverTimer.current=null;void onToggle(folder)},700)}} onDragLeave={()=>{setDropTarget(false);if(hoverTimer.current!=null){clearTimeout(hoverTimer.current);hoverTimer.current=null;}}} onDrop={e=>{const raw=e.dataTransfer.getData("application/x-ddreams-asset-ids");if(!raw)return;e.preventDefault();e.stopPropagation();setDropTarget(false);if(hoverTimer.current!=null)clearTimeout(hoverTimer.current);try{const ids=JSON.parse(raw) as number[];if(ids.length&&folder.path)onFileDrop?.(ids,folder.path,e.ctrlKey)}catch{}}} onContextMenu={e=>{e.preventDefault();if(onCreateFolder&&folder.path)setFolderMenu({x:e.clientX,y:e.clientY})}}>
+    <div ref={el => { if (el) for (const id of folder.folderIds ?? [folder.id]) rowRefs.current.set(id, el); }} className={`tree-row folder-row ${dropTarget?"drop-target":""} ${(folder.folderIds ?? [folder.id]).some(id => activeIds.has(id)) ? "active" : ""}`} style={{ paddingLeft: 8 + depth * 14 }} onDragEnter={spring.onDragEnter} onDragOver={e=>{spring.onDragOver(e);if(!e.dataTransfer.types.includes("application/x-ddreams-asset-ids"))return;e.preventDefault();e.dataTransfer.dropEffect=e.ctrlKey?"copy":"move";setDropTarget(true)}} onDragLeave={e=>{spring.onDragLeave(e);setDropTarget(false)}} onDrop={e=>{spring.onDrop();const raw=e.dataTransfer.getData("application/x-ddreams-asset-ids");if(!raw)return;e.preventDefault();e.stopPropagation();setDropTarget(false);try{const ids=JSON.parse(raw) as number[];if(ids.length&&folder.path)onFileDrop?.(ids,folder.path,e.ctrlKey)}catch{}}} onContextMenu={e=>{e.preventDefault();if(onCreateFolder&&folder.path)setFolderMenu({x:e.clientX,y:e.clientY})}}>
       <button className="tree-toggle" aria-label={open ? "Zbaliť" : "Rozbaliť"} onClick={() => void onToggle(folder)}>{loading ? "·" : open ? "▾" : "▸"}</button>
       <button className="tree-label" onClick={() => onNavigate(folder)} title={folder.path ?? folder.name}><span className="folder-icon">▰</span><span className="tree-text">{folder.name || "(bez názvu)"}</span><small>{folder.offline ? "OFFLINE" : depth === 0 ? folder.count || "" : ""}</small></button>
     </div>
