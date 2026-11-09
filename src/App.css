@@ -48,3 +48,13 @@
 .confirm-dialog{width:min(480px,calc(100vw - 36px));padding:16px;background:#24282e;border:1px solid #6a4b4b;border-radius:6px;box-shadow:0 12px 40px #000b;color:#dde3ea;display:grid;gap:8px;font-size:12px;line-height:1.45}.confirm-dialog p{margin:0}.confirm-path{color:#a9c0d8;word-break:break-all}
 .confirm-actions{display:flex;justify-content:flex-end;gap:8px;margin-top:4px}.confirm-actions button{border:1px solid #4a5563;border-radius:4px;padding:4px 12px;color:#d6dde5;background:#2c3440}.confirm-actions button.danger{background:#6b2f2f;border-color:#8a4343;color:#fff}
 .modal-backdrop{position:fixed;inset:0;z-index:1000;display:grid;place-items:center;background:#0009}
+/* Top-left tile badges sit in one row so the category mark and rating stars never overlap. */
+.tile-badges-left{position:absolute;left:4px;top:4px;display:flex;align-items:center;gap:3px;z-index:1}.tile-badges-left>.category-badge,.tile-badges-left>.rating-badge{position:static}
+/* Katalóg tab: editing block for the selected files (Properties stay read-only). */
+.catalog-editor{margin:0 0 10px;padding:8px 10px 10px;border:1px solid #39424d;border-radius:5px;background:#21262c;display:grid;gap:4px}
+.catalog-editor.empty{color:#8a939e;font-size:11px}
+.catalog-editor-title{font-weight:600;color:#dfe5ec;font-size:12px;margin-bottom:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.catalog-editor .editor-row{display:grid;grid-template-columns:96px 1fr;align-items:center;gap:8px;padding:2px 0;min-height:24px}
+.catalog-editor .editor-row>span{color:#9aa4af;font-size:11px}
+.catalog-editor .editor-row>b{font-weight:400;min-width:0}
+.catalog-editor .property-group{margin:4px 0 0}
