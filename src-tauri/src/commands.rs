@@ -278,6 +278,11 @@ pub fn get_assets(
     if filter.kind == "folder" { return listing.0.page(&filter); }
     db::assets_page(&state.0, &filter, &formats.0).map_err(|e| e.to_string())
 }
+
+#[tauri::command(async)]
+pub fn get_folder_previews(state: State<'_, DatabaseState>, formats: State<'_, FormatsState>, paths: Vec<String>) -> Result<std::collections::HashMap<String, Vec<db::FolderPreviewAsset>>, String> {
+    db::folder_previews(&state.0, &paths, &formats.0).map_err(|e| e.to_string())
+}
 fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
     let (path,files)=listing.uncatalogued_files(filter)?;
     if path.is_empty()||files.is_empty()||writer.effective_folder_mode(&path).as_deref()!=Some("include"){return Ok(0);}

@@ -171,6 +171,7 @@ pub fn run() {
             commands::search_keyword_options,
             commands::get_calendar_aggregate,
             commands::get_assets,
+            commands::get_folder_previews,
             commands::get_formats,
             commands::get_preview_source,
             commands::folder_exists,

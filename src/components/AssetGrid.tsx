@@ -6,6 +6,7 @@ import type { Asset, CatalogAssetMetadata, FormatTable, Page, View, ViewFilters 
 import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type ThumbnailInfoConfig } from "../thumbnailInfo";
 
 const PAGE_SIZE = 120;
+type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
 declare global { interface Window { __ddreamsShift?: boolean } }
 export function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes)) return "—";
@@ -59,6 +60,9 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const [itemsVersion, setItemsVersion] = useState(0);
   const [columns, setColumns] = useState(5);
   const [tileMetadata, setTileMetadata] = useState(new Map<number, import("../types").TileExifMetadata>());
+  const folderPreviewCache = useRef(new Map<string, FolderPreview[]>());
+  const folderPreviewGeneration = useRef(0);
+  const [folderPreviews, setFolderPreviews] = useState(new Map<string, FolderPreview[]>());
   const [rubber,setRubber]=useState<{x1:number;y1:number;x2:number;y2:number;add:boolean}|null>(null);
   const rubberRef=useRef<typeof rubber>(null);
   const wantsCategories = thumbnailInfo.fields.some(field => field.id === "categories");
@@ -90,6 +94,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   useEffect(() => {
     requestVersion.current++;
     cache.current.clear(); pages.current.clear(); setTotal(0); setItemsVersion(v => v + 1);
+    folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setTileMetadata(new Map());
     scrollRef.current?.scrollTo({ top: 0 });
     void fetchPage(0, requestVersion.current);
@@ -101,6 +106,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     refreshTokenRef.current = refreshToken;
     requestVersion.current++;
     pages.current.clear();
+    folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setItemsVersion(v => v + 1);
     const scroll = scrollRef.current;
     const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
@@ -123,6 +129,33 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     const end = Math.min(total, (virtualRows[virtualRows.length - 1].index + 1) * columns);
     for (let offset = Math.floor(start / PAGE_SIZE) * PAGE_SIZE; offset < end; offset += PAGE_SIZE) void fetchPage(offset, requestVersion.current);
   }, [virtualRows, columns, total, fetchPage, itemsVersion]);
+  useEffect(() => {
+    if (!virtualRows.length) return;
+    const generation = folderPreviewGeneration.current;
+    const start = virtualRows[0].index * columns;
+    const end = Math.min(total, (virtualRows[virtualRows.length - 1].index + 1) * columns);
+    const requested: string[] = [];
+    for (let index = start; index < end; index++) {
+      const asset = cache.current.get(index);
+      const path = asset?.isDirectory ? asset.path : undefined;
+      if (path && !folderPreviewCache.current.has(path) && !requested.includes(path)) requested.push(path);
+    }
+    if (!requested.length) return;
+    const timer = window.setTimeout(() => {
+      for (const path of requested) folderPreviewCache.current.set(path, []);
+      void invoke<Record<string, FolderPreview[]>>("get_folder_previews", { paths: requested }).then(result => {
+        if (generation !== folderPreviewGeneration.current) return;
+        const next = new Map(folderPreviews);
+        for (const path of requested) {
+          const previews = result[path] ?? [];
+          folderPreviewCache.current.set(path, previews);
+          next.set(path, previews);
+        }
+        setFolderPreviews(next);
+      }).catch(error => console.error("Náhľady priečinkov sa nepodarilo načítať", error));
+    }, 70);
+    return () => window.clearTimeout(timer);
+  }, [virtualRows, columns, total, itemsVersion, folderPreviews]);
 
   const visibleSignature = virtualRows.length ? `${virtualRows[0].index}:${virtualRows[virtualRows.length - 1].index}:${columns}:${itemsVersion}` : "";
   const exifFields = thumbnailInfo.fields.map(field => field.id).filter(field => EXIF_THUMBNAIL_FIELDS.has(field));
@@ -206,7 +239,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} groupNumber={view.groups?.[index]} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -214,7 +247,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; groupNumber?:number; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
+function AssetTile({ asset, folderPreviews, groupNumber, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; folderPreviews: FolderPreview[]; groupNumber?:number; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
   // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
   // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
   const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
@@ -278,7 +311,7 @@ function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, on
           else if (state === "offline") setOffline(true);
           else setBroken(true);
         } catch { setBroken(true); }
-      }} /> : <div className="file-placeholder"><span>{asset.isDirectory ? "📁" : offline || asset.offline ? "OFFLINE" : badge}</span>{(offline || asset.offline) && <small>Odpojené</small>}</div>}
+      }} /> : asset.isDirectory ? <div className="folder-tile"><div className="folder-tab"/><div className="folder-body">{folderPreviews.slice(0, 4).map(preview => <img key={preview.id} className="folder-preview" src={thumbUrl(preview, 160, tileEpoch)} loading="lazy" draggable={false} onError={event => { event.currentTarget.style.display = "none"; }} />)}</div></div> : <div className="file-placeholder"><span>{offline || asset.offline ? "OFFLINE" : badge}</span>{(offline || asset.offline) && <small>Odpojené</small>}</div>}
       {overlayMode>0&&!asset.isDirectory && <span className="type-badge" title={`Typ súboru: ${badge}`}>{badge}</span>}
       {overlayMode>0&&(asset.hasCategories||!!asset.rating)&&<span className="tile-badges-left">{asset.hasCategories&&<span className="category-badge" title="Zaradené v kategórii">◆</span>}{!!asset.rating&&<span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}</span>}
       {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
@@ -301,7 +334,7 @@ function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, on
     )}
   </div>;
 }
-export function thumbUrl(asset: Asset, size: number, epoch: number, retry = 0): string {
+export function thumbUrl(asset: Pick<Asset, "id" | "path" | "fileModified">, size: number, epoch: number, retry = 0): string {
   const url = new URL(convertFileSrc(asset.path ?? "", "thumb"));
   url.searchParams.set("id", String(asset.id));
   url.searchParams.set("s", String(size));

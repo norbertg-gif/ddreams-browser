@@ -104,6 +104,57 @@ pub struct AssetPage {
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct FolderPreviewAsset {
+    pub id: i64,
+    pub path: String,
+    pub file_modified: Option<String>,
+}
+
+fn normalized_catalog_path(path: &str) -> String {
+    path.trim_end_matches(['\\', '/']).replace('\\', "/").to_lowercase()
+}
+
+pub fn folder_previews(db: &Db, paths: &[String], formats: &FormatTable) -> rusqlite::Result<HashMap<String, Vec<FolderPreviewAsset>>> {
+    let mut result: HashMap<String, Vec<FolderPreviewAsset>> = paths.iter().cloned().map(|p| (p, Vec::new())).collect();
+    if result.is_empty() { return Ok(result); }
+    // The candidate list is a full scan of the catalogue (~250 ms on 90k files), so it is kept for a
+    // minute per database; previews are decoration and may lag behind catalogue changes that long.
+    type Candidates = Arc<Vec<(i64, String, Option<String>, String)>>;
+    static CACHE: Mutex<Option<(usize, std::time::Instant, Candidates)>> = Mutex::new(None);
+    let key = Arc::as_ptr(db) as usize;
+    let cached = CACHE.lock().unwrap().as_ref().filter(|(k, at, _)| *k == key && at.elapsed().as_secs() < 60).map(|(_, _, c)| c.clone());
+    let candidates: Candidates = match cached {
+        Some(c) => c,
+        None => {
+            let rows = {
+                let conn = db.lock().unwrap();
+                let visual_extensions = formats.sql_in("ext_lower", &["image", "raw"]);
+                let sql = format!("SELECT id,path,file_modified,ext FROM assets WHERE is_listed=1 AND path IS NOT NULL AND {visual_extensions} ORDER BY name COLLATE NOCASE");
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?)))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            let list: Candidates = Arc::new(rows.into_iter()
+                .filter(|(_, _, _, ext)| matches!(formats.group(ext), Some("image" | "raw")))
+                .map(|(id,path,file_modified,_)| { let key = normalized_catalog_path(&path); (id,path,file_modified,key) }).collect());
+            *CACHE.lock().unwrap() = Some((key, std::time::Instant::now(), list.clone()));
+            list
+        }
+    };
+    for requested in paths {
+        let folder = normalized_catalog_path(requested);
+        let direct = candidates.iter().filter(|(_, _, _, candidate)| candidate.rsplit_once('/').map(|(parent, _)| parent) == Some(folder.as_str())).take(4).collect::<Vec<_>>();
+        let selected = if direct.is_empty() {
+            let prefix = format!("{folder}/");
+            candidates.iter().filter(|(_, _, _, candidate)| candidate.starts_with(&prefix)).take(4).collect::<Vec<_>>()
+        } else { direct };
+        result.insert(requested.clone(), selected.into_iter().map(|(id,path,file_modified,_)| FolderPreviewAsset { id:*id, path:path.clone(), file_modified:file_modified.clone() }).collect());
+    }
+    Ok(result)
+}
+
+#[derive(Clone, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Folder {
     pub id: i64,
     pub parent_id: Option<i64>,
@@ -989,6 +1040,17 @@ mod feature_tests {
         let c=Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);CREATE TABLE categories(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);CREATE TABLE keywords(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER,PRIMARY KEY(asset_id,keyword_id));CREATE INDEX idx_asset_categories_category_asset ON asset_categories(category_id,asset_id);CREATE INDEX idx_asset_keywords_keyword_asset ON asset_keywords(keyword_id,asset_id);CREATE INDEX idx_categories_parent_id ON categories(parent_id);CREATE INDEX idx_keywords_parent_id ON keywords(parent_id);").unwrap();
         Arc::new(Mutex::new(c))
+    }
+    #[test]
+    fn folder_previews_use_direct_images_then_descendants() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,path,file_modified) VALUES (1,'one.jpg','jpg','jpg',1,'C:/photos/one.jpg','2025-01-01'),(2,'two.png','png','png',1,'C:/photos/empty/inner/two.png','2025-01-02'),(3,'clip.mp4','mp4','mp4',1,'C:/photos/clip.mp4',NULL),(4,'gone.jpg','jpg','jpg',0,'C:/photos/gone.jpg',NULL)").unwrap();
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let result = folder_previews(&db, &["C:\\photos".into(), "C:\\empty".into()], &formats).unwrap();
+        assert_eq!(result["C:\\photos"].iter().map(|a| a.id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(result["C:\\empty"].len(), 0);
+        let descendants = folder_previews(&db, &["C:\\photos\\empty".into()], &formats).unwrap();
+        assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
     #[test] fn special_items_use_listed_photos_and_relationships(){
