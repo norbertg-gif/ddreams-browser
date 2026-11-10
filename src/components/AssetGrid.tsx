@@ -191,14 +191,14 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   useEffect(()=>{if(!rubber)return;const timer=window.setInterval(()=>{const el=scrollRef.current,v=rubberRef.current;if(!el||!v)return;if(v.y2<30)el.scrollTop-=14;else if(v.y2>el.clientHeight-30)el.scrollTop+=14},24);return()=>window.clearInterval(timer)},[!!rubber]);
 
   return <div className="grid-shell">
-    <div className="asset-scroll" ref={scrollRef} tabIndex={0} onMouseDown={e=>{if((e.target as HTMLElement).closest(".asset-tile"))e.currentTarget.focus({preventScroll:true})}} onPointerDown={beginRubber} onPointerMove={moveRubber} onPointerUp={()=>void endRubber()} onPointerCancel={()=>void endRubber()} onWheel={e=>{if(e.ctrlKey){e.preventDefault();window.dispatchEvent(new CustomEvent("ddreams-zoom",{detail:e.deltaY>0?-8:8}))}}} onKeyDown={onKeyDown} onScroll={() => { window.dispatchEvent(new Event("ddreams-scroll"));const now=Date.now();if(now-scrollPulse.current>220){scrollPulse.current=now;onViewport();} }}>
+    <div className="asset-scroll" ref={scrollRef} tabIndex={0} onMouseDown={e=>{if((e.target as HTMLElement).closest(".asset-tile"))e.currentTarget.focus({preventScroll:true})}} onPointerDown={beginRubber} onPointerMove={moveRubber} onPointerUp={()=>void endRubber()} onPointerCancel={()=>void endRubber()} onWheel={e=>{if(e.ctrlKey){e.preventDefault();window.dispatchEvent(new CustomEvent("ddreams-zoom",{detail:e.deltaY>0?-8:8}))}}} onKeyDown={onKeyDown} onScroll={e => { window.dispatchEvent(new Event("ddreams-scroll"));const top=(e.currentTarget as HTMLElement).scrollTop,page=(e.currentTarget as HTMLElement).clientHeight;if(Math.abs(top-scrollPulse.current)>page*3){scrollPulse.current=top;onViewport();} }}>
       {rubber&&<div className="rubber-band" style={{left:Math.min(rubber.x1,rubber.x2),top:Math.min(rubber.y1,rubber.y2),width:Math.abs(rubber.x1-rubber.x2),height:Math.abs(rubber.y1-rubber.y2)}}/>}
       <div style={{ height: virtualizer.getTotalSize(), position: "relative", width: "100%" }}>
         {virtualRows.map(row => <div key={row.key} className="asset-row" style={{ position: "absolute", top: 0, transform: `translateY(${row.start}px)`, height: rowHeight, gridTemplateColumns: `repeat(${columns}, minmax(0, ${tileWidth}px))` } as CSSProperties}>
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={`${asset.id}:${epoch}`} asset={asset} groupNumber={view.groups?.[index]} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} onViewport={onViewport} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} groupNumber={view.groups?.[index]} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -206,7 +206,10 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, onViewport, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly }: { asset: Asset; groupNumber?:number; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onViewport: () => void; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean }) {
+function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly }: { asset: Asset; groupNumber?:number; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean }) {
+  // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
+  // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
+  const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
   const [broken, setBroken] = useState(false);
   const [offline, setOffline] = useState(false);
   const [retry, setRetry] = useState(0);
@@ -256,10 +259,11 @@ function AssetTile({ asset, groupNumber, size, epoch, selected, primary, cut, on
   return <div ref={tileRef} draggable={!asset.isDirectory} onDragStart={e=>{if(asset.isDirectory){e.preventDefault();return;}const ids=selected&&selectedIds.length?selectedIds:[asset.id];e.dataTransfer.setData("application/x-ddreams-asset-ids",JSON.stringify(ids));e.dataTransfer.effectAllowed="copyMove";const count=ids.length,noun=count===1?"súbor":count<=4?"súbory":"súborov",dragImage=document.createElement("div");dragImage.textContent=`${count} ${noun}`;Object.assign(dragImage.style,{position:"fixed",left:"-1000px",top:"-1000px",padding:"3px 8px",borderRadius:"10px",background:"#273644",color:"#d9dfe8",fontSize:"11px",lineHeight:"14px",border:"1px solid #465461",whiteSpace:"nowrap",pointerEvents:"none"});document.body.appendChild(dragImage);// Negative offsets place the image down and right of the cursor hotspot.
   e.dataTransfer.setDragImage(dragImage,-14,-14);window.setTimeout(()=>dragImage.remove(),0);}} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""} ${cut?"cut-pending":""} ${groupNumber!=null?`duplicate-group-${groupNumber%2}`:""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>{groupNumber!=null&&<span className="duplicate-group-badge">#{groupNumber}</span>}
     <div className="thumb-wrap" style={{ height: size }}>
-      {!asset.isDirectory && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, epoch, retry)} loading="lazy" draggable={false} onError={async () => {
+      {!asset.isDirectory && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, tileEpoch, retry)} loading="lazy" draggable={false} onError={async () => {
         try {
-          const state = await invoke<"ready" | "offline" | "stale" | "unavailable">("get_thumbnail_state", { assetId: asset.id, epoch });
-          if (state === "stale") { onViewport(); setRetry(v => v + 1); }
+          const current = latestEpoch.current;
+          const state = await invoke<"ready" | "offline" | "stale" | "unavailable">("get_thumbnail_state", { assetId: asset.id, epoch: current });
+          if (state === "stale" || (state === "ready" && retry < 2)) { setTileEpoch(latestEpoch.current); setRetry(v => v + 1); }
           else if (state === "offline") setOffline(true);
           else setBroken(true);
         } catch { setBroken(true); }
@@ -292,6 +296,7 @@ export function thumbUrl(asset: Asset, size: number, epoch: number, retry = 0): 
   url.searchParams.set("s", String(size));
   url.searchParams.set("v", String(epoch));
   url.searchParams.set("r", String(retry));
+  if (asset.fileModified) url.searchParams.set("m", asset.fileModified);
   return url.toString();
 }
 export function labelText(label: string): string {

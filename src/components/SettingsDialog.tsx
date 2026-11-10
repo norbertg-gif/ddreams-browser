@@ -13,17 +13,34 @@ type Props = {
   onToggleAi: () => void;
 };
 
+type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
+
 /** Application settings. Sections grow as features arrive. */
 export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
+  const [backup, setBackup] = useState<BackupStatus | null>(null);
+  const [backupBusy, setBackupBusy] = useState(false);
+  const [backupDone, setBackupDone] = useState(false);
+  const [backupError, setBackupError] = useState("");
   const box = useRef<HTMLDivElement>(null);
   useEffect(() => {
     const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", key, true);
     return () => window.removeEventListener("keydown", key, true);
   }, [onClose]);
+  useEffect(() => { void invoke<BackupStatus>("get_backup_status").then(setBackup).catch(e => setBackupError(String(e))); }, []);
+  const backupNow = async () => {
+    setBackupBusy(true); setBackupDone(false); setBackupError("");
+    try { await invoke<string>("backup_catalog_now"); setBackup(await invoke<BackupStatus>("get_backup_status")); setBackupDone(true); window.setTimeout(() => setBackupDone(false), 1800); }
+    catch (e) { setBackupError(String(e)); } finally { setBackupBusy(false); }
+  };
+  const changeInterval = async (days: number) => {
+    setBackupError("");
+    try { await invoke("set_backup_interval_days", { days }); setBackup(await invoke<BackupStatus>("get_backup_status")); }
+    catch (e) { setBackupError(String(e)); }
+  };
   const add = async (mode: "include" | "exclude") => {
     const value = path.trim();
     if (!value) return;
@@ -48,6 +65,14 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
           <button onClick={() => void add("include")}>Zahrnúť</button><button onClick={() => void add("exclude")}>Vylúčiť</button>
         </div>
         {error && <small className="settings-error">{error}</small>}
+        <div className="backup-settings">
+          <b>Záloha katalógu</b>
+          <small>Posledná záloha: {backup?.lastBackupAt ? new Date(backup.lastBackupAt * 1000).toLocaleString("sk-SK") : "zatiaľ žiadna"} · {backup?.backupCount ?? 0} záloh</small>
+          <small className="backup-path" title={backup?.backupsDir}>{backup?.backupsDir ?? "Načítavam…"}</small>
+          <button disabled={backupBusy} onClick={() => void backupNow()}>{backupBusy ? "Zálohujem…" : backupDone ? "Záloha hotová" : "Zálohovať teraz"}</button>
+          <label>Pripomínať zálohu: <select value={backup?.intervalDays ?? 30} onChange={e => void changeInterval(Number(e.target.value))}><option value={30}>každý mesiac</option><option value={14}>každé 2 týždne</option><option value={7}>každý týždeň</option><option value={0}>nikdy</option></select></label>
+          {backupError && <small className="settings-error">{backupError}</small>}
+        </div>
       </section>
       <section className="settings-section">
         <h3>Zobrazenie</h3>

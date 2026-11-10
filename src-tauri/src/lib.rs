@@ -27,11 +27,8 @@ pub fn run() {
     let info = paths.info();
     eprintln!("DDreams paths: root={}, catalog={}, backups={}, cache={}, exiftool={}, formats={}, metadata_view={}, settings={}, portable={}, readonly={}", info.root, info.catalog, info.backups, info.cache, info.exiftool, info.formats, info.metadata_view, info.settings, info.portable, info.readonly);
     if let Err(error) = paths.ensure_runtime_dirs() { eprintln!("Warning: cannot create runtime directories: {error}"); }
-    match backup::create_startup_backup(&paths.catalog, &paths.backups) {
-        Ok(Some(path)) => eprintln!("Catalog backup created: {}", path.display()),
-        Ok(None) => eprintln!("Catalog backup skipped: unchanged within the last hour"),
-        Err(error) => eprintln!("Warning: catalog backup failed: {error}"),
-    }
+    // No backup at startup (it delayed the window by ~20 s): the app reminds about once a month and
+    // Settings has "Zálohovať teraz" (backup.rs, BackupReminder.tsx).
     let mut connection = open_catalog(&paths.catalog, paths.readonly).unwrap_or_else(|e| {
         panic!("Cannot open catalog at {}: {e}", paths.catalog.display())
     });
@@ -179,6 +176,10 @@ pub fn run() {
             commands::folder_exists,
             commands::delete_files,
             commands::get_delete_info,
+            backup::get_backup_status,
+            backup::backup_catalog_now,
+            backup::set_backup_interval_days,
+            backup::snooze_backup_reminder,
             commands::ai_duplicates_of,
             commands::get_folder_rules,
             commands::get_folder_rule_state,
