@@ -183,3 +183,4 @@ input[type=range]{accent-color:#b8b8b8}
 .thumb-wrap{overflow:visible}
 .type-badge{top:-9px;right:-6px}
 .asset-scroll:focus,.asset-scroll:focus-visible{outline:0}
+.value-row.active{background:#585858;color:#fff}.color-hint,.ai-no-suggestion{display:block;padding:2px 8px 4px;color:#8c8c8c;font-size:10px}

@@ -499,12 +499,16 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             args.push(filter.value.clone().unwrap_or_default().into());
         }
         "color" => {
-            let color=filter.value.as_deref().unwrap_or("");
-            if !crate::colors::PALETTE.iter().any(|entry|entry.value==color) { where_sql.push_str(" AND 0"); }
-            else if !ai_attached { where_sql.push_str(" AND EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1)");args.push(color.to_owned().into()); }
-            else {
-                where_sql.push_str(" AND (EXISTS(SELECT 1 FROM ai.colors c,json_each(c.auto) j WHERE c.asset_id=a.id AND j.value=? AND coalesce((SELECT o.state FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=?),1)=1) OR EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1))");
-                args.extend([color.to_owned().into(),color.to_owned().into(),color.to_owned().into()]);
+            // One colour or several separated by commas; a photo must contain all of them.
+            let colors:Vec<&str>=filter.value.as_deref().unwrap_or("").split(',').map(str::trim).filter(|c|!c.is_empty()).collect();
+            if colors.is_empty() { where_sql.push_str(" AND 0"); }
+            for color in colors {
+                if !crate::colors::PALETTE.iter().any(|entry|entry.value==color) { where_sql.push_str(" AND 0"); }
+                else if !ai_attached { where_sql.push_str(" AND EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1)");args.push(color.to_owned().into()); }
+                else {
+                    where_sql.push_str(" AND (EXISTS(SELECT 1 FROM ai.colors c,json_each(c.auto) j WHERE c.asset_id=a.id AND j.value=? AND coalesce((SELECT o.state FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=?),1)=1) OR EXISTS(SELECT 1 FROM asset_color_overrides o WHERE o.asset_id=a.id AND o.color=? AND o.state=1))");
+                    args.extend([color.to_owned().into(),color.to_owned().into(),color.to_owned().into()]);
+                }
             }
         }
         "special" => match filter.value.as_deref().unwrap_or("") {
