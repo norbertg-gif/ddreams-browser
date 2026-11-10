@@ -184,3 +184,14 @@ input[type=range]{accent-color:#b8b8b8}
 .type-badge{top:-9px;right:-6px}
 .asset-scroll:focus,.asset-scroll:focus-visible{outline:0}
 .value-row.active{background:#585858;color:#fff}.color-hint,.ai-no-suggestion{display:block;padding:2px 8px 4px;color:#8c8c8c;font-size:10px}
+.tile-context-menu{gap:0;padding:4px 0;background:#2b2b2b;border:1px solid #5a5a5a}
+.tile-context-menu>button,.tile-context-menu .write-menu-group>button{display:block;width:100%;padding:4px 14px;border-radius:0;color:#d6d6d6}
+.tile-context-menu button:hover:not(:disabled){background:#5a5a5a;color:#fff}
+.tile-context-menu .write-menu-row{padding:2px 14px}.tile-context-menu .write-menu-row button{border-radius:2px}
+.tile-context-menu .menu-danger:hover:not(:disabled){background:#7a3434;color:#fff}
+.settings-editors{display:grid;gap:4px;margin:6px 0}
+.settings-editor{display:grid;grid-template-columns:130px minmax(0,1fr) auto auto auto auto auto;gap:6px;align-items:center}
+.settings-editor .editor-name{height:22px;padding:0 5px;background:#1c1c1c;border:1px solid #454545;color:#e0e0e0}
+.settings-editor label{white-space:nowrap;color:#b0b0b0}
+.settings-editor button,.settings-add button{padding:2px 8px;border:1px solid #505050;border-radius:2px}
+.settings-editor button:hover:not(:disabled),.settings-add button:hover:not(:disabled){background:#4a4a4a}

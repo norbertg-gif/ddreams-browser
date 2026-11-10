@@ -315,6 +315,38 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
     }
     command.spawn().map(|_|()).map_err(|e|e.to_string())
 }
+/// Opens the given files in an external editor chosen in Settings. `multi` = the program takes all
+/// files in one launch; otherwise it is started once per file (at most 20).
+#[tauri::command(async)]
+pub fn open_in_editor(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, exe: String, multi: bool) -> Result<usize, String> {
+    let exe = exe.trim();
+    if !Path::new(exe).is_file() { return Err(format!("Program sa nenašiel: {exe}")); }
+    let paths: Vec<String> = asset_ids.into_iter()
+        .filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path)))
+        .filter(|p| Path::new(p).is_file()).collect();
+    if paths.is_empty() { return Err("Žiadny z vybraných súborov nie je dostupný".into()); }
+    if multi {
+        std::process::Command::new(exe).args(&paths).spawn().map_err(|e| e.to_string())?;
+    } else {
+        if paths.len() > 20 { return Err("Tento program berie súbory po jednom – vyber najviac 20 súborov".into()); }
+        for path in &paths { std::process::Command::new(exe).arg(path).spawn().map_err(|e| e.to_string())?; }
+    }
+    Ok(paths.len())
+}
+
+/// Windows file dialog for choosing an editor program. Returns None when cancelled.
+#[tauri::command(async)]
+pub fn pick_editor_program() -> Result<Option<String>, String> {
+    use std::os::windows::process::CommandExt;
+    let script = "Add-Type -AssemblyName System.Windows.Forms; $o=New-Object System.Windows.Forms.Form -Property @{TopMost=$true;ShowInTaskbar=$false;Opacity=0}; $d=New-Object System.Windows.Forms.OpenFileDialog; $d.Filter='Programy (*.exe)|*.exe'; $d.Title='Vyber program'; [Console]::OutputEncoding=[Text.Encoding]::UTF8; if($d.ShowDialog($o) -eq 'OK'){[Console]::Write($d.FileName)}";
+    let output = std::process::Command::new("powershell.exe").args(["-NoProfile", "-STA", "-Command", script]).creation_flags(0x0800_0000).output().map_err(|e| e.to_string())?;
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    Ok(if path.is_empty() { None } else { Some(path) })
+}
+
+#[tauri::command(async)]
+pub fn program_exists(path: String) -> bool { Path::new(path.trim()).is_file() }
+
 #[tauri::command(async)]
 pub fn get_asset_ids(
     state: State<'_, DatabaseState>,

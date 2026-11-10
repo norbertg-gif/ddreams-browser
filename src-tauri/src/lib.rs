@@ -188,7 +188,7 @@ pub fn run() {
             commands::set_folder_rule,
             commands::refresh_folder_listing,
             commands::get_asset_paths,
-            commands::asset_action,
+            commands::asset_action,commands::open_in_editor,commands::pick_editor_program,commands::program_exists,
             commands::get_asset_ids,
             commands::get_folder_children,
             commands::find_folder_path,

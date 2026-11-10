@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useFolderRules, type FolderRuleAction } from "../folderRules";
+import { saveEditors, useEditors, type Editor } from "../editors";
 
 type Props = {
   onClose: () => void;
@@ -27,6 +28,21 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
   const [backupDone, setBackupDone] = useState(false);
   const [backupError, setBackupError] = useState("");
   const box = useRef<HTMLDivElement>(null);
+  const editors = useEditors();
+  const [editorError, setEditorError] = useState("");
+  const [picking, setPicking] = useState(false);
+  const setEditor = (index: number, patch: Partial<Editor>) => saveEditors(editors.map((e, i) => i === index ? { ...e, ...patch } : e));
+  const moveEditor = (index: number, to: number) => { if (to < 0 || to >= editors.length) return; const next = [...editors]; const [item] = next.splice(index, 1); next.splice(to, 0, item); saveEditors(next); };
+  const addEditor = async () => {
+    setEditorError(""); setPicking(true);
+    try {
+      const path = await invoke<string | null>("pick_editor_program");
+      if (!path) return;
+      if (editors.some(e => e.path.toLowerCase() === path.toLowerCase())) { setEditorError("Tento program už v zozname je."); return; }
+      const name = (path.split(/[\\/]/).pop() ?? path).replace(/\.exe$/i, "");
+      saveEditors([...editors, { name, path, multi: true }]);
+    } catch (e) { setEditorError(String(e)); } finally { setPicking(false); }
+  };
   useEffect(() => {
     const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", key, true);
@@ -81,6 +97,22 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
         <label className="settings-check"><input type="checkbox" checked={showOtherFiles} onChange={e => onShowOtherFiles(e.target.checked)} /> Zobrazovať aj iné súbory než fotky a videá</label>
         <label className="settings-check ui-scale-setting">Veľkosť písma rozhrania: <select value={uiScale} onChange={e => onUiScale(Number(e.target.value))}><option value={1}>Malé (predvolené)</option><option value={1.1}>Stredné</option><option value={1.2}>Veľké</option></select></label>
         <p className="settings-help">Inak sú skryté (zip, log, pdf…). Dočasne ich ukážeš vo Filtroch voľbou „Typ: všetky súbory“.</p>
+      </section>
+      <section className="settings-section">
+        <h3>Externé editory</h3>
+        <p className="settings-help">Programy, v ktorých otvoríš fotky z kontextového menu. Prvý v zozname je predvolený.</p>
+        {editors.length === 0 ? <small className="settings-empty">Zatiaľ žiadny editor.</small> :
+          <div className="settings-editors">{editors.map((editor, index) => <div key={editor.path} className="settings-editor">
+            <input className="editor-name" value={editor.name} onChange={e => setEditor(index, { name: e.target.value })} title="Názov v menu" />
+            <span className="rule-path" title={editor.path}>{editor.path}</span>
+            <label title="Program otvorí všetky vybrané súbory naraz"><input type="checkbox" checked={editor.multi} onChange={e => setEditor(index, { multi: e.target.checked })} /> viac súborov</label>
+            <button disabled={index === 0} onClick={() => moveEditor(index, index - 1)} title="Vyššie">↑</button>
+            <button disabled={index === editors.length - 1} onClick={() => moveEditor(index, index + 1)} title="Nižšie">↓</button>
+            <button disabled={index === 0} onClick={() => moveEditor(index, 0)} title="Nastaviť ako predvolený">Predvolený</button>
+            <button onClick={() => saveEditors(editors.filter((_, i) => i !== index))} title="Odstrániť zo zoznamu">Odstrániť</button>
+          </div>)}</div>}
+        <div className="settings-add"><button disabled={picking} onClick={() => void addEditor()}>{picking ? "Vyberáš program…" : "Pridať program…"}</button></div>
+        {editorError && <small className="settings-error">{editorError}</small>}
       </section>
       <section className="settings-section">
         <h3>AI</h3>
