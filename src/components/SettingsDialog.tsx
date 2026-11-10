@@ -11,12 +11,14 @@ type Props = {
   aiAvailable: boolean;
   aiStatusText: string;
   onToggleAi: () => void;
+  uiScale: number;
+  onUiScale: (value: number) => void;
 };
 
 type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
 
 /** Application settings. Sections grow as features arrive. */
-export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi }: Props) {
+export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
@@ -77,6 +79,7 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
       <section className="settings-section">
         <h3>Zobrazenie</h3>
         <label className="settings-check"><input type="checkbox" checked={showOtherFiles} onChange={e => onShowOtherFiles(e.target.checked)} /> Zobrazovať aj iné súbory než fotky a videá</label>
+        <label className="settings-check ui-scale-setting">Veľkosť písma rozhrania: <select value={uiScale} onChange={e => onUiScale(Number(e.target.value))}><option value={1}>Malé (predvolené)</option><option value={1.1}>Stredné</option><option value={1.2}>Veľké</option></select></label>
         <p className="settings-help">Inak sú skryté (zip, log, pdf…). Dočasne ich ukážeš vo Filtroch voľbou „Typ: všetky súbory“.</p>
       </section>
       <section className="settings-section">
