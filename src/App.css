@@ -59,3 +59,5 @@
 .catalog-editor .editor-row>span{color:#9aa4af;font-size:11px}
 .catalog-editor .editor-row>b{font-weight:400;min-width:0}
 .catalog-editor .property-group{margin:4px 0 0}
+.dup-block{display:grid;gap:4px;margin:2px 0 8px}.dup-caption{color:#8f9aa6;font-size:10px;text-transform:uppercase;letter-spacing:.5px}
+.delete-warning{color:#f0a3a3;background:#3a2020;border:1px solid #6a3434;border-radius:4px;padding:6px 8px}

@@ -588,6 +588,20 @@ impl CatalogWriter {
         let change_id=record_stored_change(&tx,events,action,summary)?;tx.commit().map_err(|e|e.to_string())?;Ok((change_id,remapped))
     }
 
+    /// Permanently deleted files: drop their catalogue rows for good (no undo — the files are gone).
+    pub fn purge_assets(&self, asset_ids:&[i64])->Result<(),String>{
+        self.require_write()?;
+        if asset_ids.is_empty(){return Ok(());}
+        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
+        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        for table in ["asset_categories","asset_keywords","asset_color_overrides","ai_suggestion_rejections"]{
+            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0)).map_err(|e|e.to_string())?;
+            if exists{for id in asset_ids{tx.execute(&format!("DELETE FROM {table} WHERE asset_id=?1"),[id]).map_err(|e|e.to_string())?;}}
+        }
+        for id in asset_ids{tx.execute("DELETE FROM assets WHERE id=?1",[id]).map_err(|e|e.to_string())?;}
+        mark_catalog_modified(&tx)?;tx.commit().map_err(|e|e.to_string())?;Ok(())
+    }
+
     /// Files were moved to the Recycle Bin: remove their catalogue rows and store the file payload,
     /// all in ONE change, so undo restores the files first and then the rows.
     pub fn record_file_delete(&self, asset_ids:&[i64], summary:&str, undo_payload:&str)->Result<Option<i64>,String>{

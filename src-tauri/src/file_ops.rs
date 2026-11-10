@@ -10,6 +10,10 @@ pub enum ConflictPolicy { Skip, KeepBoth, Cancel }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DeleteInfo { pub count: usize, pub names: Vec<String>, pub sidecars: usize, pub permanent_count: usize, pub no_bin_drives: Vec<String> }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FileOperationResult { pub change_id: Option<i64>, pub summary: String, pub changed_count: usize, pub skipped_count: usize, pub remapped_ids: Vec<AssetIdRemap>, pub affected_ids: Vec<i64>, pub affected_folder_paths: Vec<String> }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -38,6 +42,8 @@ pub trait FileSystemOps: Send + Sync {
     fn recycle_files(&self, paths: &[PathBuf]) -> Result<(), String>;
     /// User-initiated delete: Recycle Bin only, refused where there is no Recycle Bin (USB/network).
     fn recycle_delete(&self, paths: &[PathBuf]) -> Result<(), String>;
+    /// Whether deleting from this path can go to the Recycle Bin (fixed local disk).
+    fn has_recycle_bin(&self, path: &Path) -> bool;
     /// The Recycle Bin item that holds `original`, if any (most recently deleted).
     fn recycled_item(&self, original: &Path) -> Option<PathBuf>;
     fn restore_recycled(&self, original: &Path) -> Result<(), String>;
@@ -68,6 +74,7 @@ impl FileSystemOps for NativeFileSystem {
         if let Some(left)=paths.iter().find(|p|p.exists()) { return Err(format!("Súbor sa nepodarilo presunúť do Koša: {}",left.display())); }
         Ok(())
     }
+    fn has_recycle_bin(&self,path:&Path)->bool { has_recycle_bin(path) }
     fn recycled_item(&self,original:&Path)->Option<PathBuf> { find_recycled(original).map(|(data,_)|data) }
     fn restore_recycled(&self,original:&Path)->Result<(),String> {
         let (data,info)=find_recycled(original).ok_or_else(||format!("Súbor nie je v Koši (Kôš bol možno vyprázdnený): {}",original.display()))?;
@@ -188,20 +195,51 @@ impl FileManager {
 
     /// Moves the selected files and their sidecars to the Recycle Bin and removes their catalogue rows,
     /// as one undoable change. Directories are skipped.
-    pub fn delete_files(&self,ids:&[i64])->Result<FileOperationResult,String>{
-        self.writable()?;
+    fn delete_sources(&self,ids:&[i64])->Result<(Vec<i64>,Vec<Source>),String>{
         let files_only=ids.iter().copied().filter(|id|!(*id<0&&self.listing.asset(*id).is_some_and(|a|a.is_directory))).collect::<Vec<_>>();
         if files_only.is_empty(){return Err("Priečinky sa týmto nemažú".into());}
         let sources=self.resolve_sources(&files_only)?;
         if sources.is_empty(){return Err("Nie sú vybrané žiadne súbory".into());}
-        let mut files=Vec::new();for source in &sources{for pair in sidecar_pairs(&source.path,&source.path)?{if !files.iter().any(|f:&PathBuf|path_eq(f,&pair.from)){files.push(pair.from);}}}
-        self.fs.recycle_delete(&files)?;
-        let payload=serde_json::to_string(&UndoPayload::Delete{files:files.clone()}).map_err(|e|e.to_string())?;
-        let count=sources.len();let summary=format!("Odstránené do Koša: {count} {}",if count==1{"súbor"}else if count<5{"súbory"}else{"súborov"});
-        let catalog_ids=sources.iter().filter(|s|s.id>0).map(|s|s.id).collect::<Vec<_>>();
-        let change_id=match self.writer.record_file_delete(&catalog_ids,&summary,&payload){Ok(id)=>id,Err(error)=>{let rollback=files.iter().try_for_each(|f|self.fs.restore_recycled(f));return Err(combine_error(error,rollback));}};
+        Ok((files_only,sources))
+    }
+    fn files_of(&self,source:&Source)->Result<Vec<PathBuf>,String>{Ok(sidecar_pairs(&source.path,&source.path)?.into_iter().map(|p|p.from).collect())}
+
+    /// What a delete would do, for the confirmation dialog: how many files go permanently (no Recycle
+    /// Bin on their drive, or `permanent` requested with Shift+Delete).
+    pub fn delete_info(&self,ids:&[i64],permanent:bool)->Result<DeleteInfo,String>{
+        let (_,sources)=self.delete_sources(ids)?;let mut sidecars=0usize;let mut permanent_count=0usize;let mut drives=Vec::<String>::new();
+        for source in &sources{sidecars+=self.files_of(source)?.len().saturating_sub(1);let bin=self.fs.has_recycle_bin(&source.path);if permanent||!bin{permanent_count+=1;}if !bin{let drive=volume_key(&source.path).to_uppercase();if !drives.contains(&drive){drives.push(drive);}}}
+        Ok(DeleteInfo{count:sources.len(),names:sources.iter().take(5).map(|s|s.name.clone()).collect(),sidecars,permanent_count,no_bin_drives:drives})
+    }
+
+    /// Deletes the selected files with their sidecars. To the Recycle Bin where the drive has one
+    /// (undoable, one journaled change); permanently when `permanent` (Shift+Delete) or the drive has no
+    /// Recycle Bin (USB/network) — those catalogue rows are purged without undo. Directories are skipped.
+    /// Returns the result and the catalogue ids that were purged permanently.
+    pub fn delete_files(&self,ids:&[i64],permanent:bool)->Result<(FileOperationResult,Vec<i64>),String>{
+        self.writable()?;
+        let (files_only,sources)=self.delete_sources(ids)?;
+        let (to_bin,to_purge):(Vec<&Source>,Vec<&Source>)=sources.iter().partition(|s|!permanent&&self.fs.has_recycle_bin(&s.path));
+        let mut summary_parts=Vec::new();let mut change_id=None;let mut purged_ids=Vec::new();
+        if !to_bin.is_empty(){
+            let mut files=Vec::new();for source in &to_bin{for file in self.files_of(source)?{if !files.iter().any(|f:&PathBuf|path_eq(f,&file)){files.push(file);}}}
+            self.fs.recycle_delete(&files)?;
+            let payload=serde_json::to_string(&UndoPayload::Delete{files:files.clone()}).map_err(|e|e.to_string())?;
+            let count=to_bin.len();let summary=format!("Odstránené do Koša: {count} {}",slovak_files(count));
+            let catalog_ids=to_bin.iter().filter(|s|s.id>0).map(|s|s.id).collect::<Vec<_>>();
+            change_id=match self.writer.record_file_delete(&catalog_ids,&summary,&payload){Ok(id)=>id,Err(error)=>{let rollback=files.iter().try_for_each(|f|self.fs.restore_recycled(f));return Err(combine_error(error,rollback));}};
+            summary_parts.push(summary);
+        }
+        if !to_purge.is_empty(){
+            let mut failed=Vec::new();let mut done=Vec::new();
+            for source in &to_purge{let mut ok=true;for file in self.files_of(source)?{if let Err(e)=self.fs.remove_file(&file){if file==source.path{ok=false;}failed.push(format!("{}: {e}",file.display()));}}if ok{done.push(*source);}}
+            purged_ids=done.iter().filter(|s|s.id>0).map(|s|s.id).collect();
+            self.writer.purge_assets(&purged_ids)?;
+            summary_parts.push(format!("Zmazané natrvalo: {} {}",done.len(),slovak_files(done.len())));
+            if !failed.is_empty(){summary_parts.push(format!("Nepodarilo sa zmazať: {}",failed.join("; ")));}
+        }
         let mut folders=Vec::<String>::new();for source in &sources{if let Some(parent)=source.path.parent(){let p=parent.to_string_lossy().to_string();self.listing.invalidate_path(&p).ok();if !folders.contains(&p){folders.push(p);}}}
-        Ok(FileOperationResult{change_id,summary,changed_count:count,skipped_count:0,remapped_ids:Vec::new(),affected_ids:files_only,affected_folder_paths:folders})
+        Ok((FileOperationResult{change_id,summary:summary_parts.join(" · "),changed_count:sources.len(),skipped_count:0,remapped_ids:Vec::new(),affected_ids:files_only,affected_folder_paths:folders},purged_ids))
     }
 
     pub fn undo_last_change(&self)->Result<Option<crate::journal::ChangeSummary>,String>{self.writable()?;self.writer.undo_last_with(|payload|self.undo_payload(payload))}
@@ -260,6 +298,7 @@ mod tests {
         fn copy_no_replace(&self,a:&Path,b:&Path)->io::Result<()>{NativeFileSystem.copy_no_replace(a,b)?;let offset=self.copied_mtime_offset.load(Ordering::SeqCst);if offset!=i64::MIN{let modified=fs::metadata(a)?.modified()?;let rounded=if offset<0{modified.checked_sub(std::time::Duration::from_secs(offset.unsigned_abs())).unwrap()}else{modified.checked_add(std::time::Duration::from_secs(offset as u64)).unwrap()};File::options().write(true).open(b)?.set_times(FileTimes::new().set_modified(rounded))?;}Ok(())}fn remove_file(&self,p:&Path)->io::Result<()>{NativeFileSystem.remove_file(p)}fn create_dir(&self,p:&Path)->io::Result<()>{NativeFileSystem.create_dir(p)}fn remove_dir(&self,p:&Path)->io::Result<()>{NativeFileSystem.remove_dir(p)}
         fn recycle_files(&self,paths:&[PathBuf])->Result<(),String>{for path in paths{let to=self.recycle.join(path.file_name().unwrap());NativeFileSystem.move_no_replace(path,&to).map_err(|e|e.to_string())?;}Ok(())}
         fn recycle_delete(&self,paths:&[PathBuf])->Result<(),String>{for path in paths{let to=self.recycle.join(format!("$R{}-{}",self.move_calls.fetch_add(1,Ordering::SeqCst),path.file_name().unwrap().to_string_lossy()));NativeFileSystem.move_no_replace(path,&to).map_err(|e|e.to_string())?;self.recycled.lock().unwrap().insert(path.clone(),to);}Ok(())}
+        fn has_recycle_bin(&self,path:&Path)->bool{!path.to_string_lossy().contains("nobin")}
         fn recycled_item(&self,original:&Path)->Option<PathBuf>{self.recycled.lock().unwrap().get(original).filter(|p|p.exists()).cloned()}
         fn restore_recycled(&self,original:&Path)->Result<(),String>{let data=self.recycled_item(original).ok_or("not in bin")?;NativeFileSystem.move_no_replace(&data,original).map_err(|e|e.to_string())?;self.recycled.lock().unwrap().remove(original);Ok(())}
     }
@@ -277,15 +316,23 @@ mod tests {
     #[test]fn simulated_mid_batch_failure_rolls_back_and_readonly_refuses(){let root=temp();let(disk,manager)=set_up(&root,Some(true));fs::write(root.join("src/a.xmp"),b"side").unwrap();seed_asset_path(&manager.db,&root);disk.fail_move.store(1,Ordering::SeqCst);let error=manager.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err();assert!(error.contains("simulated failure"));assert!(root.join("src/a.jpg").exists());assert!(root.join("src/a.xmp").exists());assert!(!root.join("dst/a.jpg").exists());assert_eq!(manager.db.lock().unwrap().query_row("SELECT path FROM assets WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),root.join("src/a.jpg").to_string_lossy());let ro=FileManager::with_fs(manager.db.clone(),manager.listing.clone(),manager.writer.clone(),true,disk);assert!(ro.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err().contains("iba na čítanie"));let _=fs::remove_dir_all(root);}
     #[test]fn delete_recycles_main_and_sidecar_removes_rows_and_undo_restores(){let root=temp();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);fs::write(root.join("src/a.xmp"),b"side").unwrap();let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
         let before:String=db.lock().unwrap().query_row("SELECT path||':'||coalesce(rating,'') FROM assets WHERE id=1",[],|r|r.get(0)).unwrap();
-        let result=manager.delete_files(&[1]).unwrap();assert_eq!(result.summary,"Odstránené do Koša: 1 súbor");assert!(!root.join("src/a.jpg").exists());assert!(!root.join("src/a.xmp").exists());
+        let result=manager.delete_files(&[1],false).unwrap().0;assert_eq!(result.summary,"Odstránené do Koša: 1 súbor");assert!(!root.join("src/a.jpg").exists());assert!(!root.join("src/a.xmp").exists());
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);
         manager.undo_last_change().unwrap();assert_eq!(fs::read(root.join("src/a.jpg")).unwrap(),b"abc");assert_eq!(fs::read(root.join("src/a.xmp")).unwrap(),b"side");
         let after:String=db.lock().unwrap().query_row("SELECT path||':'||coalesce(rating,'') FROM assets WHERE id=1",[],|r|r.get(0)).unwrap();assert_eq!(after,before);let _=fs::remove_dir_all(root);}
     #[test]fn delete_undo_refuses_when_bin_item_missing_or_target_occupied(){let root=temp();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
-        manager.delete_files(&[1]).unwrap();fs::write(root.join("src/a.jpg"),b"new").unwrap();assert!(manager.undo_last_change().unwrap_err().contains("pôvodnom mieste"));
+        manager.delete_files(&[1],false).unwrap();fs::write(root.join("src/a.jpg"),b"new").unwrap();assert!(manager.undo_last_change().unwrap_err().contains("pôvodnom mieste"));
         fs::remove_file(root.join("src/a.jpg")).unwrap();let bin=disk.recycled_item(&root.join("src/a.jpg")).unwrap();fs::remove_file(bin).unwrap();assert!(manager.undo_last_change().unwrap_err().contains("nie je v Koši"));
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0,"no partial undo");let _=fs::remove_dir_all(root);}
     #[test]fn recycle_info_parser_reads_v1_and_v2(){let path="C:\\Foto\\a.jpg";let units:Vec<u8>=path.encode_utf16().chain(Some(0)).flat_map(|u|u.to_le_bytes()).collect();
         let mut v2=Vec::new();v2.extend(2u64.to_le_bytes());v2.extend(5u64.to_le_bytes());v2.extend(77u64.to_le_bytes());v2.extend(((units.len()/2) as u32).to_le_bytes());v2.extend(&units);assert_eq!(parse_recycle_info(&v2),Some((77,path.to_string())));
         let mut v1=Vec::new();v1.extend(1u64.to_le_bytes());v1.extend(5u64.to_le_bytes());v1.extend(9u64.to_le_bytes());let mut fixed=units.clone();fixed.resize(520,0);v1.extend(fixed);assert_eq!(parse_recycle_info(&v1),Some((9,path.to_string())));assert_eq!(parse_recycle_info(&[0;10]),None);}
+    #[test]fn permanent_delete_and_drives_without_bin_purge_rows_without_undo(){let root=temp().join("nobin");fs::create_dir_all(&root).unwrap();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);fs::write(root.join("src/a.xmp"),b"side").unwrap();let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
+        let info=manager.delete_info(&[1],false).unwrap();assert_eq!((info.count,info.sidecars,info.permanent_count),(1,1,1));
+        let (result,purged)=manager.delete_files(&[1],false).unwrap();assert_eq!(result.summary,"Zmazané natrvalo: 1 súbor");assert_eq!(purged,vec![1]);assert!(result.change_id.is_none());
+        assert!(!root.join("src/a.jpg").exists());assert!(!root.join("src/a.xmp").exists());assert!(disk.recycled_item(&root.join("src/a.jpg")).is_none(),"not in the bin");
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);let _=fs::remove_dir_all(root.parent().unwrap());}
+    #[test]fn shift_delete_is_permanent_even_with_a_bin(){let root=temp();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
+        assert_eq!(manager.delete_info(&[1],true).unwrap().permanent_count,1);assert_eq!(manager.delete_info(&[1],false).unwrap().permanent_count,0);
+        let (result,_)=manager.delete_files(&[1],true).unwrap();assert!(result.summary.starts_with("Zmazané natrvalo"));assert!(!root.join("src/a.jpg").exists());assert!(disk.recycled_item(&root.join("src/a.jpg")).is_none());let _=fs::remove_dir_all(root);}
 }

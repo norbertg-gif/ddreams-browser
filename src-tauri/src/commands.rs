@@ -51,6 +51,8 @@ pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) 
 #[tauri::command]
 pub fn ai_duplicate_groups(state:State<'_,AiState>,level:String)->Result<Value,String>{state.0.duplicate_groups(&level)}
 #[tauri::command]
+pub fn ai_duplicates_of(state:State<'_,AiState>,asset_id:i64,level:String)->Result<Vec<i64>,String>{state.0.duplicates_of(asset_id,&level)}
+#[tauri::command]
 pub fn ai_suggest(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String)->Result<Value,String>{state.0.suggest(asset_ids,&kind)}
 #[tauri::command]
 pub fn ai_reject_suggestion(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String,label_id:i64)->Result<usize,String>{state.0.reject_suggestion(&asset_ids,&kind,label_id)}
@@ -561,9 +563,13 @@ pub fn get_preview_source(state: State<'_, ThumbnailState>, asset_id: i64, epoch
 #[tauri::command]
 pub fn folder_exists(path:String)->bool{Path::new(path.trim()).is_dir()}
 
-/// Moves the selected files (with sidecars) to the Recycle Bin; undoable with Ctrl+Z.
 #[tauri::command]
-pub async fn delete_files(state:State<'_,FileManagerState>,asset_ids:Vec<i64>)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids)).await.map_err(|e|e.to_string())?}
+pub fn get_delete_info(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,permanent:bool)->Result<crate::file_ops::DeleteInfo,String>{state.0.delete_info(&asset_ids,permanent)}
+
+/// Deletes the selected files (with sidecars): to the Recycle Bin (undoable) or permanently when
+/// `permanent` (Shift+Delete) or the drive has no Recycle Bin.
+#[tauri::command]
+pub async fn delete_files(state:State<'_,FileManagerState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,permanent:Option<bool>)->Result<FileOperationResult,String>{let manager=state.0.clone();let (result,purged)=tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids,permanent.unwrap_or(false))).await.map_err(|e|e.to_string())??;ai.0.forget(purged);Ok(result)}
 
 #[tauri::command]
 pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::folder_rules::FolderRule>,String>{writer.0.folder_rules()}

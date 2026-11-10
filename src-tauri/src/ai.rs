@@ -226,6 +226,30 @@ impl AiService {
         result_page(result)
     }
 
+    /// Duplicates of ONE photo: "similar" = cosine ≥ 0.93 (bursts, same scene); "same" = cosine ≥ 0.95 and
+    /// the same base name with non-conflicting capture time (copies, RAW+JPG, edited exports) — the same
+    /// rules as the catalogue-wide scan. Returns the photo itself first, then the matches by similarity.
+    pub fn duplicates_of(&self, asset_id:i64, level:&str)->Result<Vec<i64>,String>{
+        if asset_id <= 0 { return Err("Fotka ešte nie je v katalógu".into()); }
+        let threshold=match level{"same"=>0.95,"similar"=>0.93,_=>return Err("Neplatná úroveň podobnosti".into())};
+        let result=self.request("similar",json!({"asset_id":asset_id,"limit":1000}),Duration::from_secs(60))?;
+        let rows=result.get("results").and_then(Value::as_array).cloned().unwrap_or_default();
+        let candidates=rows.iter().filter(|r|r.get("score").and_then(Value::as_f64).unwrap_or(0.0)>=threshold).filter_map(|r|r.get("asset_id").and_then(Value::as_i64)).filter(|id|*id!=asset_id).collect::<Vec<_>>();
+        let conn=self.0.db.lock().map_err(|e|e.to_string())?;
+        let mut meta=std::collections::HashMap::new();
+        for id in std::iter::once(asset_id).chain(candidates.iter().copied()) {
+            if let Some(row)=conn.query_row("SELECT name,exif_date,size FROM assets WHERE id=?1 AND is_listed=1",[id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<f64>>(2)?))).optional().map_err(|e|e.to_string())? { meta.insert(id,row); }
+        }
+        let listed=candidates.into_iter().filter(|id|meta.contains_key(id)).collect::<Vec<_>>();
+        let matches=if level=="same" {
+            let ids=std::iter::once(asset_id).chain(listed.iter().copied()).collect::<Vec<_>>();
+            let group=split_same_groups(&ids,&meta).into_iter().find(|g|g.contains(&asset_id)).unwrap_or_default();
+            listed.into_iter().filter(|id|group.contains(id)).collect::<Vec<_>>()
+        } else { listed };
+        if matches.is_empty() { return Ok(Vec::new()); }
+        Ok(std::iter::once(asset_id).chain(matches).collect())
+    }
+
     pub fn duplicate_groups(&self, level:&str)->Result<Value,String>{
         // Burst neighbours reach cosine 0.999, so pixels alone can't tell a copy from the next frame.
         // "same" = visually close (≥ 0.95) AND the same base name AND capture times not contradicting.

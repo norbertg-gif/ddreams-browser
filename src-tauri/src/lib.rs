@@ -178,6 +178,8 @@ pub fn run() {
             commands::get_preview_source,
             commands::folder_exists,
             commands::delete_files,
+            commands::get_delete_info,
+            commands::ai_duplicates_of,
             commands::get_folder_rules,
             commands::get_folder_rule_state,
             commands::get_exclusion_impact,
