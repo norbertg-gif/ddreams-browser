@@ -23,6 +23,7 @@ use tauri::http::{Response, StatusCode, header};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    let _ = commands::PROCESS_START.set(std::time::Instant::now());
     let paths = paths::Paths::resolve();
     let info = paths.info();
     eprintln!("DDreams paths: root={}, catalog={}, backups={}, cache={}, exiftool={}, formats={}, metadata_view={}, settings={}, portable={}, readonly={}", info.root, info.catalog, info.backups, info.cache, info.exiftool, info.formats, info.metadata_view, info.settings, info.portable, info.readonly);
@@ -188,7 +189,7 @@ pub fn run() {
             commands::set_folder_rule,
             commands::refresh_folder_listing,
             commands::get_asset_paths,
-            commands::asset_action,commands::open_in_editor,commands::pick_editor_program,commands::program_exists,
+            commands::asset_action,commands::startup_mark,commands::open_in_editor,commands::pick_editor_program,commands::program_exists,
             commands::get_asset_ids,
             commands::get_folder_children,
             commands::find_folder_path,

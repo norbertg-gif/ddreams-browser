@@ -8,7 +8,8 @@ import Splitter from "./Splitter";
 import { readStored, writeStored } from "../storage";
 import { useSpringOpen } from "../hooks/useSpringOpen";
 
-const shortcuts = [
+type Shortcut = { name: string; path: string };
+const DEFAULT_SHORTCUTS: Shortcut[] = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
@@ -17,6 +18,11 @@ type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; 
 export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule }: Props) {
   const folderRules = useFolderRules();
   const [tab, setTab] = useState<"folders" | "calendar">("folders");
+  const [shortcuts, setShortcuts] = useState<Shortcut[]>(() => { const v = readStored<Shortcut[]>("ddreams.shortcuts", DEFAULT_SHORTCUTS); return Array.isArray(v) ? v : DEFAULT_SHORTCUTS; });
+  useEffect(() => { writeStored("ddreams.shortcuts", shortcuts); }, [shortcuts]);
+  const currentPath = activeView?.kind === "folder" ? (activeView.folderPath ?? "") : "";
+  const samePath = (x: string, y: string) => x.replace(/[\\/]+$/, "").toLowerCase() === y.replace(/[\\/]+$/, "").toLowerCase();
+  const addShortcut = () => { if (!currentPath || shortcuts.some(s => samePath(s.path, currentPath))) return; const name = currentPath.split(/[\\/]/).filter(Boolean).pop() ?? currentPath; setShortcuts([...shortcuts, { name, path: currentPath }]); };
   const [shortcutsHeight, setShortcutsHeight] = useState<number | null>(() => readStored<number | null>("ddreams.shortcutsHeight", null));
   const shortcutsRef = useRef<HTMLElement | null>(null);
   const paneRef = useRef<HTMLElement | null>(null);
@@ -84,7 +90,7 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
 
   const activeSet = new Set([activeFolderId, ...activeFolderIds].filter((v): v is number => v != null));
   return <FolderRulesContext.Provider value={{ rules: folderRules, onRule: onFolderRule }}><aside className="left-pane" ref={paneRef}>
-    <section className="shortcuts-pane" ref={shortcutsRef} style={shortcutsHeight == null ? undefined : { height: shortcutsHeight, flex: "none" }}><div className="pane-title">Skratky</div>{shortcuts.map(s => <button className="shortcut" key={s.path} onClick={() => void clickShortcut(s.path)}><span className="folder-glyph"/><span title={s.path}><b>{s.name}</b></span></button>)}</section>
+    <section className="shortcuts-pane" ref={shortcutsRef} style={shortcutsHeight == null ? undefined : { height: shortcutsHeight, flex: "none" }}><div className="pane-title">Skratky<button className="shortcut-add" disabled={!currentPath||shortcuts.some(s=>samePath(s.path,currentPath))} title={currentPath?`Pridať do skratiek: ${currentPath}`:"Otvor priečinok, ktorý chceš pridať"} onClick={addShortcut}>+</button></div>{shortcuts.length===0&&<small className="color-hint">Otvor priečinok a klikni na +</small>}{shortcuts.map(s => <div className="shortcut-row" key={s.path}><button className="shortcut" onClick={() => void clickShortcut(s.path)}><span className="folder-glyph"/><span title={s.path}><b>{s.name}</b></span></button><button className="shortcut-remove" title={`Odstrániť skratku ${s.name} (priečinok ostane)`} onClick={()=>setShortcuts(shortcuts.filter(x=>x.path!==s.path))}>×</button></div>)}</section>
     <Splitter direction="y" value={() => shortcutsHeight ?? shortcutsRef.current?.offsetHeight ?? 120} min={36} max={Math.max(36, (paneRef.current?.offsetHeight ?? 600) - 160)} onChange={setShortcutsHeight} onReset={() => setShortcutsHeight(null)}/>
     <div className="left-tabs"><button className={tab === "folders" ? "active" : ""} onClick={() => setTab("folders")}>Priečinky</button><button className={tab === "calendar" ? "active" : ""} onClick={() => setTab("calendar")}>Kalendár</button></div>
     {tab === "calendar" ? <CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/> : <div className="folder-tree">

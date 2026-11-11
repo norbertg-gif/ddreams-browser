@@ -92,9 +92,28 @@ pub fn get_asset_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,asset_id
 
 #[tauri::command(async)]
 pub fn get_color_counts(db:State<'_,DatabaseState>,ai:State<'_,AiState>)->Result<Vec<ColorCount>,String>{
-    let attached=ai.0.ensure_colors_attached();let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let mut counts=std::collections::HashMap::<String,usize>::new();
-    let sql=if attached{"SELECT a.id,c.auto FROM assets a LEFT JOIN ai.colors c ON c.asset_id=a.id WHERE a.is_listed=1 AND a.id>0"}else{"SELECT a.id,NULL FROM assets a WHERE a.is_listed=1 AND a.id>0"};let rows=conn.prepare(sql).map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
-    let overrides=conn.prepare("SELECT asset_id,color,state FROM asset_color_overrides").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let mut by_id=std::collections::HashMap::<i64,Vec<(String,i64)>>::new();for(id,color,state)in overrides{by_id.entry(id).or_default().push((color,state));}
+    // The catalogue lock is held only for the two quick catalogue reads. ai.sqlite (hundreds of MB,
+    // on the same disk the AI model loads from) is read through its own read-only connection:
+    // with the lock held, a slow cold read here used to freeze every other query for many seconds.
+    let mut counts=std::collections::HashMap::<String,usize>::new();
+    let (ids,overrides)={
+        let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+        let ids=conn.prepare("SELECT id FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+        let overrides=conn.prepare("SELECT asset_id,color,state FROM asset_color_overrides").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+        (ids,overrides)
+    };
+    let mut auto_by_id=std::collections::HashMap::<i64,String>::new();
+    let ai_db=ai.0.ai_db_path();
+    if ai_db.is_file() {
+        if let Ok(conn)=rusqlite::Connection::open_with_flags(&ai_db,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY) {
+            let _=conn.busy_timeout(std::time::Duration::from_secs(2));
+            if let Ok(mut stmt)=conn.prepare("SELECT asset_id,auto FROM colors") {
+                if let Ok(found)=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))) { for (id,auto) in found.flatten() { if let Some(auto)=auto { auto_by_id.insert(id,auto); } } }
+            }
+        }
+    }
+    let rows:Vec<(i64,Option<String>)>=ids.into_iter().map(|id|{let auto=auto_by_id.remove(&id);(id,auto)}).collect();
+    let mut by_id=std::collections::HashMap::<i64,Vec<(String,i64)>>::new();for(id,color,state)in overrides{by_id.entry(id).or_default().push((color,state));}
     for(id,json)in rows{let auto=json.as_deref().and_then(|v|serde_json::from_str::<Vec<String>>(v).ok()).unwrap_or_default();let effective=crate::colors::effective_colors(&auto,by_id.get(&id).map(Vec::as_slice).unwrap_or(&[]));for color in effective{*counts.entry(color).or_default()+=1;}}
     Ok(crate::colors::PALETTE.iter().map(|c|ColorCount{value:c.value.into(),name:c.name.into(),hex:c.hex.into(),count:*counts.get(c.value).unwrap_or(&0)}).collect())
 }
@@ -342,6 +361,22 @@ pub fn pick_editor_program() -> Result<Option<String>, String> {
     let output = std::process::Command::new("powershell.exe").args(["-NoProfile", "-STA", "-Command", script]).creation_flags(0x0800_0000).output().map_err(|e| e.to_string())?;
     let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     Ok(if path.is_empty() { None } else { Some(path) })
+}
+
+pub static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Appends "<ms since process start> <label>" to cache/startup.log (the file restarts with the
+/// first mark of a run). Used to see where a slow cold start spends its time.
+#[tauri::command(async)]
+pub fn startup_mark(info: State<'_, AppInfoState>, label: String) {
+    use std::io::Write;
+    static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+    let ms = PROCESS_START.get().map(|t| t.elapsed().as_millis()).unwrap_or(0);
+    let path = Path::new(&info.0.cache).join("startup.log");
+    let first = FIRST.swap(false, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).write(true).truncate(first).append(!first).open(path) {
+        let _ = writeln!(file, "{ms:>7} ms  {}", label.chars().take(120).collect::<String>());
+    }
 }
 
 #[tauri::command(async)]

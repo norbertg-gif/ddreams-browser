@@ -82,6 +82,8 @@ impl AiService {
 
     pub fn status(&self) -> AiStatus { self.0.status.lock().unwrap().clone() }
 
+    pub fn ai_db_path(&self) -> PathBuf { self.0.paths.ai_db.clone() }
+
     pub fn ensure_colors_attached(&self) -> bool {
         if self.0.colors_attached.load(Ordering::Relaxed) { return self.has_colors_table(); }
         if !self.0.paths.ai_db.is_file() { return false; }

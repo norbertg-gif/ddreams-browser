@@ -217,3 +217,23 @@ input[type=range]{accent-color:#b8b8b8}
 .viewer-top>span:nth-child(3){order:7;text-align:right;color:#b8b8b8;padding-left:8px;border-left:1px solid #454545}
 .viewer-footer{height:21px;padding:3px 10px;background:#2b2b2b;border-top:1px solid #151515;font-size:10px}
 .viewer-arrow:hover{background:#3a3a3a}
+.filmstrip{flex:none;height:74px;display:flex;align-items:center;gap:3px;padding:4px 8px;background:#262626;border-top:1px solid #151515;overflow-x:auto;overflow-y:hidden;white-space:nowrap}
+.filmstrip-item{flex:none;height:60px;width:76px;padding:2px;border:2px solid transparent;border-radius:0;background:#303030;display:flex;align-items:center;justify-content:center;color:#8a8a8a;font-size:10px}
+.filmstrip-item img{max-width:100%;max-height:100%;object-fit:contain}
+.filmstrip-item:hover{background:#444}
+.filmstrip-item.active{background:#6a6a6a;border-color:#e0e0e0}
+.pane-title{display:flex;align-items:center}
+.shortcut-add{margin-left:auto;width:18px;height:16px;line-height:14px;border-radius:2px;color:#d0d0d0;font-size:14px;font-weight:400}
+.shortcut-add:hover:not(:disabled),.shortcut-remove:hover{background:#555;color:#fff}
+.shortcut-row{display:flex;align-items:center}.shortcut-row .shortcut{flex:1;min-width:0}
+.shortcut-row:hover{background:#353535}
+.shortcut-remove{flex:none;width:18px;height:17px;line-height:15px;color:#a0a0a0;border-radius:2px;visibility:hidden}
+.shortcut-row:hover .shortcut-remove{visibility:visible}
+.catalog-zone-title{font-size:10px;font-weight:700;letter-spacing:.4px;text-transform:uppercase;padding:3px 8px;margin:0}
+.catalog-zone-title.edit-zone{background:#5a4718;color:#ffe2a0;border-left:3px solid #e0aa2a}
+.catalog-zone-title.filter-zone{background:#1f3a52;color:#b9d8f5;border-left:3px solid #5f9fd8;margin:6px -2px 4px}
+.catalog-editor{background:#3a3323;border:1px solid #6a5420;border-left:3px solid #e0aa2a;padding-top:0}
+.catalog-editor .catalog-zone-title{margin:0 0 4px -3px;border-left:0}
+.filter-zone-content .catalog-section{background:#222a31}
+.filter-zone-content .catalog-section-heading{background:#2a3642}
+.filter-zone-content .keyword-filter{background:#1b2229;border-color:#3d5266}
