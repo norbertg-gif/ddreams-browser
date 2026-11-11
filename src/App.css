@@ -237,3 +237,9 @@ input[type=range]{accent-color:#b8b8b8}
 .filter-zone-content .catalog-section{background:#222a31}
 .filter-zone-content .catalog-section-heading{background:#2a3642}
 .filter-zone-content .keyword-filter{background:#1b2229;border-color:#3d5266}
+
+.shortcut-add{width:20px;height:17px;background:#444;border:1px solid #5a5a5a;color:#fff}
+.shortcut-add:disabled{opacity:.35}
+.shortcut-remove{visibility:visible;color:#777}
+.shortcut-rename{flex:1;min-width:0;height:19px;margin-left:14px;padding:0 4px;font-size:11px;background:#1c1c1c;color:#fff;border:1px solid #6a8fbf;outline:none}
+.category-context-menu button:disabled{opacity:.4;pointer-events:none}
