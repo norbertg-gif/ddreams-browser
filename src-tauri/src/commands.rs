@@ -21,6 +21,10 @@ use tauri::Emitter;
 use rusqlite::OptionalExtension;
 
 pub struct DatabaseState(pub Db);
+/// Second, read-only connection for side-panel data (counts, trees, folder previews, calendar).
+/// WAL lets it read while the main connection serves the folder listing, so background loading
+/// never makes the grid wait for the catalogue lock.
+pub struct BackgroundDbState(pub Db);
 pub struct ExifState(pub Arc<ExifTool>);
 pub struct ThumbnailState(pub Arc<ThumbService>);
 pub struct ListingState(pub Arc<ListingService>);
@@ -91,7 +95,7 @@ pub fn get_asset_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,asset_id
 }
 
 #[tauri::command(async)]
-pub fn get_color_counts(db:State<'_,DatabaseState>,ai:State<'_,AiState>)->Result<Vec<ColorCount>,String>{
+pub fn get_color_counts(db:State<'_, BackgroundDbState>,ai:State<'_,AiState>)->Result<Vec<ColorCount>,String>{
     // The catalogue lock is held only for the two quick catalogue reads. ai.sqlite (hundreds of MB,
     // on the same disk the AI model loads from) is read through its own read-only connection:
     // with the lock held, a slow cold read here used to freeze every other query for many seconds.
@@ -253,7 +257,7 @@ pub fn get_keyword_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Resul
 #[tauri::command(async)]
 pub fn delete_keyword(state:State<'_,CatalogWriterState>,id:i64)->Result<KeywordMutationResult,String>{state.0.delete_keyword(id)}
 #[tauri::command(async)]
-pub fn search_keyword_options(state:State<'_,DatabaseState>,query:String)->Result<Vec<db::KeywordOption>,String>{db::keyword_options(&state.0,&query).map_err(|e|e.to_string())}
+pub fn search_keyword_options(state:State<'_, BackgroundDbState>,query:String)->Result<Vec<db::KeywordOption>,String>{db::keyword_options(&state.0,&query).map_err(|e|e.to_string())}
 
 #[tauri::command(async)]
 pub fn get_calendar_aggregate(state: State<'_, CalendarState>, source: String) -> Result<CalendarAggregate, String> {
@@ -299,7 +303,7 @@ pub fn get_assets(
 }
 
 #[tauri::command(async)]
-pub fn get_folder_previews(state: State<'_, DatabaseState>, formats: State<'_, FormatsState>, paths: Vec<String>) -> Result<std::collections::HashMap<String, Vec<db::FolderPreviewAsset>>, String> {
+pub fn get_folder_previews(state: State<'_, BackgroundDbState>, formats: State<'_, FormatsState>, paths: Vec<String>) -> Result<std::collections::HashMap<String, Vec<db::FolderPreviewAsset>>, String> {
     db::folder_previews(&state.0, &paths, &formats.0).map_err(|e| e.to_string())
 }
 fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
@@ -443,7 +447,7 @@ pub fn get_folder_ancestors(
 }
 #[tauri::command(async)]
 pub fn get_category_roots(
-    state: State<'_, DatabaseState>,
+    state: State<'_, BackgroundDbState>,
     include_children: bool,
     offset: i64,
     limit: i64,
@@ -452,7 +456,7 @@ pub fn get_category_roots(
 }
 #[tauri::command(async)]
 pub fn get_catalog_nodes(
-    state: State<'_, DatabaseState>,
+    state: State<'_, BackgroundDbState>,
     kind: String,
     parent_id: Option<i64>,
     root_id: Option<i64>,
@@ -472,12 +476,12 @@ pub fn search_keywords(
     db::keyword_search_page(&state.0, &query, offset, limit).map_err(|e| e.to_string())
 }
 #[tauri::command(async)]
-pub fn search_catalog_tree(state: State<'_, DatabaseState>, kind:String, query:String, include_children:bool, offset:i64, limit:i64)->Result<Vec<db::CatalogNode>,String>{
+pub fn search_catalog_tree(state: State<'_, BackgroundDbState>, kind:String, query:String, include_children:bool, offset:i64, limit:i64)->Result<Vec<db::CatalogNode>,String>{
     db::catalog_tree_search(&state.0,&kind,&query,offset,limit,include_children).map_err(|e|e.to_string())
 }
 #[tauri::command(async)]
 pub fn get_catalog_values(
-    state: State<'_, DatabaseState>,
+    state: State<'_, BackgroundDbState>,
     formats: State<'_, FormatsState>,
     kind: String,
     offset: i64,

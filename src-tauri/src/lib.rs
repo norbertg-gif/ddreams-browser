@@ -37,12 +37,14 @@ pub fn run() {
         schema::migrate_catalog(&mut connection).unwrap_or_else(|e| panic!("Catalog migration failed at {}: {e}", paths.catalog.display()));
     }
     let db = Arc::new(Mutex::new(connection));
+    // Falls back to the main connection if a second one cannot be opened.
+    let background_db = db::open_read_only(&paths.catalog).map(|c| Arc::new(Mutex::new(c))).unwrap_or_else(|e| { eprintln!("Warning: background catalog connection failed: {e}"); db.clone() });
     let exif = exiftool::ExifTool::new(paths.exiftool.clone());
     let formats = formats::FormatTable::load_selected(paths.formats.as_deref());
     let metadata_view = metadata_view::MetadataView::load_selected(paths.metadata_view.as_deref());
     let display_metadata = display_metadata::DisplayMetadataCache::new(paths.cache.clone());
     let listing = listing::ListingService::new(db.clone(), formats.clone());
-    let calendar = calendar::CalendarService::new(db.clone(), formats.clone());
+    let calendar = calendar::CalendarService::new(background_db.clone(), formats.clone());
     // RAW plugin lives next to the AI module (modules/raw or <repo>/raw) and uses the same Python runtime.
     let raw_plugin = paths.ai_python.clone().zip(paths.ai_script.parent().and_then(|p| p.parent()).map(|p| p.join("raw").join("ddreams_raw.py")))
         .filter(|(python, script)| python.is_file() && script.is_file())
@@ -62,6 +64,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| { setup_ai.set_app(app.handle().clone()); Ok(()) })
         .manage(DatabaseState(db))
+        .manage(commands::BackgroundDbState(background_db))
         .manage(ExifState(exif))
         .manage(ListingState(listing))
         .manage(FormatsState(formats))
