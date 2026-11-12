@@ -484,3 +484,9 @@ input[type=checkbox]{accent-color:var(--accent)}
 .viewer-canvas .viewer-image{position:relative;z-index:1}
 .viewer-canvas .viewer-arrow{position:relative;z-index:2}
 .viewer-bar,.filmstrip,.viewer-footer{position:relative;z-index:3}
+
+/* viewer: photo centred, arrows float over the edges */
+.viewer-canvas{justify-content:center;align-items:center;padding:18px 70px}
+.viewer-canvas .viewer-arrow{position:absolute;top:50%;margin-top:-22px}
+.viewer-canvas .viewer-arrow:first-child{left:14px}.viewer-canvas .viewer-arrow:last-child{right:14px}
+.viewer-canvas img{max-width:100%}
