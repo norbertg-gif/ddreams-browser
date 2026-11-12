@@ -464,3 +464,16 @@ input[type=checkbox]{accent-color:var(--accent)}
 .ai-search-box{flex:0 1 230px}
 .folder-tile{width:64%;height:60%}
 .tree-toggle{color:var(--muted);font-size:11px}
+
+/* ticked metadata rows: what "Kopírovať zaškrtnuté" puts on the clipboard */
+.meta-row.checkable{grid-template-columns:16px minmax(0,40%) minmax(0,1fr);cursor:pointer}
+.meta-check{width:13px;height:13px;margin:2px 0 0;pointer-events:none}
+.meta-row.selected{background:#16202d;border-radius:0}
+.copy-controls{gap:6px}.copy-controls>button,.copy-controls>button:first-child,.copy-controls>button:nth-child(2){border-radius:7px;height:28px;padding:0 10px}
+
+/* toolbar: one wrapping row of items, sort and view controls pushed to the right */
+.center-pane .toolbar{flex-wrap:wrap;align-items:center;justify-content:flex-start}
+.center-pane .toolbar-left,.center-pane .toolbar-right{display:contents}
+.center-pane .toolbar-right>select{margin-left:auto}
+.type-pills{margin-left:6px}
+.ai-search-box{flex:0 1 230px;margin-left:6px}

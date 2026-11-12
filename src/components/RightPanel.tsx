@@ -17,7 +17,8 @@ export default function RightPanel({ hosts, catalogReady = true, activeColors = 
   const [assetLinks,setAssetLinks]=useState<CatalogAssetLinks|null>(null);
   const [loading, setLoading] = useState(false);
   const [openGroups, setOpenGroups] = useState<Set<string>>(() => new Set(readStored<string[]>("ddreams.metadataOpen", ["IPTC", "EXIF", "Katalóg"]).map(name => name === "ACDSee" ? "Katalóg" : name)));
-  const [selectedRows, setSelectedRows] = useState<string[]>([]);
+  const [selectedRows, setSelectedRows] = useState<string[]>(() => { const v = readStored<string[]>("ddreams.metadataChecked", []); return Array.isArray(v) ? v : []; });
+  useEffect(() => writeStored("ddreams.metadataChecked", selectedRows), [selectedRows]);
   const [rowAnchor, setRowAnchor] = useState("");
   const [copyMenu, setCopyMenu] = useState(false);
   const [copyMessage, setCopyMessage] = useState("");
@@ -31,7 +32,7 @@ export default function RightPanel({ hosts, catalogReady = true, activeColors = 
 
   useEffect(() => {
     const requestId = ++metadataRequest.current;
-    setMetadata(null); setSelectedRows([]); if (primaryId == null) return;
+    setMetadata(null); if (primaryId == null) return;
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
   }, [primaryId, refreshToken]);
@@ -52,9 +53,9 @@ export default function RightPanel({ hosts, catalogReady = true, activeColors = 
     const key = rowKey(row); setRowAnchor(key);
     if (event.shiftKey && rowAnchor) {
       const a = rowList.findIndex(r => rowKey(r) === rowAnchor), b = rowList.findIndex(r => rowKey(r) === key);
-      setSelectedRows(rowList.slice(Math.min(a,b),Math.max(a,b)+1).map(rowKey));
-    } else if (event.ctrlKey || event.metaKey) setSelectedRows(prev => prev.includes(key) ? prev.filter(v => v !== key) : [...prev,key]);
-    else setSelectedRows([key]);
+      const range = rowList.slice(Math.min(a,b),Math.max(a,b)+1).map(rowKey);
+      setSelectedRows(prev => [...new Set([...prev, ...range])]);
+    } else setSelectedRows(prev => prev.includes(key) ? prev.filter(v => v !== key) : [...prev,key]);
   };
   const copy = async (mode: "selected" | "values" | "section", group?: string) => {
     const ids = selectedIds.length > 1 ? selectedIds : primaryId == null ? [] : [primaryId];
@@ -120,14 +121,14 @@ export default function RightPanel({ hosts, catalogReady = true, activeColors = 
         {openGroups.has(group.name) && <div className="metadata-rows">
           {[...new Set(group.rows.map(row=>row.subgroup))].map(subgroup=><div className="metadata-subgroup" key={subgroup}>
             {subgroup && subgroup !== group.name && <div className="metadata-subgroup-title">{subgroup}</div>}
-            {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setSelectedRows([rowKey(row)]); setRowAnchor(rowKey(row)); setCopyMenu(true); }}>
-              <span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "Katalóg" ? catalogText(row) : row.value}</b>
+            {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row checkable ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setCopyMenu(true); }}>
+              <input type="checkbox" className="meta-check" tabIndex={-1} readOnly checked={selectedRows.includes(rowKey(row))} title="Zaškrtnuté riadky sa kopírujú tlačidlom Kopírovať zaškrtnuté" /><span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "Katalóg" ? catalogText(row) : row.value}</b>
             </div>)}
           </div>)}
         </div>}
         {group.name==="Katalóg"&&<div className="meta-row"><span>Farby</span><b>{colorNames||"—"}</b></div>}
       </section>)}
-      <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
+      <div className="copy-controls">{selectedRows.length > 0 && <button title="Zrušiť všetky zaškrtnutia" onClick={() => setSelectedRows([])}>Zrušiť</button>}<button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať zaškrtnuté{selectedRows.length ? ` (${selectedRows.length})` : ""}</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
     </div>
