@@ -54,6 +54,61 @@ pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u3
 pub fn ai_similar(state: State<'_, AiState>, asset_id: i64, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.similar(asset_id, limit) }
 #[tauri::command(async)]
 pub fn ai_duplicate_groups(state:State<'_,AiState>,level:String)->Result<Value,String>{state.0.duplicate_groups(&level)}
+#[derive(Serialize)]
+pub struct AiSeriesGroup { pub ids:Vec<i64>, pub best:i64 }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiSeriesResult { pub groups:Vec<AiSeriesGroup>, pub analyzed:usize, pub truncated:bool }
+
+fn exif_date_seconds(value:&str)->Option<f64>{
+    if !value.is_ascii(){return None;}
+    let split=value.find(|c|c=='T'||c==' ')?;let date=&value[..split];let time=&value[split+1..];
+    if date.len()!=10||date.as_bytes()[4]!=b'-'||date.as_bytes()[7]!=b'-'||time.len()<8{return None;}
+    let year=date[0..4].parse::<i64>().ok()?;let month=date[5..7].parse::<i64>().ok()?;let day=date[8..10].parse::<i64>().ok()?;
+    let hour=time[0..2].parse::<i64>().ok()?;let minute=time[3..5].parse::<i64>().ok()?;let second=time[6..8].parse::<i64>().ok()?;
+    if !(1..=12).contains(&month)||!(0..=23).contains(&hour)||!(0..=59).contains(&minute)||!(0..=60).contains(&second){return None;}
+    let leap=year%4==0&&(year%100!=0||year%400==0);let month_days=[31,if leap{29}else{28},31,30,31,30,31,31,30,31,30,31];if day<1||day>month_days[(month-1) as usize]{return None;}
+    let y=year-if month<=2{1}else{0};let era=y/400;let yoe=y-era*400;let mp=month+if month>2{-3}else{9};let doy=(153*mp+2)/5+day-1;let doe=yoe*365+yoe/4-yoe/100+doy;let days=era*146097+doe-719468;
+    let tail=&time[8..];let offset=if tail.starts_with('+')||tail.starts_with('-'){let sign=if tail.starts_with('+'){1}else{-1};let h=tail.get(1..3)?.parse::<i64>().ok()?;let m=tail.get(4..6)?.parse::<i64>().ok()?;sign*(h*3600+m*60)}else{0};
+    Some((days*86400+hour*3600+minute*60+second-offset) as f64)
+}
+
+#[tauri::command(async)]
+pub fn ai_series(state:State<'_,DatabaseState>,listing:State<'_,ListingState>,formats:State<'_,FormatsState>,ai:State<'_,AiState>,mut filter:AssetFilter,preset:String)->Result<AiSeriesResult,String>{
+    let raw_only=filter.file_group.as_deref()==Some("raw");
+    if matches!(filter.file_group.as_deref(),Some("video"|"other")){return Ok(AiSeriesResult{groups:Vec::new(),analyzed:0,truncated:false});}
+    filter.file_group=Some(if raw_only{"raw".into()}else{"images".into()});
+    filter.sort="captureTime".into();filter.descending=false;filter.offset=0;filter.limit=500;
+    let cap=20_000usize;let mut truncated=false;let mut candidates:Vec<(i64,Option<f64>)>=Vec::new();
+    if filter.kind=="ai"{let page=db::assets_page(&state.0,&filter,&formats.0).map_err(|e|e.to_string())?;candidates.extend(page.items.into_iter().filter(|a|!a.is_directory).map(|a|(a.id,a.exif_date.as_deref().and_then(exif_date_seconds))));}
+    else {
+        let mut offset=0i64;
+        loop {
+            filter.offset=offset;
+            let (rows,page_count,total)=if filter.kind=="folder" {
+                let page=listing.0.page(&filter)?;let page_count=page.items.len();let total=page.total;
+                (page.items.into_iter().filter(|a|!a.is_directory).map(|a|(a.id,a.exif_date.as_deref().and_then(exif_date_seconds))).collect::<Vec<_>>(),page_count,Some(total))
+            } else {
+                let ids=db::asset_ids_page(&state.0,&filter,&formats.0,offset,500).map_err(|e|e.to_string())?;let page_count=ids.len();
+                let conn=state.0.lock().map_err(|_|"catalog lock poisoned")?;let mut rows=Vec::new();
+                for chunk in ids.chunks(500){let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");let mut stmt=conn.prepare(&format!("SELECT id,exif_date FROM assets WHERE id IN ({marks}) AND is_listed=1")).map_err(|e|e.to_string())?;rows.extend(stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?);}
+                (rows.into_iter().map(|(id,date)|(id,date.as_deref().and_then(exif_date_seconds))).collect::<Vec<_>>(),page_count,None)
+            };
+            for (id,date) in rows{if candidates.len()==cap{truncated=true;break;}candidates.push((id,date));}
+            if truncated||page_count<500||total.is_some_and(|n|offset+page_count as i64>=n){break;}
+            offset+=page_count as i64;
+        }
+    }
+    candidates.sort_by(|a,b|a.1.is_none().cmp(&b.1.is_none()).then(a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)).then(a.0.cmp(&b.0)));
+    if candidates.len()>cap{candidates.truncate(cap);truncated=true;}
+    let items=candidates.iter().map(|(id,date)|serde_json::json!({"asset_id":id,"t":date})).collect::<Vec<_>>();
+    let analyzed=items.len();
+    let result=ai.0.analyze_series(items,preset.as_str())?;
+    let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|group|{
+        let ids=group.get("ids")?.as_array()?.iter().filter_map(Value::as_i64).collect::<Vec<_>>();let best=group.get("best")?.as_i64()?;(ids.len()>1).then_some(AiSeriesGroup{ids,best})
+    }).collect();
+    Ok(AiSeriesResult{groups,analyzed,truncated})
+}
 #[tauri::command(async)]
 pub fn ai_duplicates_of(state:State<'_,AiState>,asset_id:i64,level:String)->Result<Vec<i64>,String>{state.0.duplicates_of(asset_id,&level)}
 #[tauri::command(async)]
@@ -122,6 +177,59 @@ pub fn get_color_counts(db:State<'_, BackgroundDbState>,ai:State<'_,AiState>)->R
     Ok(crate::colors::PALETTE.iter().map(|c|ColorCount{value:c.value.into(),name:c.name.into(),hex:c.hex.into(),count:*counts.get(c.value).unwrap_or(&0)}).collect())
 }
 
+#[derive(Serialize,Clone)]
+#[serde(rename_all="camelCase")]
+pub struct AssetQuality { pub asset_id:i64,pub sharp:f64,pub hi:f64,pub lo:f64,pub mean:f64,pub flags:Vec<String> }
+
+fn quality_connection(ai:&AiState)->Option<rusqlite::Connection>{
+    let path=ai.0.ai_db_path();if !path.is_file(){return None;}
+    let conn=rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).ok()?;
+    let _=conn.busy_timeout(std::time::Duration::from_secs(2));Some(conn)
+}
+
+#[tauri::command(async)]
+pub fn get_asset_quality(db:State<'_,BackgroundDbState>,ai:State<'_,AiState>,asset_ids:Vec<i64>)->Result<Vec<AssetQuality>,String>{
+    let ids={
+        let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+        let wanted=asset_ids.into_iter().filter(|id|*id>0).collect::<std::collections::HashSet<_>>();
+        let mut out=std::collections::HashSet::new();
+        for chunk in wanted.iter().copied().collect::<Vec<_>>().chunks(500){
+            let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let mut stmt=conn.prepare(&format!("SELECT id FROM assets WHERE is_listed=1 AND id IN ({marks})")).map_err(|e|e.to_string())?;
+            for row in stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? {out.insert(row.map_err(|e|e.to_string())?);}
+        }out
+    };
+    let Some(conn)=quality_connection(&ai) else{return Ok(Vec::new())};
+    let mut out=Vec::new();
+    for chunk in ids.iter().copied().collect::<Vec<_>>().chunks(500){
+        if chunk.is_empty(){continue}
+        let marks=std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql=format!("SELECT asset_id,sharp,hi,lo,mean FROM quality WHERE version=? AND asset_id IN ({marks})");
+        let mut stmt=match conn.prepare(&sql){Ok(v)=>v,Err(_)=>return Ok(Vec::new())};
+        let mut args=vec![rusqlite::types::Value::Integer(crate::quality::QUALITY_VERSION)];args.extend(chunk.iter().copied().map(Into::into));
+        let rows=stmt.query_map(rusqlite::params_from_iter(args.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?,r.get::<_,f64>(4)?))).map_err(|e|e.to_string())?;
+        for row in rows{let(id,sharp,hi,lo,mean)=row.map_err(|e|e.to_string())?;let flags=crate::quality::flags(sharp,hi,lo,mean).into_iter().map(str::to_owned).collect();out.push(AssetQuality{asset_id:id,sharp,hi,lo,mean,flags});}
+    }
+    Ok(out)
+}
+
+#[tauri::command(async)]
+pub fn get_quality_counts(db:State<'_,BackgroundDbState>,ai:State<'_,AiState>)->Result<Vec<db::ValueCount>,String>{
+    let ids={
+        let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+        conn.prepare("SELECT id FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<std::collections::HashSet<i64>>>().map_err(|e|e.to_string())?
+    };
+    let mut counts=std::collections::HashMap::<&'static str,i64>::new();
+    if let Some(conn)=quality_connection(&ai){
+        if let Ok(mut stmt)=conn.prepare("SELECT asset_id,sharp,hi,mean FROM quality WHERE version=?"){
+            if let Ok(rows)=stmt.query_map([crate::quality::QUALITY_VERSION],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,f64>(1)?,r.get::<_,f64>(2)?,r.get::<_,f64>(3)?))){
+                for row in rows.flatten(){let(id,sharp,hi,mean)=row;if !ids.contains(&id){continue}for flag in crate::quality::flags(sharp,hi,0.0,mean){*counts.entry(flag).or_default()+=1;}}
+            }
+        }
+    }
+    Ok(["blur","over","under"].into_iter().map(|value|db::ValueCount{value:value.into(),count:*counts.get(value).unwrap_or(&0)}).collect())
+}
+
 #[tauri::command(async)]
 pub fn import_photosort_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,writer:State<'_,CatalogWriterState>)->Result<ColorImportResult,String>{
     let Some(path)=ai.0.photosort_corrections_path() else{return Err("Photosort learned priečinok nie je dostupný".into())};let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let done:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).unwrap_or(false);if done{return Ok(ColorImportResult{done:true,matched:0,ambiguous:0,missing:0});}
@@ -180,6 +288,24 @@ pub fn set_asset_values(
     for id in asset_ids.iter().copied().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
     for candidate in candidates { let _ = listing.0.invalidate_path(&candidate.folder_path); }
     Ok(result)
+}
+
+#[tauri::command(async)]
+pub fn get_asset_labels(state: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>) -> Result<Vec<(i64, Option<String>)>, String> {
+    let mut labels = Vec::new();
+    for id in asset_ids.iter().copied().filter(|id| *id < 0) {
+        if let Some(asset) = listing.0.asset(id) { labels.push((id, asset.label)); }
+    }
+    let conn = state.0.lock().map_err(|_| "catalog lock poisoned")?;
+    let listed_ids = asset_ids.iter().copied().filter(|id| *id >= 0).collect::<Vec<_>>();
+    for chunk in listed_ids.chunks(500) {
+        if chunk.is_empty() { continue; }
+        let marks = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+        let sql = format!("SELECT id,label FROM assets WHERE is_listed=1 AND id IN ({marks})");
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        labels.extend(stmt.query_map(rusqlite::params_from_iter(chunk.iter()), |row| Ok((row.get(0)?, row.get(1)?))).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?);
+    }
+    Ok(labels)
 }
 
 #[tauri::command(async)]
@@ -292,7 +418,7 @@ pub fn get_assets(
     // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
     // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
     if filter.kind == "folder" && filter.offset == 0 { let _ = auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter); }
-    if filter.sort == "similarity" {
+    if filter.sort == "similarity" && filter.kind != "series" {
         let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
         let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
         loop {base.offset=offset;let page=if filter.kind=="folder"{listing.0.page(&base)?}else{db::assets_page(&state.0,&base,&formats.0).map_err(|e|e.to_string())?};total=page.total;total_size=page.total_size;let count=page.items.len();all.extend(page.items);offset+=count as i64;if count<500||offset>=total{break}}
@@ -396,6 +522,7 @@ pub fn get_asset_ids(
     limit: i64,
 ) -> Result<Vec<i64>, String> {
     if filter.kind == "folder" { let mut f=filter; f.offset=offset; f.limit=limit; return Ok(listing.0.page(&f)?.items.into_iter().map(|a|a.id).collect()); }
+    if filter.kind == "series" { let mut f=filter;f.offset=offset;f.limit=limit;return Ok(db::assets_page(&state.0,&f,&formats.0).map_err(|e|e.to_string())?.items.into_iter().map(|a|a.id).collect()); }
     db::asset_ids_page(&state.0, &filter, &formats.0, offset, limit).map_err(|e| e.to_string())
 }
 #[tauri::command(async)]

@@ -13,6 +13,7 @@ pub mod journal;
 mod listing;
 mod metadata_view;
 mod paths;
+mod quality;
 mod schema;
 mod thumbs;
 
@@ -140,6 +141,7 @@ pub fn run() {
             commands::ai_search_text,
             commands::ai_similar,
             commands::ai_duplicate_groups,
+            commands::ai_series,
             commands::ai_suggest,
             commands::ai_reject_suggestion,
             commands::ai_suggestion_groups,
@@ -147,6 +149,8 @@ pub fn run() {
             commands::set_asset_colors,
             commands::get_asset_colors,
             commands::get_color_counts,
+            commands::get_asset_quality,
+            commands::get_quality_counts,
             commands::import_photosort_colors,
             commands::get_photosort_color_import_status,
             commands::get_recent_changes,
@@ -157,6 +161,7 @@ pub fn run() {
             commands::rename_file,
             commands::create_folder,
             commands::set_asset_values,
+            commands::get_asset_labels,
             commands::set_asset_categories,
             commands::get_category_selection_counts,
             commands::get_keyword_selection_counts,

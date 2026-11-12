@@ -377,6 +377,7 @@ fn order_clause(sort: &str, descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     let (expr, empty) = match sort {
         "date" | "dateTaken" => ("coalesce(a.exif_date,a.file_modified)", "coalesce(a.exif_date,a.file_modified) IS NULL OR coalesce(a.exif_date,a.file_modified)=''"),
+        "captureTime" => ("a.exif_date", "a.exif_date IS NULL OR a.exif_date=''"),
         "modified" => ("a.file_modified", "a.file_modified IS NULL OR a.file_modified=''"),
         "size" => ("a.size", "a.size IS NULL"), "type" => ("a.ext_lower", "a.ext_lower IS NULL OR a.ext_lower=''"),
         "dimensions" => ("coalesce(a.width,0)*coalesce(a.height,0)", "a.width IS NULL OR a.height IS NULL"),
@@ -411,6 +412,7 @@ pub fn compare_assets(a: &Asset, b: &Asset, sort: &str, descending: bool) -> std
     let empty_a; let empty_b;
     let (cmp, ea, eb) = match sort {
         "date" | "dateTaken" => { let av=a.exif_date.as_ref().or(a.file_modified.as_ref()); let bv=b.exif_date.as_ref().or(b.file_modified.as_ref()); (av.cmp(&bv), av.is_none(), bv.is_none()) },
+        "captureTime" => (a.exif_date.cmp(&b.exif_date), a.exif_date.as_deref().is_none_or(str::is_empty), b.exif_date.as_deref().is_none_or(str::is_empty)),
         "modified" => (a.file_modified.cmp(&b.file_modified), a.file_modified.is_none(), b.file_modified.is_none()),
         "size" => (a.size.partial_cmp(&b.size).unwrap_or(Ordering::Equal), a.size.is_none(), b.size.is_none()),
         "type" => (a.ext.to_lowercase().cmp(&b.ext.to_lowercase()), a.ext.is_empty(), b.ext.is_empty()),
@@ -442,9 +444,10 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
 }
 
 pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
-    if filter.kind == "ai" { return ai_assets_page(db, filter, formats); }
+    if filter.kind == "ai" || filter.kind == "series" { return ai_assets_page(db, filter, formats); }
     let conn = db.lock().unwrap();
     let ai_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
+    let quality_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
     let extra_cols = filter.include_categories as i64 + filter.include_keywords as i64;
     let mut from_sql = String::from("assets a");
@@ -511,6 +514,10 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
                 }
             }
         }
+        "quality" => match filter.value.as_deref().and_then(crate::quality::flag_sql) {
+            Some(fragment) if quality_attached => where_sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM ai.quality q WHERE q.asset_id=a.id AND q.version={} AND ({fragment}))",crate::quality::QUALITY_VERSION)),
+            _ => where_sql.push_str(" AND 0"),
+        },
         "special" => match filter.value.as_deref().unwrap_or("") {
             "all_photos" => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
@@ -580,7 +587,8 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
 
 fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
     let mut seen = HashSet::new();
-    let ids = filter.ids.as_deref().unwrap_or_default().iter().copied().filter(|id| *id > 0 && seen.insert(*id)).take(500).collect::<Vec<_>>();
+    let cap=if filter.kind=="series"{20_000}else{500};
+    let ids = filter.ids.as_deref().unwrap_or_default().iter().copied().filter(|id| *id > 0 && seen.insert(*id)).take(cap).collect::<Vec<_>>();
     if ids.is_empty() { return Ok(AssetPage { items: Vec::new(), total: 0, total_size: 0.0 }); }
     let requested = ids.iter().enumerate().map(|(index, _)| format!("(?{}, {})", index + 1, index)).collect::<Vec<_>>().join(",");
     let with_sql = format!("WITH requested(id,ord) AS (VALUES {requested})");
@@ -636,6 +644,7 @@ pub fn asset_ids_page(
     limit: i64,
 ) -> rusqlite::Result<Vec<i64>> {
     let conn = db.lock().unwrap();
+    let quality_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let mut with_sql = String::new();
     let mut from_sql = String::from("assets a");
     let mut where_sql = format!("a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
@@ -685,6 +694,10 @@ pub fn asset_ids_page(
             where_sql.push_str(" AND coalesce(a.label,'')=?");
             args.push(filter.value.clone().unwrap_or_default().into())
         }
+        "quality" => match filter.value.as_deref().and_then(crate::quality::flag_sql) {
+            Some(fragment) if quality_attached => where_sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM ai.quality q WHERE q.asset_id=a.id AND q.version={} AND ({fragment}))",crate::quality::QUALITY_VERSION)),
+            _ => where_sql.push_str(" AND 0"),
+        },
         "special" => match filter.value.as_deref().unwrap_or("") {
             "all_photos" => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),

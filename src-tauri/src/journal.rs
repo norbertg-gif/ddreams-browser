@@ -723,7 +723,7 @@ fn parse_asset_updates(values: &serde_json::Map<String, Value>) -> Result<AssetU
             "label" => {
                 result.label = Some(if value.is_null() { None } else {
                     let label = value.as_str().ok_or("Invalid colour label")?;
-                    if !["Red", "Yellow", "Green", "Blue", "Purple"].contains(&label) { return Err("Invalid colour label".into()); }
+                    if !["Red", "Yellow", "Green", "Blue", "Purple", "Gray"].contains(&label) { return Err("Invalid colour label".into()); }
                     Some(label.to_owned())
                 });
             }
@@ -745,7 +745,7 @@ fn update_summary_parts(updates: &AssetUpdates, tagged: Option<bool>) -> Vec<Str
 }
 
 fn label_name(value: &str) -> &str {
-    match value { "Red" => "Červená", "Yellow" => "Žltá", "Green" => "Zelená", "Blue" => "Modrá", "Purple" => "Fialová", _ => value }
+    match value { "Red" => "Červená", "Yellow" => "Žltá", "Green" => "Zelená", "Blue" => "Modrá", "Purple" => "Fialová", "Gray" => "Na vyradenie", _ => value }
 }
 
 fn slovak_count(count: usize, one: &'static str, few: &'static str, many: &'static str) -> &'static str {

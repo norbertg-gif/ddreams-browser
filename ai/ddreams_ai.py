@@ -23,6 +23,7 @@ MODEL_NAME = "ViT-L-16-SigLIP2-256"
 DIMENSION = 1024
 SCHEMA_VERSION = "1"
 COLOR_VERSION = 1
+QUALITY_VERSION = 1
 TEXT_PROB_FLOOR = 0.003
 TEXT_PROB_RELATIVE = 0.05
 SIMILARITY_COSINE_FLOOR = 0.60
@@ -186,20 +187,46 @@ def decode_photo(item: dict[str, Any]):
             image = Image.fromarray(np.asarray(thumb.data).reshape(thumb.height, thumb.width, 3), "RGB")
         else:
             raise ValueError(f"RAW preview format nepodporovaný: {thumb.format}")
-        image = ImageOps.exif_transpose(image).convert("RGB")
-        image.thumbnail((512, 512), Image.Resampling.BICUBIC)
-        return image
+        return _finish_decoded(ImageOps.exif_transpose(image).convert("RGB"))
 
     image = Image.open(path)
     if ext in {"jpg", "jpeg", "png"}:
-        image.draft("RGB", (512, 512))
+        image.draft("RGB", (1024, 1024))
     if ext in {"tif", "tiff"}:
-        image.thumbnail((512, 512), Image.Resampling.BICUBIC)
+        image.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
     image = ImageOps.exif_transpose(image)
     image.load()
-    image = image.convert("RGB")
+    return _finish_decoded(image.convert("RGB"))
+
+
+def _finish_decoded(image: Any):
+    """Measure quality while the image is still up to 1024 px, then reduce it to the model input size."""
+    from PIL import Image
+
+    quality = compute_quality(image)
     image.thumbnail((512, 512), Image.Resampling.BICUBIC)
+    image.info["ddreams_quality"] = quality
     return image
+
+
+def compute_quality(image: Any) -> tuple[float, float, float, float]:
+    """Return sharpness, clipped highlights/shadows and normalized mean luma."""
+    from PIL import Image
+
+    rgb_image = image.convert("RGB")
+    if max(rgb_image.size) > 1024:
+        scale = 1024 / max(rgb_image.size)
+        rgb_image = rgb_image.resize((max(1, round(rgb_image.width * scale)), max(1, round(rgb_image.height * scale))), Image.Resampling.BILINEAR)
+    rgb = np.asarray(rgb_image, dtype=np.float32)
+    luma = rgb[:, :, 0] * np.float32(0.299) + rgb[:, :, 1] * np.float32(0.587) + rgb[:, :, 2] * np.float32(0.114)
+    padded = np.pad(luma, 1, mode="edge")
+    laplacian = padded[:-2, 1:-1] + padded[2:, 1:-1] + padded[1:-1, :-2] + padded[1:-1, 2:] - 4 * luma
+    tile_variances = []
+    for ys in np.array_split(np.arange(luma.shape[0]), 12):
+        for xs in np.array_split(np.arange(luma.shape[1]), 12):
+            tile_variances.append(float(np.var(laplacian[np.ix_(ys, xs)])) if len(ys) and len(xs) else 0.0)
+    total = luma.size
+    return float(np.mean(sorted(tile_variances)[-3:])), float(np.count_nonzero(luma >= 250) / total), float(np.count_nonzero(luma <= 5) / total), float(np.mean(luma, dtype=np.float64) / 255.0)
 
 
 class SiglipEmbedder:
@@ -335,6 +362,7 @@ class AIService:
             CREATE TABLE IF NOT EXISTS embeddings(asset_id INTEGER PRIMARY KEY, model TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL);
             CREATE TABLE IF NOT EXISTS failures(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, error TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS colors(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, shares TEXT NOT NULL, auto TEXT NOT NULL, version INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS quality(asset_id INTEGER PRIMARY KEY, size INTEGER, mtime_ns INTEGER, sharp REAL, hi REAL, lo REAL, mean REAL, version INTEGER);
         """)
         self.db_lock = threading.RLock()
         self._lock = threading.RLock()
@@ -359,6 +387,7 @@ class AIService:
         self._stop = False
         self._paused = False
         self._queue: list[dict[str, Any]] = []
+        self._quality_queue: list[dict[str, Any]] = []
         self._generation = 0
         self._active = False
         self._done = self._failed = self._offline = 0
@@ -462,11 +491,11 @@ class AIService:
                 state = "paused"
             elif not self._model_ready.is_set():
                 state = "loading"
-            elif self._active or self._queue:
+            elif self._active or self._queue or self._quality_queue:
                 state = "indexing"
             else:
                 state = "ready"
-            queued = len(self._queue)
+            queued = len(self._queue) + len(self._quality_queue)
             elapsed = max(0.001, time.monotonic() - self._started_at) if self._started_at else 0.0
             processed = self._done + self._failed + self._offline
             rate = processed / elapsed if elapsed else 0.0
@@ -515,7 +544,7 @@ class AIService:
         with self.db_lock:
             removed = 0
             if prune:
-                current = {int(row[0]) for row in self.db.execute("SELECT asset_id FROM embeddings")} | {int(row[0]) for row in self.db.execute("SELECT asset_id FROM failures")}
+                current = {int(row[0]) for row in self.db.execute("SELECT asset_id FROM embeddings")} | {int(row[0]) for row in self.db.execute("SELECT asset_id FROM failures")} | {int(row[0]) for row in self.db.execute("SELECT asset_id FROM quality")}
                 remove = current - ids
                 removed = len(remove)
                 if remove:
@@ -523,17 +552,22 @@ class AIService:
                     self.db.execute(f"DELETE FROM embeddings WHERE asset_id IN ({marks})", tuple(remove))
                     self.db.execute(f"DELETE FROM failures WHERE asset_id IN ({marks})", tuple(remove))
                     self.db.execute(f"DELETE FROM colors WHERE asset_id IN ({marks})", tuple(remove))
+                    self.db.execute(f"DELETE FROM quality WHERE asset_id IN ({marks})", tuple(remove))
                 self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
             old = {int(a): (str(m), int(s), int(t)) for a, m, s, t in self.db.execute("SELECT asset_id,model,size,mtime_ns FROM embeddings")}
             failed_old = {int(a): (int(s), int(t)) for a, s, t in self.db.execute("SELECT asset_id,size,mtime_ns FROM failures")}
             color_old = {int(a): (int(s), int(t), int(v)) for a, s, t, v in self.db.execute("SELECT asset_id,size,mtime_ns,version FROM colors")}
+            quality_old = {int(a): (s, t, v) for a, s, t, v in self.db.execute("SELECT asset_id,size,mtime_ns,version FROM quality")}
             queued, upto, failed_before = [], 0, 0
+            quality_queued = []
             for item in items:
                 aid, size, mtime = item["asset_id"], item["size"], item["mtime_ns"]
                 if old.get(aid) == (self.model_name, size, mtime):
                     upto += 1
                     if color_old.get(aid) != (size, mtime, COLOR_VERSION):
                         queued.append({**item, "colors_only": True})
+                    elif quality_old.get(aid) != (size, mtime, QUALITY_VERSION):
+                        quality_queued.append({**item, "quality_only": True})
                 elif failed_old.get(aid) == (size, mtime):
                     failed_before += 1
                 else:
@@ -545,18 +579,25 @@ class AIService:
         if removed and self._embedder is not None:
             self._embedder.remove_index(list(current - ids))
         with self._condition:
+            queued_ids = {item["asset_id"] for item in queued}
+            self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in queued_ids]
             if append:
                 queued_ids = {item["asset_id"] for item in self._queue}
                 queued = [item for item in queued if item["asset_id"] not in queued_ids]
                 self._queue.extend(queued)
-                self._total += len(queued)
+                priority_ids = queued_ids | {item["asset_id"] for item in queued}
+                pending_quality = {item["asset_id"] for item in self._quality_queue}
+                quality_to_add = [item for item in quality_queued if item["asset_id"] not in priority_ids | pending_quality]
+                self._quality_queue.extend(quality_to_add)
+                self._total += len(queued) + len(quality_to_add)
                 if queued and self._started_at is None:
                     self._started_at = time.monotonic()
             else:
                 self._generation = generation
                 self._queue = queued
+                self._quality_queue = [item for item in quality_queued if item["asset_id"] not in queued_ids]
                 self._done = self._failed = self._offline = 0
-                self._total = len(queued)
+                self._total = len(queued) + len(self._quality_queue)
                 self._started_at = time.monotonic() if queued else None
                 self._last_error = None
             self._condition.notify_all()
@@ -576,7 +617,7 @@ class AIService:
                 chunk = asset_ids[start:start + 500]
                 marks = ",".join("?" for _ in chunk)
                 known |= {int(r[0]) for r in self.db.execute(f"SELECT asset_id FROM embeddings WHERE asset_id IN ({marks})", chunk)}
-                for table in ("embeddings", "failures", "colors"):
+                for table in ("embeddings", "failures", "colors", "quality"):
                     self.db.execute(f"DELETE FROM {table} WHERE asset_id IN ({marks})", chunk)
             self.db.commit()
             self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
@@ -585,7 +626,9 @@ class AIService:
         with self._condition:
             before = len(self._queue)
             self._queue = [item for item in self._queue if item["asset_id"] not in forget]
-            self._total = max(0, self._total - (before - len(self._queue)))
+            before_quality = len(self._quality_queue)
+            self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in forget]
+            self._total = max(0, self._total - (before - len(self._queue)) - (before_quality - len(self._quality_queue)))
             self._condition.notify_all()
         return {"forgotten": len(known)}
 
@@ -595,19 +638,22 @@ class AIService:
         try:
             while True:
                 with self._condition:
-                    while not self._stop and (self._paused or not self._model_ready.is_set() or self._model_error or not self._queue):
+                    while not self._stop and (self._paused or not self._model_ready.is_set() or self._model_error or (not self._queue and not self._quality_queue)):
                         self._condition.wait(timeout=0.5)
                     if self._stop:
                         return
                     generation = self._generation
-                    batch, self._queue = self._queue[:BATCH_SIZE], self._queue[BATCH_SIZE:]
+                    if self._queue:
+                        batch, self._queue = self._queue[:BATCH_SIZE], self._queue[BATCH_SIZE:]
+                    else:
+                        batch, self._quality_queue = self._quality_queue[:4], self._quality_queue[4:]
                     self._active = True
                 self._process_batch(batch, generation, pool)
         finally:
             pool.shutdown(wait=True)
 
     def _process_batch(self, batch: list[dict[str, Any]], generation: int, pool: concurrent.futures.ThreadPoolExecutor) -> None:
-        success, errors, offline, color_rows = [], [], [], []
+        success, errors, offline, color_rows, quality_rows = [], [], [], [], []
         futures = {pool.submit(self.decoder, item): item for item in batch if os.path.isfile(item["path"])}
         offline.extend(item for item in batch if not os.path.isfile(item["path"]))
         decoded, decoded_items = [], []
@@ -616,14 +662,16 @@ class AIService:
                 image = future.result()
                 decoded.append(image)
                 decoded_items.append(item)
-                shares = palette_counts(image)
-                color_rows.append((item, shares, dominant_colors(shares, {name: float(value["threshold"]) for name, value in self.color_thresholds.items()})))
+                quality_rows.append((item, getattr(image, "info", {}).get("ddreams_quality") or compute_quality(image)))
+                if not item.get("quality_only"):
+                    shares = palette_counts(image)
+                    color_rows.append((item, shares, dominant_colors(shares, {name: float(value["threshold"]) for name, value in self.color_thresholds.items()})))
             except Exception as exc:
                 if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) in {21, 53, 67, 1167}:
                     offline.append(item)
                 else:
                     errors.append((item, f"{type(exc).__name__}: {exc}"))
-        embed_positions = [index for index, item in enumerate(decoded_items) if not item.get("colors_only")]
+        embed_positions = [index for index, item in enumerate(decoded_items) if not item.get("colors_only") and not item.get("quality_only")]
         embed_images = [decoded[index] for index in embed_positions]
         embed_items = [decoded_items[index] for index in embed_positions]
         if embed_images:
@@ -650,6 +698,9 @@ class AIService:
                 for item, shares, auto in color_rows:
                     self.db.execute("INSERT OR REPLACE INTO colors(asset_id,size,mtime_ns,shares,auto,version) VALUES(?,?,?,?,?,?)",
                                     (item["asset_id"], item["size"], item["mtime_ns"], json.dumps(shares, ensure_ascii=False), json.dumps(auto, ensure_ascii=False), COLOR_VERSION))
+                for item, values in quality_rows:
+                    self.db.execute("INSERT OR REPLACE INTO quality(asset_id,size,mtime_ns,sharp,hi,lo,mean,version) VALUES(?,?,?,?,?,?,?,?)",
+                                    (item["asset_id"], item["size"], item["mtime_ns"], *values, QUALITY_VERSION))
                 for item, error in errors:
                     self.db.execute("INSERT OR REPLACE INTO failures(asset_id,size,mtime_ns,error,at) VALUES(?,?,?,?,?)",
                                     (item["asset_id"], item["size"], item["mtime_ns"], error[:2000], time.time()))
@@ -664,13 +715,13 @@ class AIService:
         final = False
         with self._condition:
             if generation == self._generation:
-                self._done += len(success) + sum(item.get("colors_only", False) for item, _, _ in color_rows)
+                self._done += len(success) + sum(item.get("colors_only", False) for item, _, _ in color_rows) + sum(item.get("quality_only", False) for item, _ in quality_rows)
                 self._failed += len(errors)
                 self._offline += len(offline)
                 self.indexed_count = new_indexed_count
                 if errors:
                     self._last_error = errors[-1][1]
-                final = not self._queue
+                final = not self._queue and not self._quality_queue
                 if final:
                     self._started_at = None
             self._active = False
@@ -948,6 +999,75 @@ class AIService:
         groups.sort(key=lambda g: (-len(g["asset_ids"]), -g["max_sim"], g["asset_ids"][0]))
         return {"groups": groups}
 
+    def _series(self, request: dict[str, Any]) -> dict[str, Any]:
+        items = request.get("items")
+        max_gap, min_sim = request.get("max_gap"), request.get("min_sim")
+        if not isinstance(items, list):
+            raise RequestError("items musí byť zoznam")
+        if isinstance(max_gap, bool) or not isinstance(max_gap, (int, float)) or not np.isfinite(max_gap) or max_gap < 0:
+            raise RequestError("max_gap musí byť nezáporné číslo")
+        if isinstance(min_sim, bool) or not isinstance(min_sim, (int, float)) or not np.isfinite(min_sim) or not -1 <= min_sim <= 1:
+            raise RequestError("min_sim musí byť číslo od -1 do 1")
+        rows, seen = [], set()
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise RequestError("Každá položka musí byť objekt")
+            aid, stamp = item.get("asset_id"), item.get("t")
+            if isinstance(aid, bool) or not isinstance(aid, int) or aid <= 0 or aid in seen:
+                raise RequestError("asset_id musí byť kladné a jedinečné")
+            if stamp is not None and (isinstance(stamp, bool) or not isinstance(stamp, (int, float)) or not np.isfinite(stamp)):
+                raise RequestError("t musí byť číslo alebo null")
+            seen.add(aid)
+            rows.append((aid, float(stamp) if stamp is not None else None, index))
+        rows.sort(key=lambda row: (row[1] is None, row[1] if row[1] is not None else 0.0, row[2]))
+        _, matrix, positions = self._index_snapshot()
+        pair_positions, pair_ids, pair_indices = [], [], []
+        for index in range(1, len(rows)):
+            left, right = rows[index - 1], rows[index]
+            if left[1] is not None and right[1] is not None and right[1] - left[1] <= max_gap and left[0] in positions and right[0] in positions:
+                pair_positions.append((positions[left[0]], positions[right[0]]))
+                pair_ids.append((left[0], right[0]))
+                pair_indices.append(index)
+        similarities = np.empty(len(pair_positions), dtype=np.float32)
+        if pair_positions:
+            left_pos, right_pos = np.asarray(pair_positions, dtype=np.int64).T
+            if isinstance(matrix, dict):
+                left_vectors = np.stack([matrix[left] for left, _ in pair_ids]).astype(np.float32, copy=False)
+                right_vectors = np.stack([matrix[right] for _, right in pair_ids]).astype(np.float32, copy=False)
+                similarities = np.sum(left_vectors * right_vectors, axis=1, dtype=np.float32)
+            else:
+                torch = self._embedder.torch
+                with torch.inference_mode():
+                    left_vectors = matrix[torch.as_tensor(left_pos, device=matrix.device)]
+                    right_vectors = matrix[torch.as_tensor(right_pos, device=matrix.device)]
+                    similarities = (left_vectors.float() * right_vectors.float()).sum(dim=1).cpu().numpy()
+        linked = {index: float(score) >= min_sim for index, score in zip(pair_indices, similarities)}
+        by_id = {row[0]: index for index, row in enumerate(rows)}
+        sharp_by_id: dict[int, float | None] = {aid: None for aid, _, _ in rows}
+        with self.db_lock:
+            for start in range(0, len(rows), 500):
+                chunk = [row[0] for row in rows[start:start + 500]]
+                marks = ",".join("?" for _ in chunk)
+                for aid, sharp in self.db.execute(f"SELECT asset_id,sharp FROM quality WHERE asset_id IN ({marks})", chunk):
+                    sharp_by_id[int(aid)] = float(sharp) if sharp is not None else None
+        groups, chain = [], []
+        def finish_chain() -> None:
+            if len(chain) < 2:
+                return
+            ids = [rows[i][0] for i in chain]
+            best = max(ids, key=lambda aid: (sharp_by_id[aid] if sharp_by_id[aid] is not None else -1.0, -rows[by_id[aid]][1]))
+            groups.append({"ids": ids, "best": best, "sharp": {str(aid): sharp_by_id[aid] for aid in ids}})
+        for index, (aid, stamp, _) in enumerate(rows):
+            if stamp is None or aid not in positions:
+                finish_chain(); chain = []
+                continue
+            if index > 0 and linked.get(index, False):
+                chain.append(index)
+            else:
+                finish_chain(); chain = [index]
+        finish_chain()
+        return {"groups": groups}
+
     def _order_by_similarity(self, request: dict[str, Any]) -> dict[str, Any]:
         asset_ids = request.get("asset_ids")
         if not isinstance(asset_ids, list) or any(isinstance(a, bool) or not isinstance(a, int) for a in asset_ids):
@@ -1044,6 +1164,8 @@ class AIService:
             return self._suggest_batch(request)
         if cmd == "duplicate_groups":
             return self._duplicate_groups(request)
+        if cmd == "series":
+            return self._series(request)
         if cmd == "order_by_similarity":
             return self._order_by_similarity(request)
         if cmd == "pause":
@@ -1110,7 +1232,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "order_by_similarity"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "order_by_similarity"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

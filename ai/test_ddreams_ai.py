@@ -8,9 +8,30 @@ import unittest
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
-from ddreams_ai import AIService, COLOR_PALETTE, DIMENSION, RequestError, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+from ddreams_ai import AIService, COLOR_PALETTE, DIMENSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+
+
+class FakePhoto:
+    def __init__(self, name): self.name = name
+    def __str__(self): return self.name
+    def convert(self, mode): return Image.new(mode, (16, 16), "white")
+
+
+class QualityTests(unittest.TestCase):
+    def test_sharp_checkerboard_scores_above_blurred_copy(self):
+        pixels = (np.indices((128, 128)).sum(axis=0) % 2 * 255).astype(np.uint8)
+        checker = Image.fromarray(pixels, mode="L").convert("RGB")
+        sharp = compute_quality(checker)[0]
+        blurred = compute_quality(checker.filter(ImageFilter.GaussianBlur(3)))[0]
+        self.assertGreater(sharp, blurred * 5)
+
+    def test_clipped_highlights_and_shadows(self):
+        self.assertEqual(compute_quality(Image.new("RGB", (16, 16), "white"))[1], 1.0)
+        _, _, lo, mean = compute_quality(Image.new("RGB", (16, 16), "black"))
+        self.assertEqual(lo, 1.0)
+        self.assertEqual(mean, 0.0)
 
 
 class FakeEmbedder:
@@ -64,7 +85,7 @@ class ServerTests(unittest.TestCase):
         self.db = self.root / "ai.sqlite"
         self.events = []
         self.next_id = 100
-        self.service = AIService(self.db, "fake", embedder_factory=FakeEmbedder, decoder=lambda item: Path(item["path"]).name, output=self.events.append)
+        self.service = AIService(self.db, "fake", embedder_factory=FakeEmbedder, decoder=lambda item: FakePhoto(Path(item["path"]).name), output=self.events.append)
         self.service.start()
         self.assertTrue(self.service._model_ready.wait(5))
         self.assertIsNone(self.service._model_error)
@@ -107,6 +128,49 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn(east1["asset_id"], [row["asset_id"] for row in similar["results"]])
         hello = self.service.execute({"cmd": "hello"})
         self.assertEqual((1, "ViT-L-16-SigLIP2-256", DIMENSION), (hello["protocol"], hello["model"], hello["dim"]))
+
+    def test_quality_is_indexed_and_backfilled_at_low_priority(self):
+        item = self.make_file("quality-backfill.jpg")
+        self.index([item]); self.wait_idle()
+        row = self.service.db.execute("SELECT size,mtime_ns,sharp,hi,lo,mean,version FROM quality WHERE asset_id=?", (item["asset_id"],)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual((item["size"], item["mtime_ns"], 1), (row[0], row[1], row[6]))
+        self.service.db.execute("DELETE FROM quality WHERE asset_id=?", (item["asset_id"],)); self.service.db.commit()
+        self.assertEqual(self.index([item])["queued"], 0)
+        self.assertEqual([queued["asset_id"] for queued in self.service._quality_queue], [item["asset_id"]])
+        self.wait_idle()
+        self.assertEqual(self.service.db.execute("SELECT count(*) FROM quality WHERE asset_id=?", (item["asset_id"],)).fetchone()[0], 1)
+
+    def series(self, timed_ids, vectors, sharp=None, max_gap=10, min_sim=0.9):
+        self.service._embedder.vectors.update(vectors)
+        for asset_id, value in (sharp or {}).items():
+            self.service.db.execute("INSERT OR REPLACE INTO quality(asset_id,sharp) VALUES(?,?)", (asset_id, value))
+        self.service.db.commit()
+        return self.service.execute({"cmd": "series", "items": [{"asset_id": aid, "t": stamp} for aid, stamp in timed_ids],
+                                     "max_gap": max_gap, "min_sim": min_sim})["groups"]
+
+    def test_series_chain_and_sharpness_tie_uses_earliest_time(self):
+        vectors = {10: np.array([1, 0], dtype=np.float32), 11: np.array([0.98, 0.2], dtype=np.float32), 12: np.array([0.96, 0.28], dtype=np.float32)}
+        groups = self.series([(10, 1.0), (11, 2.0), (12, 3.0)], vectors, {10: 12.0, 11: 25.0, 12: 25.0})
+        self.assertEqual(groups[0]["ids"], [10, 11, 12])
+        self.assertEqual(groups[0]["best"], 11)
+
+    def test_series_gap_breaks_chain(self):
+        vector = np.array([1, 0], dtype=np.float32)
+        groups = self.series([(20, 1.0), (21, 2.0), (22, 20.0)], {20: vector, 21: vector, 22: vector})
+        self.assertEqual([group["ids"] for group in groups], [[20, 21]])
+
+    def test_series_similarity_breaks_chain(self):
+        groups = self.series([(30, 1.0), (31, 2.0), (32, 3.0)], {
+            30: np.array([1, 0], dtype=np.float32), 31: np.array([1, 0], dtype=np.float32),
+            32: np.array([0, 1], dtype=np.float32),
+        })
+        self.assertEqual([group["ids"] for group in groups], [[30, 31]])
+
+    def test_missing_embedding_breaks_chain(self):
+        vector = np.array([1, 0], dtype=np.float32)
+        groups = self.series([(40, 1.0), (41, 2.0), (42, 3.0)], {40: vector, 42: vector})
+        self.assertEqual(groups, [])
 
     def test_search_cutoff_and_decode_only_color_pass(self):
         item = self.make_file("east-colors.jpg")
@@ -220,7 +284,7 @@ class ServerTests(unittest.TestCase):
             if item["asset_id"] == first["asset_id"]:
                 entered.set()
                 release.wait(5)
-            return item["path"]
+            return FakePhoto(Path(item["path"]).name)
         self.service.decoder = slow_decoder
         self.index([first])
         try:
@@ -234,7 +298,7 @@ class ServerTests(unittest.TestCase):
     def test_failures_cached_until_metadata_changes_and_offline_retry(self):
         bad = self.make_file("bad.jpg")
         offline = {"asset_id": 987654321, "path": str(self.root / "missing.jpg"), "size": 4, "mtime_ns": 5}
-        self.service.decoder = lambda item: (_ for _ in ()).throw(ValueError("decode broke")) if Path(item["path"]).name == "bad.jpg" else Path(item["path"]).name
+        self.service.decoder = lambda item: (_ for _ in ()).throw(ValueError("decode broke")) if Path(item["path"]).name == "bad.jpg" else FakePhoto(Path(item["path"]).name)
         self.index([bad, offline])
         self.wait_idle()
         self.assertEqual(self.service.status()["failed"], 1)
@@ -253,7 +317,7 @@ class ServerTests(unittest.TestCase):
             if item["asset_id"] == second["asset_id"]:
                 entered.set()
                 release.wait(5)
-            return Path(item["path"]).name
+            return FakePhoto(Path(item["path"]).name)
         self.service.decoder = slow_decoder
         self.index([second])
         self.assertTrue(entered.wait(5))

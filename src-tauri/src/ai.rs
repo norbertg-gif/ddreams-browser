@@ -6,6 +6,7 @@ use std::{collections::HashMap, fs::{self, File, OpenOptions}, io::{BufRead, Buf
 use tauri::Emitter;
 
 const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+const SERIES_PRESETS: &[(&str, f64, f64)] = &[("strict", 3.0, 0.93), ("normal", 10.0, 0.90), ("loose", 60.0, 0.86)];
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -261,6 +262,11 @@ impl AiService {
         for (index,ids) in accepted{let row=&rows[index];if level=="same"{for part in split_same_groups(&ids,&meta){groups.push(json!({"assetIds":part,"minSim":row.get("min_sim"),"maxSim":row.get("max_sim")}));}}else{groups.push(json!({"assetIds":ids,"minSim":row.get("min_sim"),"maxSim":row.get("max_sim")}));}}
         groups.sort_by_key(|g|std::cmp::Reverse(g["assetIds"].as_array().map(|a|a.len()).unwrap_or(0)));
         Ok(json!({"groups":groups}))
+    }
+
+    pub fn analyze_series(&self, items: Vec<Value>, preset: &str) -> Result<Value, String> {
+        let (_, max_gap, min_sim) = SERIES_PRESETS.iter().copied().find(|(name, _, _)| *name == preset).unwrap_or(SERIES_PRESETS[1]);
+        self.request("series", json!({"items":items,"max_gap":max_gap,"min_sim":min_sim}), Duration::from_secs(300))
     }
 
     pub fn order_by_similarity(&self,asset_ids:Vec<i64>)->Result<Vec<i64>,String>{

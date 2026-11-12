@@ -3,10 +3,11 @@ import { useEditors } from "../editors";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
-import type { Asset, CatalogAssetMetadata, FormatTable, Page, View, ViewFilters } from "../types";
+import type { Asset, AssetQuality, CatalogAssetMetadata, FormatTable, Page, View, ViewFilters } from "../types";
 import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type ThumbnailInfoConfig } from "../thumbnailInfo";
 
 const PAGE_SIZE = 120;
+const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostr\u00e1", over:"Prep\u00e1len\u00e1", under:"Tmav\u00e1" };
 type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
 declare global { interface Window { __ddreamsShift?: boolean } }
 export function formatBytes(bytes: number | null | undefined): string {
@@ -45,9 +46,10 @@ type Props = {
   readOnly: boolean;
   uiScale?: number;
   refreshToken?: number;
+  qualityToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale=1 }: Props) {
+export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale=1 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const cache = useRef(new Map<number, Asset>());
   const pages = useRef(new Set<number>());
@@ -61,6 +63,9 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const [itemsVersion, setItemsVersion] = useState(0);
   const [columns, setColumns] = useState(5);
   const [tileMetadata, setTileMetadata] = useState(new Map<number, import("../types").TileExifMetadata>());
+  const [tileQuality, setTileQuality] = useState(new Map<number, AssetQuality>());
+  const qualityCache = useRef(new Map<number, AssetQuality>());
+  const qualityRequests = useRef(new Set<number>());
   const folderPreviewCache = useRef(new Map<string, FolderPreview[]>());
   const folderPreviewGeneration = useRef(0);
   const [folderPreviews, setFolderPreviews] = useState(new Map<string, FolderPreview[]>());
@@ -159,6 +164,19 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   }, [virtualRows, columns, total, itemsVersion, folderPreviews]);
 
   const visibleSignature = virtualRows.length ? `${virtualRows[0].index}:${virtualRows[virtualRows.length - 1].index}:${columns}:${itemsVersion}` : "";
+  useEffect(()=>{qualityCache.current.clear();qualityRequests.current.clear();setTileQuality(new Map())},[refreshToken]);
+  useEffect(()=>{
+    if(!virtualRows.length)return;
+    const start=virtualRows[0].index*columns,end=Math.min(total,(virtualRows[virtualRows.length-1].index+1)*columns);
+    const ids:number[]=[];
+    for(let index=start;index<end;index++){const asset=cache.current.get(index);if(asset&&!asset.isDirectory&&asset.id>0&&!qualityCache.current.has(asset.id)&&!qualityRequests.current.has(asset.id))ids.push(asset.id)}
+    if(!ids.length)return;
+    const timer=window.setTimeout(()=>{
+      ids.forEach(id=>qualityRequests.current.add(id));
+      void invoke<AssetQuality[]>("get_asset_quality",{assetIds:ids}).then(rows=>{for(const row of rows)qualityCache.current.set(row.assetId,row);setTileQuality(new Map(qualityCache.current))}).catch(()=>{}).finally(()=>ids.forEach(id=>qualityRequests.current.delete(id)));
+    },120);
+    return()=>window.clearTimeout(timer);
+  },[visibleSignature,qualityToken,refreshToken]);
   const exifFields = thumbnailInfo.fields.map(field => field.id).filter(field => EXIF_THUMBNAIL_FIELDS.has(field));
   useEffect(() => {
     const el = scrollRef.current;
@@ -240,7 +258,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -248,7 +266,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, folderPreviews, groupNumber, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; folderPreviews: FolderPreview[]; groupNumber?:number; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
+function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
   // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
   // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
   const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
@@ -260,6 +278,8 @@ function AssetTile({ asset, folderPreviews, groupNumber, size, epoch, selected, 
   const format = formatFor(asset, formats);
   const badge = format?.group === "raw" ? ext.toUpperCase() : ext || "FILE";
   const label = asset.label?.trim();
+  const qualityReasons=quality?.flags.map(flag=>QUALITY_FLAG_TEXT[flag]??flag)??[];
+  const rejected=label?.toLowerCase()==="gray";
   const hasSizeLine = infoFields.some(field => field.id === "sizeKb" || field.id === "sizeAuto");
   const displayValue = (id: string): string => {
     const name = asset.name;
@@ -303,8 +323,9 @@ function AssetTile({ asset, folderPreviews, groupNumber, size, epoch, selected, 
   useEffect(()=>{if(!popup)return;let current=true;void invoke<CatalogAssetMetadata|null>("get_catalog_asset_metadata",{assetId:asset.id}).then(m=>{if(current)setHoverMetadata(m)}).catch(()=>{});return()=>{current=false}},[popup,asset.id]);
   useEffect(()=>{const hide=()=>setPopup(false);window.addEventListener("ddreams-scroll",hide);window.addEventListener("resize",hide);return()=>{window.removeEventListener("ddreams-scroll",hide);window.removeEventListener("resize",hide)}},[]);
   return <div ref={tileRef} draggable={!asset.isDirectory} onDragStart={e=>{if(asset.isDirectory){e.preventDefault();return;}const ids=selected&&selectedIds.length?selectedIds:[asset.id];e.dataTransfer.setData("application/x-ddreams-asset-ids",JSON.stringify(ids));e.dataTransfer.effectAllowed="copyMove";const count=ids.length,noun=count===1?"súbor":count<=4?"súbory":"súborov",dragImage=document.createElement("div");dragImage.textContent=`${count} ${noun}`;Object.assign(dragImage.style,{position:"fixed",left:"-1000px",top:"-1000px",padding:"3px 8px",borderRadius:"10px",background:"#273644",color:"#d9dfe8",fontSize:"11px",lineHeight:"14px",border:"1px solid #465461",whiteSpace:"nowrap",pointerEvents:"none"});document.body.appendChild(dragImage);// Negative offsets place the image down and right of the cursor hotspot.
-  e.dataTransfer.setDragImage(dragImage,-14,-14);window.setTimeout(()=>dragImage.remove(),0);}} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""} ${cut?"cut-pending":""} ${groupNumber!=null?`duplicate-group-${groupNumber%2}`:""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>{groupNumber!=null&&<span className="duplicate-group-badge">#{groupNumber}</span>}
+  e.dataTransfer.setDragImage(dragImage,-14,-14);window.setTimeout(()=>dragImage.remove(),0);}} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""} ${cut?"cut-pending":""} ${rejected?"rejected":""} ${groupNumber!=null?`duplicate-group-${groupNumber%2}`:""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>{groupNumber!=null&&<span className="duplicate-group-badge">#{groupNumber}</span>}
     <div className="thumb-wrap" style={{ height: size }}>
+      {best&&<span className="best-badge" title="Najostrejšia v sérii">★ najlepšia</span>}
       {!asset.isDirectory && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, tileEpoch, retry)} loading="lazy" draggable={false} onError={async () => {
         try {
           const current = latestEpoch.current;
@@ -319,11 +340,12 @@ function AssetTile({ asset, folderPreviews, groupNumber, size, epoch, selected, 
       {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
       
       {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }} />}
+      {overlayMode>0&&qualityReasons.length>0&&<span className="quality-badge" title={qualityReasons.join(", ")}>!</span>}
       {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
       {!asset.isDirectory && !hasSizeLine && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
     <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines, maxHeight: field.lines * 14 }} title={text}>{text || "\u00a0"}</div>; })}</div>
-    {menu&&createPortal(<div ref={menuRef} className="tile-context-menu" style={{left:menuPosition?.left??menu.x,top:menuPosition?.top??menu.y}} onPointerDown={e=>e.stopPropagation()} onMouseDown={e=>e.stopPropagation()} onClick={e=>e.stopPropagation()} onDoubleClick={e=>e.stopPropagation()} onContextMenu={e=>{e.preventDefault();e.stopPropagation()}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button>{!asset.isDirectory&&editors.map((editor,index)=><button key={editor.path} disabled={asset.offline||offline} title={editor.path} onClick={()=>{setMenu(null);void invoke("open_in_editor",{assetIds:selected&&selectedIds.length?selectedIds:[asset.id],exe:editor.path,multi:editor.multi}).catch(error=>window.alert(String(error)))}}>Otvoriť v: {editor.name}{index===0?" (predvolený)":""}</button>)}<button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected && selectedIds.length ? selectedIds : [asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button><button onClick={()=>{setMenu(null);onOpenThumbnailInfo()}}>Údaje pod náhľadmi…</button><hr className="menu-separator"/><div className={`write-menu-group ${readOnly?"readonly":""}`}><div className="write-menu-row"><span>Hodnotenie</span>{[1,2,3,4,5].map(value=><button key={value} title={`Ctrl+${value}`} disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{rating:value});setMenu(null)}}>★{value}</button>)}<button title="Ctrl+0" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{rating:null});setMenu(null)}}>×</button></div><div className="write-menu-row"><span>Farebný štítok</span>{[["Red","Červená"],["Yellow","Žltá"],["Green","Zelená"],["Blue","Modrá"],["Purple","Fialová"]].map(([value,label],index)=><button key={value} title={`${label} (Alt+${index+1})`} disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{label:value});setMenu(null)}}><span className="write-menu-dot" style={{backgroundColor:value.toLowerCase()}} /></button>)}<button title="Alt+0" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{label:null});setMenu(null)}}>×</button></div><button title="\\" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{tagged:"toggle"});setMenu(null)}}>Označiť / Zrušiť označenie (\)</button></div><hr className="menu-separator"/><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"move")}}>Presunúť do…</button><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"copy")}}>Kopírovať do…</button><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation([asset.id],"rename",asset)}}>Premenovať (F2)</button><hr className="menu-separator"/>{asset.id>0&&!asset.isDirectory&&<button disabled={!aiReady} title={!aiReady?aiReason:""} onClick={()=>{setMenu(null);onFindSimilar(asset)}}>Nájsť podobné</button>}<hr className="menu-separator"/><hr className="menu-separator"/><button disabled={readOnly||asset.isDirectory} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"delete",asset)}}>Odstrániť do Koša… (Del)</button><button className="menu-danger" disabled={readOnly||asset.isDirectory} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"delete-permanent",asset)}}>Zmazať natrvalo… (Shift+Del)</button></div>,document.body)}
+    {menu&&createPortal(<div ref={menuRef} className="tile-context-menu" style={{left:menuPosition?.left??menu.x,top:menuPosition?.top??menu.y}} onPointerDown={e=>e.stopPropagation()} onMouseDown={e=>e.stopPropagation()} onClick={e=>e.stopPropagation()} onDoubleClick={e=>e.stopPropagation()} onContextMenu={e=>{e.preventDefault();e.stopPropagation()}} onMouseLeave={()=>setMenu(null)}><button onClick={()=>{setMenu(null);onDoubleClick()}}>Otvoriť</button><button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"open"})}}>Otvoriť v predvolenom programe</button>{!asset.isDirectory&&editors.map((editor,index)=><button key={editor.path} disabled={asset.offline||offline} title={editor.path} onClick={()=>{setMenu(null);void invoke("open_in_editor",{assetIds:selected&&selectedIds.length?selectedIds:[asset.id],exe:editor.path,multi:editor.multi}).catch(error=>window.alert(String(error)))}}>Otvoriť v: {editor.name}{index===0?" (predvolený)":""}</button>)}<button disabled={asset.offline||offline} onClick={()=>{setMenu(null);void invoke("asset_action",{assetId:asset.id,action:"reveal"})}}>Ukázať v Prieskumníkovi</button><button onClick={async()=>{setMenu(null);const ids=selected && selectedIds.length ? selectedIds : [asset.id];const paths=await invoke<string[]>("get_asset_paths",{ids});await navigator.clipboard.writeText(paths.join("\n"))}}>Kopírovať cestu</button><button onClick={()=>{setMenu(null);onOpenThumbnailInfo()}}>Údaje pod náhľadmi…</button><hr className="menu-separator"/><div className={`write-menu-group ${readOnly?"readonly":""}`}><div className="write-menu-row"><span>Hodnotenie</span>{[1,2,3,4,5].map(value=><button key={value} title={`Ctrl+${value}`} disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{rating:value});setMenu(null)}}>★{value}</button>)}<button title="Ctrl+0" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{rating:null});setMenu(null)}}>×</button></div><div className="write-menu-row"><span>Farebný štítok</span>{[["Red","Červená"],["Yellow","Žltá"],["Green","Zelená"],["Blue","Modrá"],["Purple","Fialová"],["Gray","Na vyradenie"]].map(([value,label],index)=><button key={value} title={`${label} (Alt+${index+1})`} disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{label:value});setMenu(null)}}><span className="write-menu-dot" style={{backgroundColor:value.toLowerCase()==="gray"?"#8a8f98":value.toLowerCase()}} /></button>)}<button title="Alt+0" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{label:null});setMenu(null)}}>×</button></div><button title="\\" disabled={readOnly} onClick={()=>{onSetValues(selected&&selectedIds.length?selectedIds:[asset.id],{tagged:"toggle"});setMenu(null)}}>Označiť / Zrušiť označenie (\)</button></div><hr className="menu-separator"/><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"move")}}>Presunúť do…</button><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"copy")}}>Kopírovať do…</button><button disabled={readOnly||asset.offline||offline} onClick={()=>{setMenu(null);onFileOperation([asset.id],"rename",asset)}}>Premenovať (F2)</button><hr className="menu-separator"/>{asset.id>0&&!asset.isDirectory&&<button disabled={!aiReady} title={!aiReady?aiReason:""} onClick={()=>{setMenu(null);onFindSimilar(asset)}}>Nájsť podobné</button>}<hr className="menu-separator"/><hr className="menu-separator"/><button disabled={readOnly||asset.isDirectory} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"delete",asset)}}>Odstrániť do Koša… (Del)</button><button className="menu-danger" disabled={readOnly||asset.isDirectory} onClick={()=>{setMenu(null);onFileOperation(selected&&selectedIds.length?selectedIds:[asset.id],"delete-permanent",asset)}}>Zmazať natrvalo… (Shift+Del)</button></div>,document.body)}
     {popup && createPortal(
       <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>
         <div className="hover-image">{!asset.isDirectory && asset.path && <img src={thumbUrl(asset, 320, epoch)} />}</div>
@@ -346,10 +368,10 @@ export function thumbUrl(asset: Pick<Asset, "id" | "path" | "fileModified">, siz
   return url.toString();
 }
 export function labelText(label: string): string {
-  const names: Record<string,string> = { red:"\u010cerven\u00e1", yellow:"\u017dlt\u00e1", green:"Zelen\u00e1", blue:"Modr\u00e1", purple:"Fialov\u00e1", "\u010derven\u00e1":"\u010cerven\u00e1", "\u017elt\u00e1":"\u017dlt\u00e1", "zelen\u00e1":"Zelen\u00e1", "modr\u00e1":"Modr\u00e1", "fialov\u00e1":"Fialov\u00e1" };
+  const names: Record<string,string> = { red:"\u010cerven\u00e1", yellow:"\u017dlt\u00e1", green:"Zelen\u00e1", blue:"Modr\u00e1", purple:"Fialov\u00e1", gray:"Na vyradenie", "\u010derven\u00e1":"\u010cerven\u00e1", "\u017elt\u00e1":"\u017dlt\u00e1", "zelen\u00e1":"Zelen\u00e1", "modr\u00e1":"Modr\u00e1", "fialov\u00e1":"Fialov\u00e1" };
   return names[label.toLocaleLowerCase("sk-SK")] ?? label;
 }
 export function labelColor(label: string): string {
-  const colors: Record<string, string> = { red: "#c94c50", "\u010derven\u00e1": "#c94c50", yellow: "#c49b37", "\u017elt\u00e1": "#c49b37", green: "#4b9862", "zelen\u00e1": "#4b9862", blue: "#4e7db7", "modr\u00e1": "#4e7db7", purple: "#8866b4", "fialov\u00e1": "#8866b4" };
+  const colors: Record<string, string> = { red: "#c94c50", "\u010derven\u00e1": "#c94c50", yellow: "#c49b37", "\u017elt\u00e1": "#c49b37", green: "#4b9862", "zelen\u00e1": "#4b9862", blue: "#4e7db7", "modr\u00e1": "#4e7db7", purple: "#8866b4", "fialov\u00e1": "#8866b4", gray: "#8a8f98" };
   return colors[label.toLowerCase()] ?? "#6b7280";
 }
