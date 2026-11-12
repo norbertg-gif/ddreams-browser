@@ -113,7 +113,7 @@ export default function RightPanel({ hosts, catalogReady = true, activeColors = 
   return <>{createPortal(<aside className="right-pane props-pane">
     <div className="properties-content" tabIndex={0} onClick={event=>{if(!(event.target instanceof HTMLElement)||!event.target.closest("input,textarea,select,button"))event.currentTarget.focus()}} onKeyDown={handlePropertiesKeyDown}>
       <div className="selected-summary">{metadata?.asset.name ?? (primaryId == null ? "Nie je vybraný súbor" : "Načítavam vlastnosti…")}{selectedIds.length > 1 && <small>{selectedIds.length} vybraných súborov</small>}</div>
-      {stats.length>0&&<div className="stat-cards">{stats.map(([name,value])=><div key={name}><small>{name}</small><b title={value}>{value}</b></div>)}</div>}
+      {stats.length>0&&<div className="stat-cards">{stats.map(([name,value])=><div key={name}><small>{name}</small><b title={value}>{value?.split(" (")[0]}</b></div>)}</div>}
       {metadata?.offline && <div className="offline-note">Súbor je offline. Zobrazené sú údaje z katalógu.</div>}
       {loading && <div className="subtle">Načítavam metadáta…</div>}
       {groups.map(group => <section className="property-group" key={group.name}>

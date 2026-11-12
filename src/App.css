@@ -477,3 +477,10 @@ input[type=checkbox]{accent-color:var(--accent)}
 .center-pane .toolbar-right>select{margin-left:auto}
 .type-pills{margin-left:6px}
 .ai-search-box{flex:0 1 230px;margin-left:6px}
+
+/* a zoomed photo stays inside the viewer area; arrows stay on top of it */
+.center-pane>.viewer-overlay{overflow:hidden}
+.viewer-canvas{position:relative;overflow:hidden;min-width:0}
+.viewer-canvas .viewer-image{position:relative;z-index:1}
+.viewer-canvas .viewer-arrow{position:relative;z-index:2}
+.viewer-bar,.filmstrip,.viewer-footer{position:relative;z-index:3}
