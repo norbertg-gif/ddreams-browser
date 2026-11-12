@@ -13,11 +13,10 @@ const DEFAULT_SHORTCUTS: Shortcut[] = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
-type Props = { onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction };
+type Props = { hosts: { folders: HTMLElement; calendar: HTMLElement }; onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction };
 
-export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule }: Props) {
+export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule }: Props) {
   const folderRules = useFolderRules();
-  const [tab, setTab] = useState<"folders" | "calendar">("folders");
   const [shortcuts, setShortcuts] = useState<Shortcut[]>(() => { const v = readStored<Shortcut[]>("ddreams.shortcuts", DEFAULT_SHORTCUTS); return Array.isArray(v) ? v : DEFAULT_SHORTCUTS; });
   useEffect(() => { writeStored("ddreams.shortcuts", shortcuts); }, [shortcuts]);
   const currentPath = activeView?.kind === "folder" ? (activeView.folderPath ?? "") : "";
@@ -75,7 +74,6 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
     if (activeFolderId == null) { lastEnsuredFolder.current=null; return; }
     if (lastEnsuredFolder.current === activeFolderId) return;
     let cancelled = false;
-    setTab("folders");
     void (async () => {
       const ancestors = await invoke<Folder[]>("get_folder_ancestors", { id: activeFolderId }).catch(() => []);
       if (cancelled || !ancestors.length) return;
@@ -95,16 +93,15 @@ export default function LeftPanel({ onNavigate, activeFolderId, activeFolderIds 
   }, [activeFolderId, roots]);
 
   const activeSet = new Set([activeFolderId, ...activeFolderIds].filter((v): v is number => v != null));
-  return <FolderRulesContext.Provider value={{ rules: folderRules, onRule: onFolderRule }}><aside className="left-pane" ref={paneRef}>
+  return <FolderRulesContext.Provider value={{ rules: folderRules, onRule: onFolderRule }}>{createPortal(<aside className="left-pane" ref={paneRef}>
     <section className="shortcuts-pane" ref={shortcutsRef} style={shortcutsHeight == null ? undefined : { height: shortcutsHeight, flex: "none" }}><div className="pane-title">Skratky<button className="shortcut-add" disabled={!currentPath||shortcuts.some(s=>samePath(s.path,currentPath))} title={currentPath?`Pridať do skratiek: ${currentPath}`:"Otvor priečinok, ktorý chceš pridať"} onClick={addShortcut}>+</button></div>{shortcuts.length===0&&<small className="color-hint">Otvor priečinok a klikni na +</small>}{shortcuts.map(s => <div className="shortcut-row" key={s.path} onContextMenu={e=>{e.preventDefault();setShortcutMenu({x:e.clientX,y:e.clientY,path:s.path})}}>{renaming?.path===s.path?<input className="shortcut-rename" autoFocus value={renaming.name} onFocus={e=>e.currentTarget.select()} onChange={e=>setRenaming({path:s.path,name:e.target.value})} onBlur={commitRename} onKeyDown={e=>{if(e.key==="Enter")commitRename();else if(e.key==="Escape")setRenaming(null);e.stopPropagation()}}/>:<button className="shortcut" onClick={() => void clickShortcut(s.path)} onDoubleClick={()=>setRenaming({path:s.path,name:s.name})}><span className="folder-glyph"/><span title={`${s.path}\nPravý klik: premenovať, presunúť, odstrániť`}><b>{s.name}</b></span></button>}<button className="shortcut-remove" title={`Odstrániť skratku ${s.name} (priečinok ostane)`} onClick={()=>setShortcuts(shortcuts.filter(x=>x.path!==s.path))}>×</button></div>)}</section>
     {shortcutMenu&&(()=>{const m=shortcutMenu;const i=shortcuts.findIndex(x=>x.path===m.path);const sc=shortcuts[i];if(!sc)return null;const close=()=>setShortcutMenu(null);return createPortal(<div className="category-context-menu" style={{left:Math.min(m.x,window.innerWidth-240),top:Math.min(m.y,window.innerHeight-150)}} onMouseLeave={close}><button onClick={()=>{close();setRenaming({path:sc.path,name:sc.name})}}>Premenovať…</button><button disabled={i===0} onClick={()=>{close();moveShortcut(sc.path,-1)}}>Posunúť hore</button><button disabled={i===shortcuts.length-1} onClick={()=>{close();moveShortcut(sc.path,1)}}>Posunúť dole</button><button onClick={()=>{close();setShortcuts(prev=>prev.filter(x=>x.path!==sc.path))}}>Odstrániť zo skratiek</button></div>,document.body)})()}
     <Splitter direction="y" value={() => shortcutsHeight ?? shortcutsRef.current?.offsetHeight ?? 120} min={36} max={Math.max(36, (paneRef.current?.offsetHeight ?? 600) - 160)} onChange={setShortcutsHeight} onReset={() => setShortcutsHeight(null)}/>
-    <div className="left-tabs"><button className={tab === "folders" ? "active" : ""} onClick={() => setTab("folders")}>Priečinky</button><button className={tab === "calendar" ? "active" : ""} onClick={() => setTab("calendar")}>Kalendár</button></div>
-    {tab === "calendar" ? <CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/> : <div className="folder-tree">
+    <div className="folder-tree">
       {error && <div className="inline-error">{error}<button onClick={() => setError("")}>×</button></div>}
       {roots.map(folder => <FolderRow key={folder.id} folder={folder} depth={0} activeIds={activeSet} expanded={expanded} childrenMap={children} loading={loading.has(folder.id)} rowRefs={rowRefs} onToggle={toggle} onNavigate={navigate} onFileDrop={onFileDrop} onCreateFolder={onCreateFolder} />)}
-    </div>}
-  </aside></FolderRulesContext.Provider>;
+    </div>
+  </aside>, hosts.folders)}{createPortal(<CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/>, hosts.calendar)}</FolderRulesContext.Provider>;
 }
 
 function FolderRow({ folder, depth, activeIds, expanded, childrenMap, loading, rowRefs, onToggle, onNavigate, onFileDrop, onCreateFolder }: { folder: Folder; depth: number; activeIds: Set<number>; expanded: Set<number>; childrenMap: Map<number, Folder[]>; loading: boolean; rowRefs: MutableRefObject<Map<number, HTMLDivElement>>; onToggle: (folder: Folder) => void; onNavigate: (folder: Folder) => void; onFileDrop?: (ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void }) {

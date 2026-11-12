@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
-import Splitter from "./Splitter";
+import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { CatalogAssetLinks, Node as CatalogNode, Metadata, MetadataRow, Root, ValueCount, View } from "../types";
 import { labelColor, labelText } from "./AssetGrid";
@@ -11,22 +11,8 @@ type CategoryMutation = { changeId:number|null; summary:string; categoryId:numbe
 type KeywordMutation = { changeId:number|null;summary:string;keywordId:number|null;parentId:number|null;ancestorIds:number[];deletedKeywordIds:number[] };
 type ColorItem={value:string;name:string;hex:string;auto:boolean;effective:boolean;manualState:boolean|null};type AssetColorInfo={assetId:number;computed:boolean;colors:ColorItem[]};
 type AiSuggestion={labelId:number;path:string;score:number;count?:number;assetIds?:number[]};
-type Props = { catalogReady?: boolean; width: number; activeColors?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
-export default function RightPanel({ catalogReady = true, width, activeColors = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
-  const [tab, setTab] = useState<"properties" | "ai">("properties");
-  const [catalogWidth, setCatalogWidth] = useState(() => { try { const v = Number(localStorage.getItem("ddreams.catalogPaneWidth")); return v >= 170 && v <= 700 ? v : 270; } catch { return 270; } });
-  useEffect(() => { try { localStorage.setItem("ddreams.catalogPaneWidth", String(catalogWidth)); } catch { /* storage unavailable */ } }, [catalogWidth]);
-  const [collapsedPanes, setCollapsedPanes] = useState(() => readStored("ddreams.collapsedPanes", { props: false, catalog: false }));
-  useEffect(() => { writeStored("ddreams.collapsedPanes", collapsedPanes); }, [collapsedPanes]);
-  const STRIP = 24;
-  // A collapsed pane gives its space back to the grid; the other pane keeps its own width.
-  const catalogOpen = Math.min(catalogWidth, Math.max(170, width - 205));
-  const catalogShown = collapsedPanes.catalog ? STRIP : catalogOpen;
-  const propsShown = collapsedPanes.props ? STRIP : Math.max(200, width - catalogOpen - 5);
-  const bothOpen = !collapsedPanes.props && !collapsedPanes.catalog;
-  const dockWidth = propsShown + catalogShown + (bothOpen ? 5 : 1);
-  const collapsedStrip = (key: "props" | "catalog", title: string) => <aside className="right-pane pane-collapsed" role="button" tabIndex={0} title={`Rozbaliť panel ${title}`} onClick={() => setCollapsedPanes(v => ({ ...v, [key]: false }))} onKeyDown={e => { if (e.key === "Enter" || e.key === " ") setCollapsedPanes(v => ({ ...v, [key]: false })); }}><span className="pane-expand">‹</span><span className="pane-vertical-title">{title}</span></aside>;
-  const collapseButton = (key: "props" | "catalog", title: string) => <button className="pane-collapse" title={`Zbaliť panel ${title}`} onClick={() => setCollapsedPanes(v => ({ ...v, [key]: true }))}>›</button>;
+type Props = { hosts: { properties: HTMLElement; catalog: HTMLElement; ai: HTMLElement }; catalogReady?: boolean; activeColors?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
+export default function RightPanel({ hosts, catalogReady = true, activeColors = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
   const [metadata, setMetadata] = useState<Metadata | null>(null);
   const [assetLinks,setAssetLinks]=useState<CatalogAssetLinks|null>(null);
   const [loading, setLoading] = useState(false);
@@ -121,10 +107,12 @@ export default function RightPanel({ catalogReady = true, width, activeColors = 
     {aiReady&&aiSuggestDone&&!aiSuggestions.category.length&&!aiSuggestions.keyword.length&&assetColors.length>0&&<small className="ai-no-suggestion">{assetColors.some(asset=>!asset.computed)?"Návrhy AI: fotka ešte nie je zaindexovaná – AI index stále beží.":"Návrhy AI: pre túto fotku nie je dosť istý návrh."}</small>}
   </section>;
   const toggleGroup = (name: string) => setOpenGroups(prev => { const next = new Set(prev); if (next.has(name)) next.delete(name); else next.add(name); return next; });
-  return <div className="right-dock" style={{width:dockWidth,gridTemplateColumns:`${propsShown}px ${bothOpen?5:1}px ${catalogShown}px`}}>{collapsedPanes.props ? collapsedStrip("props","Vlastnosti") : <aside className="right-pane props-pane">
-    <div className="right-tabs"><button className={tab === "properties" ? "active" : ""} onClick={() => setTab("properties")}>Vlastnosti</button><button className={tab === "ai" ? "active" : ""} onClick={() => setTab("ai")}>AI</button>{collapseButton("props","Vlastnosti")}</div>
-    {tab === "properties" ? <div className="properties-content" tabIndex={0} onClick={event=>{if(!(event.target instanceof HTMLElement)||!event.target.closest("input,textarea,select,button"))event.currentTarget.focus()}} onKeyDown={handlePropertiesKeyDown}>
+  const stat=(pattern:RegExp)=>metadata?.rows.find(row=>pattern.test(row.name)&&row.value&&row.value!=="-")?.value;
+  const stats=([["Čas uzávierky",stat(/^(Čas uzávierky|ExposureTime)/i)],["Clona",stat(/^(Clona|FNumber)/i)],["ISO",stat(/^ISO/i)],["Ohnisková vzdialenosť",stat(/^(Ohnisk|FocalLength$)/i)]] as const).filter(item=>item[1]);
+  return <>{createPortal(<aside className="right-pane props-pane">
+    <div className="properties-content" tabIndex={0} onClick={event=>{if(!(event.target instanceof HTMLElement)||!event.target.closest("input,textarea,select,button"))event.currentTarget.focus()}} onKeyDown={handlePropertiesKeyDown}>
       <div className="selected-summary">{metadata?.asset.name ?? (primaryId == null ? "Nie je vybraný súbor" : "Načítavam vlastnosti…")}{selectedIds.length > 1 && <small>{selectedIds.length} vybraných súborov</small>}</div>
+      {stats.length>0&&<div className="stat-cards">{stats.map(([name,value])=><div key={name}><small>{name}</small><b title={value}>{value}</b></div>)}</div>}
       {metadata?.offline && <div className="offline-note">Súbor je offline. Zobrazené sú údaje z katalógu.</div>}
       {loading && <div className="subtle">Načítavam metadáta…</div>}
       {groups.map(group => <section className="property-group" key={group.name}>
@@ -142,10 +130,10 @@ export default function RightPanel({ catalogReady = true, width, activeColors = 
       <div className="copy-controls"><button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať výber</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
-    </div> : <AiPanel primaryId={primaryId} onNavigate={onNavigate} aiReady={aiReady} aiAvailable={aiAvailable} aiReason={aiReason} catalogRefreshToken={catalogRefreshToken} />}
-  </aside>}
-  {bothOpen ? <Splitter direction="x" invert value={catalogShown} min={170} max={Math.max(170, Math.min(700, width - 205))} onChange={setCatalogWidth} onReset={()=>setCatalogWidth(270)}/> : <div className="pane-gap"/>}
-  {collapsedPanes.catalog ? collapsedStrip("catalog","Katalóg") : <aside className="right-pane catalog-pane"><div className="right-tabs"><button className="active">Katalóg</button>{collapseButton("catalog","Katalóg")}</div>{!catalogReady ? <div className="catalog-content"><small className="color-hint">Načítavam katalóg…</small></div> : <CatalogPanel activeColors={activeColors} header={catalogEditor} onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} colorToken={colorToken} aiAvailable={aiAvailable} />}</aside>}</div>;
+    </div>
+  </aside>, hosts.properties)}
+  {createPortal(<aside className="right-pane ai-pane"><AiPanel primaryId={primaryId} onNavigate={onNavigate} aiReady={aiReady} aiAvailable={aiAvailable} aiReason={aiReason} catalogRefreshToken={catalogRefreshToken} /></aside>, hosts.ai)}
+  {createPortal(<aside className="right-pane catalog-pane">{!catalogReady ? <div className="catalog-content"><small className="color-hint">Načítavam katalóg…</small></div> : <CatalogPanel activeColors={activeColors} header={catalogEditor} onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} colorToken={colorToken} aiAvailable={aiAvailable} />}</aside>, hosts.catalog)}</>;
 }
 
 function AiPanel({primaryId,onNavigate,aiReady,aiAvailable,aiReason,catalogRefreshToken=0}:{primaryId:number|null;onNavigate:(view:View)=>void;aiReady:boolean;aiAvailable:boolean;aiReason:string;catalogRefreshToken?:number}){
