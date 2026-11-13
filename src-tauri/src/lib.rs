@@ -152,6 +152,7 @@ pub fn run() {
             commands::ai_faces_persons,
             commands::ai_faces_person_assets,
             commands::ai_faces_review,
+            commands::ai_faces_clusters,
             commands::ai_faces_for_assets,
             commands::ai_faces_set,
             commands::ai_faces_person_create,

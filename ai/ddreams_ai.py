@@ -34,6 +34,10 @@ FACE_MIN_SIDE = 28
 FACE_MATCH_SIM = 0.45
 FACE_STRONG_SIM = 0.60
 FACE_TOP_K = 5
+FACE_CLUSTER_MAX = 60000
+FACE_CLUSTER_SIM = 0.55
+FACE_CLUSTER_MIN_SIZE = 4
+FACE_CLUSTER_GUESS_SIM = 0.35
 FACE_TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float64)
 TEXT_PROB_FLOOR = 0.003
 TEXT_PROB_RELATIVE = 0.05
@@ -934,6 +938,16 @@ class AIService:
                 with self._condition:
                     self._face_active_ids.discard(item["asset_id"])
                     self._condition.notify_all()
+                # Faces scanned before their references existed stay unknown; re-run naming now and then.
+                self._face_scans_since_recognize = getattr(self, "_face_scans_since_recognize", 0) + 1
+                with self._condition:
+                    drained = not self._face_scan_queue
+                if self._face_scans_since_recognize >= 500 or (drained and self._face_scans_since_recognize > 0):
+                    self._face_scans_since_recognize = 0
+                    try:
+                        self._faces_recognize_all()
+                    except Exception as exc:
+                        _stderr(f"Prepočet rozpoznania tvárí zlyhal: {exc}")
 
     def _scan_face_asset(self, item: dict[str, Any], image: Any) -> int:
         from PIL import Image
@@ -1099,6 +1113,72 @@ class AIService:
             rows = self.faces_db.execute("SELECT id,asset_id,score FROM faces WHERE person_id=? AND state='auto' ORDER BY score ASC,id LIMIT ?", (person, limit)).fetchall()
         return {"faces": [{"face_id": int(a), "asset_id": int(b), "score": float(c) if c is not None else None} for a, b, c in rows]}
 
+    def _faces_clusters(self, request: dict[str, Any]) -> dict[str, Any]:
+        min_size = request.get("min_size", FACE_CLUSTER_MIN_SIZE)
+        min_sim = request.get("min_sim", FACE_CLUSTER_SIM)
+        limit = request.get("limit", 30)
+        if isinstance(min_size, bool) or not isinstance(min_size, int) or min_size < 2:
+            raise RequestError("min_size musí byť celé číslo aspoň 2")
+        if isinstance(min_sim, bool) or not isinstance(min_sim, (int, float)) or not np.isfinite(min_sim) or not 0.3 <= min_sim <= 0.9:
+            raise RequestError("min_sim musí byť od 0.3 do 0.9")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise RequestError("limit musí byť od 1 do 100")
+        if self.faces_db is None:
+            return {"available": False, "groups": [], "unknown": 0, "clustered": 0}
+        with self.faces_lock:
+            rows = self.faces_db.execute("SELECT id,asset_id,det_score,vector FROM faces WHERE state='unknown' AND person_id IS NULL AND vector IS NOT NULL ORDER BY id").fetchall()
+            ref_ids = self._face_refs_ids.copy()
+            ref_people = self._face_refs_people.copy()
+            ref_matrix = self._face_refs_matrix.copy()
+            ref_names = {int(r[0]): str(r[1]) for r in self.faces_db.execute("SELECT id,name FROM persons")}
+        if len(rows) > FACE_CLUSTER_MAX:
+            rows = sorted(rows, key=lambda r: (-(float(r[2]) if r[2] is not None else -1.0), int(r[0])))[:FACE_CLUSTER_MAX]
+            rows.sort(key=lambda r: int(r[0]))
+        n = len(rows)
+        if n < min_size:
+            return {"available": True, "groups": [], "unknown": n, "clustered": 0}
+        face_ids = np.asarray([int(r[0]) for r in rows], dtype=np.int64)
+        asset_by_id = {int(r[0]): int(r[1]) for r in rows}
+        matrix = np.stack([np.frombuffer(r[3], dtype=np.float16).astype(np.float32) for r in rows])
+        neighbours: list[list[tuple[int, float]]] = [[] for _ in range(n)]
+        for start in range(0, n, 2048):
+            scores = matrix[start:start + 2048] @ matrix.T
+            rr, cc = np.nonzero(scores >= float(min_sim))
+            for r, c in zip(rr.tolist(), cc.tolist()):
+                i = start + r
+                if i != c:
+                    neighbours[i].append((c, float(scores[r, c])))
+        order = sorted(range(n), key=lambda i: (-len(neighbours[i]), int(face_ids[i])))
+        assigned: set[int] = set()
+        groups: list[dict[str, Any]] = []
+        for seed in order:
+            if seed in assigned:
+                continue
+            members = [(i, sim) for i, sim in neighbours[seed] if i not in assigned]
+            if not members:
+                continue
+            assigned.add(seed)
+            assigned.update(i for i, _ in members)
+            group_indices = [seed, *(i for i, _ in sorted(members, key=lambda pair: (-pair[1], int(face_ids[pair[0]]))))]
+            if len(group_indices) < min_size:
+                continue
+            group_ids = [int(face_ids[i]) for i in group_indices]
+            guess = None
+            if len(ref_ids):
+                similarities = ref_matrix @ matrix[seed]
+                best = int(np.argmax(similarities))
+                score = float(similarities[best])
+                if score >= FACE_CLUSTER_GUESS_SIM:
+                    person_id = int(ref_people[best])
+                    guess = {"person_id": person_id, "name": ref_names.get(person_id, ""), "score": score}
+            group_assets = sorted({asset_by_id[fid] for fid in group_ids})
+            groups.append({"face_ids": group_ids[:300], "total": len(group_ids), "asset_ids": group_assets[:2000], "assets": len(group_assets), "guess": guess, "_seed": int(face_ids[seed])})
+        groups.sort(key=lambda g: (-g["total"], g["_seed"]))
+        for group in groups:
+            del group["_seed"]
+        groups = groups[:limit]
+        return {"available": True, "groups": groups, "unknown": n, "clustered": sum(g["total"] for g in groups)}
+
     def _faces_for_assets(self, request: dict[str, Any]) -> dict[str, Any]:
         asset_ids = self._face_ids_arg(request, "asset_ids")
         results = []
@@ -1173,6 +1253,7 @@ class AIService:
         if cmd == "faces_persons": return self._faces_persons()
         if cmd == "faces_person_assets": return self._faces_person_assets(request)
         if cmd == "faces_review": return self._faces_review(request)
+        if cmd == "faces_clusters": return self._faces_clusters(request)
         if cmd == "faces_for_assets": return self._faces_for_assets(request)
         if cmd == "faces_set": return self._faces_set(request)
         if cmd == "faces_person_create": return self._faces_person_create(request)
@@ -1873,7 +1954,7 @@ class AIService:
             return self._index_command(request)
         if cmd == "forget":
             return self._forget_command(request)
-        if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+        if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
             return self._faces_command(request)
         if cmd == "learn_colors":
             return self._learn_colors(request)
@@ -1959,7 +2040,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

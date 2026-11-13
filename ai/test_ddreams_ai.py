@@ -210,6 +210,53 @@ class FaceTests(unittest.TestCase):
         db = sqlite3.connect(target); row = db.execute("SELECT asset_id,x,y,w,h,state FROM faces").fetchone(); name = db.execute("SELECT name FROM persons").fetchone()[0]; db.close()
         self.assertEqual(row, (12, .1, .4, .3, .4, "confirmed")); self.assertEqual(name, "Žofia Čierna")
 
+    def _insert_cluster_face(self, asset_id, vector, state="unknown", person_id=None, det_score=.9):
+        vector = np.asarray(vector, dtype=np.float32)
+        vector /= np.linalg.norm(vector)
+        with self.service.faces_lock:
+            cursor = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,det_score,source,person_id,state,vector) VALUES(?,0,0,1,1,?,'ai',?,?,?)", (asset_id, det_score, person_id, state, vector.astype(np.float16).tobytes()))
+            if state in ("confirmed", "acdsee") and person_id is not None: self.service._refresh_face_references_locked()
+            self.service.faces_db.commit()
+        return int(cursor.lastrowid)
+
+    def test_faces_clusters_find_two_identities_ignore_noise_and_are_deterministic(self):
+        for identity, axis in ((0, 0), (1, 1)):
+            for offset in range(5):
+                vector = np.zeros(512, dtype=np.float32); vector[axis] = 1; vector[10 + offset] = .04
+                self._insert_cluster_face(identity * 10 + offset, vector)
+        for offset in range(3):
+            vector = np.zeros(512, dtype=np.float32); vector[30 + offset] = 1
+            self._insert_cluster_face(30 + offset, vector)
+        first = self.service.execute({"cmd": "faces_clusters", "min_size": 4})
+        second = self.service.execute({"cmd": "faces_clusters", "min_size": 4})
+        self.assertTrue(first["available"])
+        self.assertEqual(first, second)
+        self.assertEqual([group["total"] for group in first["groups"]], [5, 5])
+        self.assertEqual(first["unknown"], 13)
+
+    def test_faces_clusters_min_size_and_named_ignored_exclusion(self):
+        for i in range(4):
+            vector = np.zeros(512, dtype=np.float32); vector[0] = 1; vector[20 + i] = .03
+            self._insert_cluster_face(i + 1, vector)
+        person = self._person()
+        self._insert_cluster_face(50, np.eye(1, 512, dtype=np.float32)[0], "confirmed", person)
+        self._insert_cluster_face(51, np.eye(1, 512, dtype=np.float32)[0], "ignored")
+        result = self.service.execute({"cmd": "faces_clusters", "min_size": 4})
+        self.assertEqual(result["unknown"], 4)
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(self.service.execute({"cmd": "faces_clusters", "min_size": 5})["groups"], [])
+
+    def test_faces_clusters_guess_uses_nearest_reference_face(self):
+        person = self._person("Jana")
+        reference = np.zeros(512, dtype=np.float32); reference[0] = 1
+        self._insert_cluster_face(90, reference, "confirmed", person)
+        for i in range(4):
+            vector = reference.copy(); vector[1 + i] = .2
+            self._insert_cluster_face(100 + i, vector)
+        group = self.service.execute({"cmd": "faces_clusters"})["groups"][0]
+        self.assertEqual(group["guess"]["person_id"], person)
+        self.assertEqual(group["guess"]["name"], "Jana")
+
 class ServerTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

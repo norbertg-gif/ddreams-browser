@@ -330,6 +330,7 @@ impl AiService {
     pub fn faces_persons(&self)->Result<Value,String>{self.request("faces_persons",json!({}),Duration::from_secs(30))}
     pub fn faces_person_assets(&self,person_id:i64,include_auto:bool)->Result<Value,String>{self.request("faces_person_assets",json!({"person_id":person_id,"include_auto":include_auto}),Duration::from_secs(30))}
     pub fn faces_review(&self,person_id:i64,limit:Option<u32>)->Result<Value,String>{self.request("faces_review",json!({"person_id":person_id,"limit":limit.unwrap_or(200).clamp(1,1000)}),Duration::from_secs(30))}
+    pub fn faces_clusters(&self,min_size:Option<u32>)->Result<Value,String>{let args=min_size.map(|v|json!({"min_size":v})).unwrap_or_else(||json!({}));self.request("faces_clusters",args,Duration::from_secs(300))}
     pub fn faces_for_assets(&self,asset_ids:&[i64])->Result<Value,String>{self.request("faces_for_assets",json!({"asset_ids":asset_ids}),Duration::from_secs(30))}
     pub fn faces_set(&self,face_ids:&[i64],action:&str,person_id:Option<i64>)->Result<Value,String>{self.request("faces_set",json!({"face_ids":face_ids,"action":action,"person_id":person_id}),Duration::from_secs(30))}
     pub fn faces_person_create(&self,name:&str)->Result<Value,String>{self.request("faces_person_create",json!({"name":name}),Duration::from_secs(30))}
