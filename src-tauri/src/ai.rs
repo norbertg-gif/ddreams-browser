@@ -319,6 +319,8 @@ impl AiService {
         Ok(json!({"groups":out,"unlabeled":result.get("unlabeled").and_then(Value::as_u64).unwrap_or(0),"clustered":result.get("clustered").and_then(Value::as_u64).unwrap_or(0)}))
     }
 
+    pub fn map_build(&self)->Result<Value,String>{self.request("map_build",json!({}),Duration::from_secs(600))}
+
     pub fn category_paths(&self)->Result<Vec<(i64,String)>,String>{
         let conn=self.0.db.lock().map_err(|e|e.to_string())?;
         let ids={let mut stmt=conn.prepare("SELECT id FROM categories").map_err(|e|e.to_string())?;let rows=stmt.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;rows};

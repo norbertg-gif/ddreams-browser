@@ -146,6 +146,8 @@ pub fn run() {
             commands::ai_reject_suggestion,
             commands::ai_suggestion_groups,
             commands::ai_unsorted_clusters,
+            commands::ai_map_build,
+            commands::ai_map_data,
             commands::ai_cluster_ignore,
             commands::ai_category_paths,
             commands::ai_faces_status,

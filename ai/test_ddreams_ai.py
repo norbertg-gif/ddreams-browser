@@ -129,6 +129,34 @@ class ServerTests(unittest.TestCase):
         self.assertIsNone(self.service._model_error)
 
 
+class MapTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.root=Path(self.temp.name)
+        self.service=AIService(self.root/"map.sqlite","fake",embedder_factory=FakeEmbedder,decoder=lambda item:item["path"])
+        self.service.start();self.assertTrue(self.service._model_ready.wait(5))
+        vectors={}
+        for cluster in range(8):
+            for offset in range(4):
+                v=np.zeros(DIMENSION,dtype=np.float32);v[cluster]=1;v[10+cluster*4+offset]=0.04
+                vectors[cluster*10+offset+1]=v/np.linalg.norm(v)
+        self.service._embedder.replace_index(list(vectors),list(vectors.values()))
+
+    def tearDown(self):self.service.stop();self.temp.cleanup()
+
+    def test_build_stores_every_point_and_is_deterministic(self):
+        first=self.service._map_build();rows=self.service.db.execute("SELECT asset_id,x,y,cluster FROM map_points ORDER BY asset_id").fetchall()
+        self.assertEqual(first["points"],32);self.assertEqual(len(rows),32)
+        self.assertTrue(all(np.isfinite((x,y)).all() and 0<=x<=1 and 0<=y<=1 for _,x,y,_ in rows))
+        assignments=[r[3] for r in rows]
+        self.assertEqual(len(set(assignments[:4])),1);self.assertEqual(len(set(assignments[4:8])),1)
+        snapshot=[tuple(r) for r in rows];self.service._map_build()
+        self.assertEqual(snapshot,[tuple(r) for r in self.service.db.execute("SELECT asset_id,x,y,cluster FROM map_points ORDER BY asset_id")])
+
+    def test_tsne_small_centroid_count(self):
+        points=AIService._map_tsne(np.eye(3,dtype=np.float32))
+        self.assertEqual(points.shape,(3,2));self.assertTrue(np.isfinite(points).all())
+
+
 class FaceTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)

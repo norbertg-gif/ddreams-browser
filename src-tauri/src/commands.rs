@@ -48,6 +48,29 @@ pub fn ai_pause(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0
 pub fn ai_resume(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.resume() }
 #[tauri::command(async)]
 pub fn ai_reindex(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.reindex() }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiMapCluster { pub id:u32,pub x:f32,pub y:f32,pub r:f32,pub count:usize,pub name:Option<String> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiMapData { pub ids:Vec<i64>,pub x:Vec<f32>,pub y:Vec<f32>,pub cluster:Vec<u32>,pub clusters:Vec<AiMapCluster>,pub built_at:Option<f64>,pub indexed:usize }
+#[tauri::command(async)]
+pub fn ai_map_build(state:State<'_,AiState>)->Result<Value,String>{state.0.map_build()}
+#[tauri::command(async)]
+pub fn ai_map_data(db:State<'_,BackgroundDbState>,ai:State<'_,AiState>)->Result<AiMapData,String>{
+    let empty=||AiMapData{ids:Vec::new(),x:Vec::new(),y:Vec::new(),cluster:Vec::new(),clusters:Vec::new(),built_at:None,indexed:0};
+    let path=ai.0.ai_db_path();if !path.is_file(){return Ok(empty())}
+    let conn=match rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX){Ok(c)=>c,Err(_)=>return Ok(empty())};
+    let exists:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='map_points')",[],|r|r.get(0)).unwrap_or(false);if !exists{return Ok(empty())}
+    let points={let mut stmt=conn.prepare("SELECT asset_id,x,y,cluster FROM map_points ORDER BY asset_id").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,f32>(1)?,r.get::<_,f32>(2)?,r.get::<_,u32>(3)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};
+    let mut allowed=std::collections::HashSet::new();let catalog=db.0.lock().map_err(|_|"catalog lock poisoned")?;
+    for chunk in points.iter().map(|p|p.0).collect::<Vec<_>>().chunks(800){if chunk.is_empty(){continue}let marks=vec!["?";chunk.len()].join(",");let mut stmt=catalog.prepare(&format!("SELECT id FROM assets WHERE is_listed=1 AND id IN ({marks})")).map_err(|e|e.to_string())?;for id in stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?{allowed.insert(id.map_err(|e|e.to_string())?);}}
+    drop(catalog);let filtered=points.into_iter().filter(|p|allowed.contains(&p.0)).collect::<Vec<_>>();
+    let clusters={let mut stmt=conn.prepare("SELECT id,x,y,r,count,name FROM map_clusters ORDER BY id").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok(AiMapCluster{id:r.get::<_,u32>(0)?,x:r.get(1)?,y:r.get(2)?,r:r.get(3)?,count:r.get::<_,i64>(4)?.max(0) as usize,name:r.get(5)?})).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};
+    let built_at=conn.query_row("SELECT value FROM meta WHERE key='map_built_at'",[],|r|r.get::<_,String>(0)).ok().and_then(|v|v.parse().ok());
+    let indexed=conn.query_row("SELECT value FROM meta WHERE key='map_photo_count'",[],|r|r.get::<_,String>(0)).ok().and_then(|v|v.parse().ok()).unwrap_or(filtered.len());
+    Ok(AiMapData{ids:filtered.iter().map(|p|p.0).collect(),x:filtered.iter().map(|p|p.1).collect(),y:filtered.iter().map(|p|p.2).collect(),cluster:filtered.iter().map(|p|p.3).collect(),clusters,built_at,indexed})
+}
 #[tauri::command(async)]
 pub fn ai_search_text(state: State<'_, AiState>, query: String, limit: Option<u32>) -> Result<AiSearchResult, String> { state.0.search_text(query, limit) }
 #[tauri::command(async)]
