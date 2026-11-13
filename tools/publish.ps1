@@ -55,6 +55,8 @@ if (-not (Test-Path -LiteralPath $SourceAiScript -PathType Leaf)) { throw "AI se
 $InstallAiScript = Join-Path $InstallAiDir 'ddreams_ai.py'
 Copy-Item -LiteralPath $SourceAiScript -Destination $InstallAiScript -Force
 Write-Output "Copied AI server: $InstallAiScript"
+Copy-Item -LiteralPath (Join-Path $RepoRoot 'ai\faces_schema.py') -Destination (Join-Path $InstallAiDir 'faces_schema.py') -Force
+Write-Output "Copied faces schema: $(Join-Path $InstallAiDir 'faces_schema.py')"
 # RAW preview plugin (LibRaw via rawpy); uses the Python runtime from modules\ai\ai.json.
 $SourceRawScript = Join-Path $RepoRoot 'raw\ddreams_raw.py'
 $InstallRawDir = Join-Path $ModulesDir 'raw'

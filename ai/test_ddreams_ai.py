@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -11,6 +12,8 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ddreams_ai import AIService, COLOR_PALETTE, DIMENSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+from faces_schema import ensure_faces_schema
+from import_acdsee_faces import import_acdsee_faces
 
 
 class FakePhoto:
@@ -32,6 +35,41 @@ class QualityTests(unittest.TestCase):
         _, _, lo, mean = compute_quality(Image.new("RGB", (16, 16), "black"))
         self.assertEqual(lo, 1.0)
         self.assertEqual(mean, 0.0)
+
+
+class FakeFaceDetector:
+    def __init__(self, boxes=None): self.boxes = boxes if boxes is not None else [[30, 30, 100, 100]]
+    def detect(self, image):
+        boxes = np.asarray(self.boxes, dtype=np.float32).reshape(-1, 4)
+        scores = np.ones(len(boxes), dtype=np.float32) * 0.99
+        kps = np.tile(np.array([[40, 48], [80, 48], [60, 66], [45, 83], [75, 83]], dtype=np.float32), (len(boxes), 1, 1))
+        return boxes, scores, kps
+
+
+class FakeFaceEncoder:
+    def __init__(self, vector=None):
+        self.vector = np.asarray(vector if vector is not None else [1.0] + [0.0] * 511, dtype=np.float32)
+    def embed(self, crops): return np.tile(self.vector, (len(crops), 1))
+
+
+def _write_dbf(path, fields, records):
+    descriptors = bytearray()
+    for name, kind, length in fields:
+        desc = bytearray(32); desc[:len(name)] = name.encode("ascii"); desc[11] = ord(kind); desc[16] = length
+        descriptors.extend(desc)
+    header_len, record_len = 32 + len(descriptors) + 1, 1 + sum(f[2] for f in fields)
+    header = bytearray(32); header[0] = 3
+    struct = __import__("struct")
+    struct.pack_into("<I", header, 4, len(records)); struct.pack_into("<HH", header, 8, header_len, record_len)
+    data = header + descriptors + b"\r"
+    for deleted, values in records:
+        raw = bytearray(b"*" if deleted else b" ")
+        for (_, kind, length), value in zip(fields, values):
+            if kind == "C": raw.extend(str(value).encode("utf-8")[:length].ljust(length, b" "))
+            elif kind == "I": raw.extend(struct.pack("<i", int(value)))
+            elif kind == "B": raw.extend(struct.pack("<d", float(value)))
+        data.extend(raw)
+    path.write_bytes(data + b"\x1a")
 
 
 class FakeEmbedder:
@@ -77,6 +115,100 @@ class FakeEmbedder:
         scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in self.vectors.items() if aid != asset_id), key=lambda pair: (-pair[1], pair[0]))
         return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01} for aid, score in scores[:limit] if score >= 0.6], "searched": len(self.vectors)}
 
+
+class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.db = self.root / "ai.sqlite"
+        self.events = []
+        self.next_id = 100
+        self.service = AIService(self.db, "fake", embedder_factory=FakeEmbedder, decoder=lambda item: FakePhoto(Path(item["path"]).name), output=self.events.append)
+        self.service.start()
+        self.assertTrue(self.service._model_ready.wait(5))
+        self.assertIsNone(self.service._model_error)
+
+
+class FaceTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(); self.root = Path(self.temp.name)
+        self.service = AIService(self.root / "ai.sqlite", "fake", embedder_factory=FakeEmbedder,
+                                 decoder=lambda item: Image.new("RGB", (160, 120), "white"),
+                                 face_detector=FakeFaceDetector(), face_encoder=FakeFaceEncoder())
+
+    def tearDown(self):
+        self.service.stop(); self.temp.cleanup()
+
+    def _person(self, name="Jana"):
+        return self.service.execute({"cmd": "faces_person_create", "name": name})["id"]
+
+    def test_scan_matches_imported_box_keeps_name_and_stores_vector(self):
+        person = self._person()
+        with self.service.faces_lock:
+            cur = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,ext_id,person_id,state) VALUES(7,.18,.24,.44,.58,'acdsee',77,?,'confirmed')", (person,))
+            fid = cur.lastrowid; self.service.faces_db.commit()
+        count = self.service._scan_face_asset({"asset_id": 7, "size": 1, "mtime_ns": 2}, Image.new("RGB", (160, 120), "white"))
+        row = self.service.faces_db.execute("SELECT x,y,w,h,person_id,state,vector FROM faces WHERE id=?", (fid,)).fetchone()
+        self.assertEqual(count, 1); self.assertEqual((row[4], row[5]), (person, "confirmed"))
+        self.assertEqual((row[0], row[1], row[2], row[3]), (.18, .24, .44, .58))
+        self.assertEqual(len(row[6]), 1024); self.assertEqual(self.service.faces_db.execute("SELECT count(*) FROM face_thumbs WHERE face_id=?", (fid,)).fetchone()[0], 1)
+
+    def test_unmatched_is_unknown_and_small_detection_is_dropped(self):
+        self.service._face_detector = FakeFaceDetector([[30, 30, 100, 100], [4, 4, 20, 20]])
+        self.service._scan_face_asset({"asset_id": 8, "size": 1, "mtime_ns": 2}, Image.new("RGB", (160, 120), "white"))
+        rows = self.service.faces_db.execute("SELECT state,person_id FROM faces WHERE asset_id=8").fetchall()
+        self.assertEqual(rows, [("unknown", None)])
+
+    def test_recognition_accept_reject_threshold_and_rejected_person(self):
+        p1, p2 = self._person("A"), self._person("B")
+        with self.service.faces_lock:
+            for vector, person in (([1, 0], p1), ([1, 0], p1), ([0.8, 0.6], p2)):
+                v = np.zeros(512, dtype=np.float16); v[:2] = vector
+                self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state,vector) VALUES(1,0,0,1,1,'acdsee',?,'confirmed',?)", (person, v.tobytes()))
+            cur = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,state,vector) VALUES(2,0,0,1,1,'ai','unknown',?)", (np.eye(1, 512, dtype=np.float16).tobytes(),))
+            fid = cur.lastrowid; self.service.faces_db.commit(); self.service._refresh_face_references_locked()
+        self.service._recognize_face_ids([fid])
+        self.assertEqual(self.service.faces_db.execute("SELECT person_id,state FROM faces WHERE id=?", (fid,)).fetchone(), (p1, "auto"))
+        self.service.execute({"cmd": "faces_set", "face_ids": [fid], "action": "reject"})
+        row = self.service.faces_db.execute("SELECT person_id,state FROM faces WHERE id=?", (fid,)).fetchone()
+        self.assertEqual(row, (p2, "auto"))
+        self.assertEqual(self.service.faces_db.execute("SELECT count(*) FROM face_rejected WHERE face_id=? AND person_id=?", (fid, p1)).fetchone()[0], 1)
+
+    def test_suggested_is_cleared_when_no_reference_matches(self):
+        person = self._person()
+        with self.service.faces_lock:
+            vec = np.zeros(512, dtype=np.float16); vec[1] = 1
+            self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state,vector) VALUES(1,0,0,1,1,'acdsee',?,'confirmed',?)", (person, vec.tobytes()))
+            fid = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state,vector) VALUES(2,0,0,1,1,'acdsee',?,'suggested',?)", (person, np.eye(1,512,dtype=np.float16).tobytes())).lastrowid
+            self.service.faces_db.commit(); self.service._refresh_face_references_locked()
+        self.service._recognize_face_ids([fid])
+        self.assertEqual(self.service.faces_db.execute("SELECT person_id,state FROM faces WHERE id=?", (fid,)).fetchone(), (None, "unknown"))
+
+    def test_faces_set_actions_and_person_counts(self):
+        person = self._person(); vec = np.eye(1, 512, dtype=np.float16).tobytes()
+        with self.service.faces_lock:
+            f1 = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state,vector) VALUES(1,0,0,1,1,'ai',?,'auto',?)", (person, vec)).lastrowid
+            f2 = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,state,vector) VALUES(2,0,0,1,1,'ai','unknown',?)", (vec,)).lastrowid
+            self.service.faces_db.commit()
+        self.assertEqual(self.service.execute({"cmd": "faces_set", "face_ids": [f1], "action": "confirm"})["changed"], 1)
+        self.assertEqual(self.service.execute({"cmd": "faces_set", "face_ids": [f2], "action": "assign", "person_id": person})["changed"], 1)
+        self.assertEqual(self.service.execute({"cmd": "faces_set", "face_ids": [f2], "action": "clear"})["changed"], 1)
+        self.service.execute({"cmd": "faces_set", "face_ids": [f1], "action": "ignore"})
+        counts = self.service.execute({"cmd": "faces_persons"})["persons"][0]
+        self.assertEqual((counts["confirmed"], counts["auto"], counts["assets"]), (0, 0, 0))
+
+    def test_acdsee_dbf_import_y_flip_utf8_deleted_records_and_idempotence(self):
+        from struct import pack
+        acdsee = self.root / "acdsee"; acdsee.mkdir()
+        _write_dbf(acdsee / "Person.dbf", [("PERSON_ID", "I", 4), ("NAME", "C", 40)], [(False, [4, "Žofia Čierna"]), (True, [5, "Deleted"])])
+        _write_dbf(acdsee / "Face.dbf", [("ASSET_ID", "I", 4), ("DBB_X", "B", 8), ("DBB_Y", "B", 8), ("DBB_W", "B", 8), ("DBB_H", "B", 8), ("DESC_ID", "I", 4), ("FACE_ID", "I", 4)], [(False, [12, .1, .2, .3, .4, 90, 100]), (True, [12, .1, .2, .3, .4, 91, 101])])
+        _write_dbf(acdsee / "RecognizedPerson.dbf", [("PERSON_ID", "I", 4), ("DESC_ID_R", "I", 4), ("ISAUTO", "I", 4)], [(False, [4, 90, -1])])
+        catalog = self.root / "catalog.sqlite"; conn = sqlite3.connect(catalog); conn.execute("CREATE TABLE assets(id INTEGER PRIMARY KEY,is_listed INTEGER)"); conn.executemany("INSERT INTO assets VALUES(?,?)", [(12, 1), (13, 0)]); conn.commit(); conn.close()
+        target = self.root / "faces-import.sqlite"
+        first = import_acdsee_faces(acdsee, catalog, target); second = import_acdsee_faces(acdsee, catalog, target)
+        self.assertEqual(first["faces"], {"confirmed": 1}); self.assertEqual(second["faces"], {}); self.assertEqual(second["skipped"], 1)
+        db = sqlite3.connect(target); row = db.execute("SELECT asset_id,x,y,w,h,state FROM faces").fetchone(); name = db.execute("SELECT name FROM persons").fetchone()[0]; db.close()
+        self.assertEqual(row, (12, .1, .4, .3, .4, "confirmed")); self.assertEqual(name, "Žofia Čierna")
 
 class ServerTests(unittest.TestCase):
     def setUp(self):

@@ -19,11 +19,22 @@ from typing import Any, Callable
 
 import numpy as np
 
+# The server is started in isolated mode (-I), which leaves its own folder off sys.path.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from faces_schema import ensure_faces_schema  # noqa: E402
+
 MODEL_NAME = "ViT-L-16-SigLIP2-256"
 DIMENSION = 1024
 SCHEMA_VERSION = "1"
 COLOR_VERSION = 1
 QUALITY_VERSION = 1
+FACE_VERSION = 1
+FACE_IMAGE_MAX = 2048
+FACE_MIN_SIDE = 28
+FACE_MATCH_SIM = 0.45
+FACE_STRONG_SIM = 0.60
+FACE_TOP_K = 5
+FACE_TEMPLATE = np.array([[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366], [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float64)
 TEXT_PROB_FLOOR = 0.003
 TEXT_PROB_RELATIVE = 0.05
 SIMILARITY_COSINE_FLOOR = 0.60
@@ -192,12 +203,13 @@ def process_memory() -> dict[str, int] | None:
         return None
 
 
-def decode_photo(item: dict[str, Any]):
+def decode_photo(item: dict[str, Any], max_side: int = 512):
     """Decode a photo to an oriented RGB PIL image suitable for model input."""
     from PIL import Image, ImageOps
 
     path = item["path"]
     ext = Path(path).suffix.lower().lstrip(".")
+    decode_side = max(1024, max_side)
     if ext in {"arw", "dng", "cr2", "nef"}:
         import rawpy
 
@@ -211,24 +223,24 @@ def decode_photo(item: dict[str, Any]):
             image = Image.fromarray(np.asarray(thumb.data).reshape(thumb.height, thumb.width, 3), "RGB")
         else:
             raise ValueError(f"RAW preview format nepodporovaný: {thumb.format}")
-        return _finish_decoded(ImageOps.exif_transpose(image).convert("RGB"))
+        return _finish_decoded(ImageOps.exif_transpose(image).convert("RGB"), max_side)
 
     image = Image.open(path)
     if ext in {"jpg", "jpeg", "png"}:
-        image.draft("RGB", (1024, 1024))
+        image.draft("RGB", (decode_side, decode_side))
     if ext in {"tif", "tiff"}:
-        image.thumbnail((1024, 1024), Image.Resampling.BICUBIC)
+        image.thumbnail((decode_side, decode_side), Image.Resampling.BICUBIC)
     image = ImageOps.exif_transpose(image)
     image.load()
-    return _finish_decoded(image.convert("RGB"))
+    return _finish_decoded(image.convert("RGB"), max_side)
 
 
-def _finish_decoded(image: Any):
+def _finish_decoded(image: Any, max_side: int = 512):
     """Measure quality while the image is still up to 1024 px, then reduce it to the model input size."""
     from PIL import Image
 
     quality = compute_quality(image)
-    image.thumbnail((512, 512), Image.Resampling.BICUBIC)
+    image.thumbnail((max_side, max_side), Image.Resampling.BICUBIC)
     image.info["ddreams_quality"] = quality
     return image
 
@@ -251,6 +263,67 @@ def compute_quality(image: Any) -> tuple[float, float, float, float]:
             tile_variances.append(float(np.var(laplacian[np.ix_(ys, xs)])) if len(ys) and len(xs) else 0.0)
     total = luma.size
     return float(np.mean(sorted(tile_variances)[-3:])), float(np.count_nonzero(luma >= 250) / total), float(np.count_nonzero(luma <= 5) / total), float(np.mean(luma, dtype=np.float64) / 255.0)
+
+
+def face_detect(img: Any, det: Any, det_in: str, size: int = 640, thr: float = 0.5):
+    """SCRFD decode and greedy NMS; coordinates are in the supplied image."""
+    from PIL import Image
+    w, h = img.size
+    scale = min(size / w, size / h)
+    nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+    canvas = np.zeros((size, size, 3), dtype=np.float32)
+    canvas[:nh, :nw] = np.asarray(img.resize((nw, nh), Image.Resampling.BILINEAR), dtype=np.float32)
+    blob = ((canvas - 127.5) / 128.0).transpose(2, 0, 1)[None]
+    outs = det.run(None, {det_in: blob})
+    boxes, scores, kpss = [], [], []
+    for i, stride in enumerate((8, 16, 32)):
+        sc = outs[i].reshape(-1); bb = outs[i + 3].reshape(-1, 4) * stride; kp = outs[i + 6].reshape(-1, 10) * stride
+        n = size // stride
+        cy, cx = np.mgrid[:n, :n]
+        centers = np.stack([cx, cy], -1).reshape(-1, 2).astype(np.float32) * stride
+        centers = np.repeat(centers, 2, axis=0)
+        keep = sc >= thr
+        if not keep.any():
+            continue
+        c = centers[keep]; b = bb[keep]; k = kp[keep].reshape(-1, 5, 2)
+        boxes.append(np.stack([c[:, 0] - b[:, 0], c[:, 1] - b[:, 1], c[:, 0] + b[:, 2], c[:, 1] + b[:, 3]], 1))
+        scores.append(sc[keep]); kpss.append(c[:, None, :] + k)
+    if not boxes:
+        return np.zeros((0, 4)), np.zeros(0), np.zeros((0, 5, 2))
+    boxes = np.concatenate(boxes) / scale; scores = np.concatenate(scores); kpss = np.concatenate(kpss) / scale
+    order = np.argsort(-scores, kind="stable"); picked = []
+    while len(order):
+        i = int(order[0]); picked.append(i)
+        if len(order) == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(boxes[i, 0], boxes[rest, 0]); yy1 = np.maximum(boxes[i, 1], boxes[rest, 1])
+        xx2 = np.minimum(boxes[i, 2], boxes[rest, 2]); yy2 = np.minimum(boxes[i, 3], boxes[rest, 3])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        area_i = max(0, boxes[i, 2] - boxes[i, 0]) * max(0, boxes[i, 3] - boxes[i, 1])
+        area_r = np.maximum(0, boxes[rest, 2] - boxes[rest, 0]) * np.maximum(0, boxes[rest, 3] - boxes[rest, 1])
+        iou = inter / np.maximum(area_i + area_r - inter, 1e-12)
+        order = rest[iou <= 0.4]
+    picked = np.asarray(picked, dtype=np.int64)
+    return boxes[picked], scores[picked], kpss[picked]
+
+
+def face_align(img: Any, kps: np.ndarray):
+    from PIL import Image
+    src = kps.astype(np.float64); dst = FACE_TEMPLATE
+    ms, md = src.mean(0), dst.mean(0); a, b = src - ms, dst - md
+    cov = b.T @ a / 5; U, S, Vt = np.linalg.svd(cov); d = np.ones(2)
+    if np.linalg.det(cov) < 0: d[1] = -1
+    R = U @ np.diag(d) @ Vt; scale = (S * d).sum() / (a ** 2).sum() * 5
+    M = np.eye(3); M[:2, :2] = scale * R; M[:2, 2] = md - scale * R @ ms
+    inv = np.linalg.inv(M)
+    return img.transform((112, 112), Image.AFFINE, tuple(inv[:2].reshape(-1)), resample=Image.Resampling.BILINEAR)
+
+
+def _box_iou(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    x1, y1 = max(a[0], b[0]), max(a[1], b[1]); x2, y2 = min(a[0] + a[2], b[0] + b[2]), min(a[1] + a[3], b[1] + b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    return inter / max(a[2] * a[3] + b[2] * b[3] - inter, 1e-12)
 
 
 class SiglipEmbedder:
@@ -371,7 +444,8 @@ class AIService:
                  embedder_factory: Callable[[str | os.PathLike[str]], Any] | None = None,
                  decoder: Callable[[dict[str, Any]], Any] = decode_photo,
                  output: Callable[[dict[str, Any]], None] | None = None,
-                 seed_colors: str | os.PathLike[str] | None = None):
+                 seed_colors: str | os.PathLike[str] | None = None,
+                 face_detector: Any = None, face_encoder: Any = None):
         self.db_path = str(db_path)
         self.model_dir = str(model_dir)
         self.model_name = MODEL_NAME
@@ -381,6 +455,25 @@ class AIService:
         self.db = sqlite3.connect(self.db_path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
+        self.faces_db_path = str(Path(self.db_path).with_name("faces.sqlite"))
+        self.faces_lock = threading.RLock()
+        self.faces_db: sqlite3.Connection | None = None
+        self._faces_available = False
+        self._faces_error: str | None = None
+        self._face_model_lock = threading.Lock()
+        self._face_detector = face_detector
+        self._face_encoder = face_encoder
+        self._face_det_input = None
+        self._face_encoder_input = None
+        if face_detector is not None and face_encoder is not None:
+            self._faces_available = True
+        try:
+            self.faces_db = sqlite3.connect(self.faces_db_path, check_same_thread=False)
+            self.faces_db.execute("PRAGMA synchronous=NORMAL")
+            ensure_faces_schema(self.faces_db)
+        except Exception as exc:
+            self._faces_error = str(exc)
+            self.faces_db = None
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS embeddings(asset_id INTEGER PRIMARY KEY, model TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, dim INTEGER NOT NULL, vector BLOB NOT NULL);
@@ -413,6 +506,12 @@ class AIService:
         self._paused = False
         self._queue: list[dict[str, Any]] = []
         self._quality_queue: list[dict[str, Any]] = []
+        self._face_scan_queue: list[dict[str, Any]] = []
+        self._face_active_ids: set[int] = set()
+        self._last_face_progress = 0.0
+        self._face_refs_ids = np.empty(0, dtype=np.int64)
+        self._face_refs_people = np.empty(0, dtype=np.int64)
+        self._face_refs_matrix = np.empty((0, 512), dtype=np.float32)
         self._generation = 0
         self._active = False
         self._done = self._failed = self._offline = 0
@@ -428,6 +527,7 @@ class AIService:
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
+        self._face_worker: threading.Thread | None = None
 
     def _seed_color_thresholds(self, seed_dir: str | os.PathLike[str] | None) -> dict[str, dict[str, float | int]]:
         previous = {}
@@ -462,8 +562,10 @@ class AIService:
         self._emit({"event": "status", **self.status()})
         self._loader = threading.Thread(target=self._load_model, name="ai-model-loader", daemon=True)
         self._worker = threading.Thread(target=self._index_loop, name="ai-indexer", daemon=True)
+        self._face_worker = threading.Thread(target=self._face_scan_loop, name="ai-face-scan", daemon=True)
         self._loader.start()
         self._worker.start()
+        self._face_worker.start()
 
     def _load_model(self) -> None:
         started = time.perf_counter()
@@ -526,9 +628,16 @@ class AIService:
             processed = self._done + self._failed + self._offline
             rate = processed / elapsed if elapsed else 0.0
             eta = (queued + (BATCH_SIZE if self._active else 0)) / rate if rate else None
+            faces = {"available": bool(self._faces_available), "scanned": 0, "pending": len(self._face_scan_queue) + len(self._face_active_ids)}
+            if self.faces_db is not None and self._faces_available:
+                try:
+                    with self.faces_lock:
+                        faces["scanned"] = int(self.faces_db.execute("SELECT count(*) FROM face_scan").fetchone()[0])
+                except sqlite3.Error:
+                    pass
             return {"state": state, "indexed": self.indexed_count, "queued": queued, "done": self._done,
                     "failed": self._failed, "offline": self._offline, "rate_per_s": round(rate, 3),
-                    "eta_s": round(eta, 1) if eta is not None else None, "last_error": self._last_error}
+                    "eta_s": round(eta, 1) if eta is not None else None, "last_error": self._last_error, "faces": faces}
 
     def _validate_items(self, raw: Any) -> list[dict[str, Any]]:
         if not isinstance(raw, list):
@@ -584,10 +693,17 @@ class AIService:
             failed_old = {int(a): (int(s), int(t)) for a, s, t in self.db.execute("SELECT asset_id,size,mtime_ns FROM failures")}
             color_old = {int(a): (int(s), int(t), int(v)) for a, s, t, v in self.db.execute("SELECT asset_id,size,mtime_ns,version FROM colors")}
             quality_old = {int(a): (s, t, v) for a, s, t, v in self.db.execute("SELECT asset_id,size,mtime_ns,version FROM quality")}
+            face_old = {}
+            if self.faces_db is not None:
+                with self.faces_lock:
+                    face_old = {int(a): (s, t, v) for a, s, t, v in self.faces_db.execute("SELECT asset_id,size,mtime_ns,version FROM face_scan")}
             queued, upto, failed_before = [], 0, 0
             quality_queued = []
+            face_queued = []
             for item in items:
                 aid, size, mtime = item["asset_id"], item["size"], item["mtime_ns"]
+                if face_old.get(aid) != (size, mtime, FACE_VERSION):
+                    face_queued.append({**item, "face_scan": True})
                 if old.get(aid) == (self.model_name, size, mtime):
                     upto += 1
                     if color_old.get(aid) != (size, mtime, COLOR_VERSION):
@@ -604,7 +720,36 @@ class AIService:
             self.db.commit()
         if removed and self._embedder is not None:
             self._embedder.remove_index(list(current - ids))
+        if prune and self.faces_db is not None:
+            with self.faces_lock:
+                known_faces = {int(row[0]) for row in self.faces_db.execute("SELECT asset_id FROM face_scan UNION SELECT DISTINCT asset_id FROM faces")}
+                drop_ids = list(known_faces - ids)
+                for start in range(0, len(drop_ids), 500):
+                    chunk = drop_ids[start:start + 500]
+                    marks = ",".join("?" for _ in chunk)
+                    fids = [int(row[0]) for row in self.faces_db.execute(f"SELECT id FROM faces WHERE asset_id IN ({marks})", chunk)] if chunk else []
+                    if fids:
+                        fmarks = ",".join("?" for _ in fids)
+                        self.faces_db.execute(f"DELETE FROM face_thumbs WHERE face_id IN ({fmarks})", fids)
+                        self.faces_db.execute(f"DELETE FROM face_rejected WHERE face_id IN ({fmarks})", fids)
+                        self.faces_db.execute(f"DELETE FROM faces WHERE id IN ({fmarks})", fids)
+                    if chunk:
+                        self.faces_db.execute(f"DELETE FROM face_scan WHERE asset_id IN ({marks})", chunk)
+                self.faces_db.commit()
+                self._refresh_face_references_locked()
+        if face_queued and self.faces_db is not None:
+            # Photos that already carry imported (named) faces go first: they become the references.
+            with self.faces_lock:
+                with_faces = {int(row[0]) for row in self.faces_db.execute("SELECT DISTINCT asset_id FROM faces WHERE vector IS NULL")}
+            face_queued.sort(key=lambda item: item["asset_id"] not in with_faces)
         with self._condition:
+            pending_faces = {item["asset_id"] for item in self._face_scan_queue}
+            pending_faces |= self._face_active_ids
+            if append:
+                active_faces = pending_faces
+                self._face_scan_queue.extend(item for item in face_queued if item["asset_id"] not in active_faces)
+            else:
+                self._face_scan_queue = face_queued
             queued_ids = {item["asset_id"] for item in queued}
             self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in queued_ids]
             if append:
@@ -649,11 +794,27 @@ class AIService:
             self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
         if known and self._embedder is not None:
             self._embedder.remove_index(list(known))
+        if self.faces_db is not None:
+            with self.faces_lock:
+                for start in range(0, len(asset_ids), 500):
+                    chunk = asset_ids[start:start + 500]
+                    if not chunk: continue
+                    marks = ",".join("?" for _ in chunk)
+                    face_ids = [int(row[0]) for row in self.faces_db.execute(f"SELECT id FROM faces WHERE asset_id IN ({marks})", chunk)]
+                    if face_ids:
+                        fmarks = ",".join("?" for _ in face_ids)
+                        self.faces_db.execute(f"DELETE FROM face_thumbs WHERE face_id IN ({fmarks})", face_ids)
+                        self.faces_db.execute(f"DELETE FROM face_rejected WHERE face_id IN ({fmarks})", face_ids)
+                        self.faces_db.execute(f"DELETE FROM faces WHERE id IN ({fmarks})", face_ids)
+                    self.faces_db.execute(f"DELETE FROM face_scan WHERE asset_id IN ({marks})", chunk)
+                self.faces_db.commit()
+                self._refresh_face_references_locked()
         with self._condition:
             before = len(self._queue)
             self._queue = [item for item in self._queue if item["asset_id"] not in forget]
             before_quality = len(self._quality_queue)
             self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in forget]
+            self._face_scan_queue = [item for item in self._face_scan_queue if item["asset_id"] not in forget]
             self._total = max(0, self._total - (before - len(self._queue)) - (before_quality - len(self._quality_queue)))
             self._condition.notify_all()
         return {"forgotten": len(known)}
@@ -677,6 +838,347 @@ class AIService:
                 self._process_batch(batch, generation, pool)
         finally:
             pool.shutdown(wait=True)
+
+    def _ensure_face_models(self) -> bool:
+        if self._faces_available:
+            return True
+        if self._faces_error or self.faces_db is None:
+            return False
+        with self._face_model_lock:
+            if self._faces_available:
+                return True
+            try:
+                embedder = self._wait_model()
+                torch = getattr(embedder, "torch", None)
+                if torch is None:
+                    raise RuntimeError("Torch ešte nie je dostupné pre onnxruntime-gpu")
+                base = Path(self.model_dir).parent
+                face_dir, py_dir = base / "faces", base / "pylibs"
+                det_path, emb_path = face_dir / "det_10g.onnx", face_dir / "w600k_r50.onnx"
+                if not face_dir.is_dir() or not py_dir.is_dir() or not det_path.is_file() or not emb_path.is_file():
+                    raise FileNotFoundError("Lokálne face modely alebo pylibs chýbajú")
+                if str(py_dir) not in sys.path:
+                    sys.path.insert(0, str(py_dir))
+                import onnxruntime as ort
+                ort.set_default_logger_severity(4)
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                self._face_detector = ort.InferenceSession(str(det_path), providers=providers)
+                self._face_encoder = ort.InferenceSession(str(emb_path), providers=providers)
+                self._face_det_input = self._face_detector.get_inputs()[0].name
+                self._face_encoder_input = self._face_encoder.get_inputs()[0].name
+                self._faces_available = True
+                with self.faces_lock:
+                    self._refresh_face_references_locked()
+                _stderr("Lokálne face modely pripravené")
+            except Exception as exc:
+                self._faces_error = str(exc)
+                self._faces_available = False
+                _stderr(f"Face modely nedostupné: {exc}")
+        return self._faces_available
+
+    def _face_vectors(self, crops: list[Any]) -> np.ndarray:
+        if hasattr(self._face_encoder, "embed"):
+            values = self._face_encoder.embed(crops)
+        else:
+            blob = np.stack([(np.asarray(c, dtype=np.float32) - 127.5) / 127.5 for c in crops]).transpose(0, 3, 1, 2)
+            values = np.concatenate([self._face_encoder.run(None, {self._face_encoder_input: blob[i:i + 1]})[0] for i in range(len(blob))])
+        values = np.asarray(values, dtype=np.float32).reshape(len(crops), 512)
+        return values / np.maximum(np.linalg.norm(values, axis=1, keepdims=True), 1e-12)
+
+    def _face_detections(self, image: Any):
+        if hasattr(self._face_detector, "detect"):
+            return self._face_detector.detect(image)
+        return face_detect(image, self._face_detector, self._face_det_input)
+
+    def _face_scan_loop(self) -> None:
+        _set_background_priority()
+        while True:
+            with self._condition:
+                while not self._stop and (self._paused or not self._face_scan_queue):
+                    self._condition.wait(timeout=0.5)
+                if self._stop:
+                    return
+                item = self._face_scan_queue.pop(0)
+                self._face_active_ids.add(item["asset_id"])
+            self._model_ready.wait()
+            with self._condition:
+                while not self._stop and self._paused:
+                    self._condition.wait(timeout=0.5)
+                if self._stop: return
+            if not self._ensure_face_models():
+                with self._condition:
+                    self._face_active_ids.discard(item["asset_id"])
+                    self._face_scan_queue.clear()
+                self._emit({"event": "status", **self.status()})
+                continue
+            try:
+                if not os.path.isfile(item["path"]):
+                    continue
+                if self.decoder is decode_photo:
+                    image = decode_photo(item, FACE_IMAGE_MAX)
+                else:
+                    image = self.decoder(item)
+                try:
+                    self._scan_face_asset(item, image)
+                finally:
+                    close = getattr(image, "close", None)
+                    if close: close()
+                now = time.monotonic()
+                with self._condition:
+                    emit_progress = not self._face_scan_queue or now - self._last_face_progress >= 1.0
+                    if emit_progress: self._last_face_progress = now
+                if emit_progress: self._emit({"event": "status", **self.status()})
+            except Exception as exc:
+                _stderr(f"Sken tvárí pre {item['asset_id']} zlyhal: {exc}")
+            finally:
+                with self._condition:
+                    self._face_active_ids.discard(item["asset_id"])
+                    self._condition.notify_all()
+
+    def _scan_face_asset(self, item: dict[str, Any], image: Any) -> int:
+        from PIL import Image
+        rgb = image.convert("RGB")
+        boxes, scores, kpss = self._face_detections(rgb)
+        with self.faces_lock:
+            existing = self.faces_db.execute("SELECT id,x,y,w,h,source,person_id,state FROM faces WHERE asset_id=?", (item["asset_id"],)).fetchall()
+        candidates = []
+        for i, box in enumerate(boxes):
+            x1, y1, x2, y2 = map(float, box)
+            norm_box = (x1 / rgb.width, y1 / rgb.height, (x2 - x1) / rgb.width, (y2 - y1) / rgb.height)
+            for row in existing:
+                iou = _box_iou(norm_box, (float(row[1]), float(row[2]), float(row[3]), float(row[4])))
+                if iou >= 0.3 and (min(x2 - x1, y2 - y1) >= FACE_MIN_SIDE or row[5] == "acdsee"):
+                    candidates.append((iou, i, row))
+        used_det, used_row, matches = set(), set(), {}
+        for iou, di, row in sorted(candidates, key=lambda v: (-v[0], -float(scores[v[1]]), int(v[2][0]))):
+            if di not in used_det and int(row[0]) not in used_row:
+                used_det.add(di); used_row.add(int(row[0])); matches[di] = row
+        for i, box in enumerate(boxes):
+            if i not in used_det and min(float(box[2] - box[0]), float(box[3] - box[1])) < FACE_MIN_SIDE:
+                used_det.add(i)
+        keep = [i for i in range(len(boxes)) if i not in used_det or i in matches]
+        crops = [face_align(rgb, np.asarray(kpss[i])) for i in keep]
+        vectors = self._face_vectors(crops) if crops else np.empty((0, 512), dtype=np.float32)
+        import io as _io
+        updates = []
+        for pos, i in enumerate(keep):
+            crop = crops[pos].resize((96, 96), Image.Resampling.BILINEAR)
+            buffer = _io.BytesIO(); crop.save(buffer, format="JPEG", quality=80)
+            x1, y1, x2, y2 = map(float, boxes[i]); norm = (x1 / rgb.width, y1 / rgb.height, (x2 - x1) / rgb.width, (y2 - y1) / rgb.height)
+            updates.append((i, norm, float(scores[i]), vectors[pos].astype(np.float16).tobytes(), buffer.getvalue()))
+        with self.faces_lock:
+            for i, norm, score, vector, thumb in updates:
+                row = matches.get(i)
+                if row:
+                    fid = int(row[0]); use_box = (float(row[1]), float(row[2]), float(row[3]), float(row[4])) if row[5] == "acdsee" else norm
+                    self.faces_db.execute("UPDATE faces SET x=?,y=?,w=?,h=?,det_score=?,vector=? WHERE id=?", (*use_box, score, vector, fid))
+                else:
+                    cur = self.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,det_score,source,ext_id,person_id,state,score,vector) VALUES(?,?,?,?,?,?,'ai',NULL,NULL,'unknown',NULL,?)",
+                                                (item["asset_id"], *norm, score, vector))
+                    fid = int(cur.lastrowid)
+                self.faces_db.execute("INSERT OR REPLACE INTO face_thumbs(face_id,jpeg) VALUES(?,?)", (fid, thumb))
+            matched = {int(row[0]) for row in matches.values()}
+            for row in existing:
+                fid, source, state = int(row[0]), row[5], row[7]
+                if source == "ai" and fid not in matched and state in ("unknown", "auto"):
+                    self.faces_db.execute("DELETE FROM face_thumbs WHERE face_id=?", (fid,))
+                    self.faces_db.execute("DELETE FROM face_rejected WHERE face_id=?", (fid,))
+                    self.faces_db.execute("DELETE FROM faces WHERE id=?", (fid,))
+            self.faces_db.execute("INSERT OR REPLACE INTO face_scan(asset_id,size,mtime_ns,version,faces) VALUES(?,?,?,?,?)",
+                                  (item["asset_id"], item["size"], item["mtime_ns"], FACE_VERSION, len(updates)))
+            self.faces_db.commit()
+            self._refresh_face_references_locked()
+            ids = [int(row[0]) for row in self.faces_db.execute("SELECT id FROM faces WHERE asset_id=? AND state IN ('unknown','auto','suggested') AND vector IS NOT NULL", (item["asset_id"],))]
+        self._recognize_face_ids(ids)
+        return len(updates)
+
+    def _refresh_face_references_locked(self) -> None:
+        if self.faces_db is None:
+            self._face_refs_ids = np.empty(0, dtype=np.int64); self._face_refs_people = np.empty(0, dtype=np.int64)
+            self._face_refs_matrix = np.empty((0, 512), dtype=np.float32); return
+        rows = self.faces_db.execute("SELECT id,person_id,vector FROM faces WHERE state IN ('confirmed','acdsee') AND vector IS NOT NULL AND person_id IS NOT NULL ORDER BY id").fetchall()
+        self._face_refs_ids = np.asarray([int(row[0]) for row in rows], dtype=np.int64)
+        self._face_refs_people = np.asarray([int(row[1]) for row in rows], dtype=np.int64)
+        self._face_refs_matrix = np.stack([np.frombuffer(row[2], dtype=np.float16).astype(np.float32) for row in rows]) if rows else np.empty((0, 512), dtype=np.float32)
+
+    @staticmethod
+    def _recognition_choice(face_id: int, vector: np.ndarray, ref_ids: np.ndarray, ref_people: np.ndarray,
+                            ref_matrix: np.ndarray, rejected: set[tuple[int, int]]) -> tuple[int | None, float | None]:
+        if not len(ref_ids): return None, None
+        similarities = vector if vector.shape == (len(ref_ids),) else ref_matrix @ vector
+        valid = (ref_ids != face_id) & (similarities >= FACE_MATCH_SIM)
+        if rejected:
+            valid &= np.fromiter(((face_id, int(person)) not in rejected for person in ref_people), dtype=bool, count=len(ref_people))
+        indices = np.flatnonzero(valid)
+        if not len(indices): return None, None
+        indices = indices[np.argsort(-similarities[indices], kind="stable")[:FACE_TOP_K]]
+        sums: dict[int, float] = {}; counts: dict[int, int] = {}; best: dict[int, float] = {}
+        for i in indices:
+            person = int(ref_people[i]); sim = float(similarities[i])
+            sums[person] = sums.get(person, 0.0) + sim; counts[person] = counts.get(person, 0) + 1
+            best[person] = max(best.get(person, -1.0), sim)
+        winner = min(sums, key=lambda person: (-sums[person], person))
+        if counts[winner] >= 2 or best[winner] >= FACE_STRONG_SIM:
+            return winner, best[winner]
+        return None, None
+
+    def _recognize_face_ids(self, face_ids: list[int]) -> int:
+        if not face_ids or self.faces_db is None: return 0
+        pending = []
+        with self.faces_lock:
+            ref_ids = self._face_refs_ids.copy(); ref_people = self._face_refs_people.copy(); ref_matrix = self._face_refs_matrix.copy()
+            for start in range(0, len(face_ids), 500):
+                chunk = face_ids[start:start + 500]; marks = ",".join("?" for _ in chunk)
+                rows = self.faces_db.execute(f"SELECT id,vector FROM faces WHERE id IN ({marks}) AND vector IS NOT NULL", chunk).fetchall()
+                rejected_rows = self.faces_db.execute(f"SELECT face_id,person_id FROM face_rejected WHERE face_id IN ({marks})", chunk).fetchall()
+                rejects: dict[int, set[tuple[int, int]]] = {}
+                for face_id, person_id in rejected_rows:
+                    rejects.setdefault(int(face_id), set()).add((int(face_id), int(person_id)))
+                for fid, blob in rows:
+                    pending.append((int(fid), np.frombuffer(blob, dtype=np.float16).astype(np.float32), rejects.get(int(fid), set())))
+        changes = []
+        for start in range(0, len(pending), 256):
+            block = pending[start:start + 256]
+            if not block: continue
+            vectors = np.stack([row[1] for row in block])
+            sims = vectors @ ref_matrix.T if len(ref_ids) else np.empty((len(block), 0), dtype=np.float32)
+            for row, vector_sims in zip(block, sims):
+                fid, _, rejected = row
+                person, score = self._recognition_choice(fid, vector_sims, ref_ids, ref_people, ref_matrix, rejected)
+                changes.append((person, "auto" if person is not None else "unknown", score, fid))
+        with self.faces_lock:
+            if changes:
+                self.faces_db.executemany("UPDATE faces SET person_id=?,state=?,score=? WHERE id=?", changes)
+                self.faces_db.commit()
+        return len(changes)
+
+    def _faces_status(self) -> dict[str, Any]:
+        available = self._ensure_face_models() if self.faces_db is not None and self._model_ready.is_set() else self._faces_available
+        if not available or self.faces_db is None:
+            return {"available": False, "scanned": 0, "pending": 0, "faces": 0, "named": 0, "unknown": 0, "persons": 0}
+        with self.faces_lock:
+            scanned = int(self.faces_db.execute("SELECT count(*) FROM face_scan").fetchone()[0])
+            faces = int(self.faces_db.execute("SELECT count(*) FROM faces").fetchone()[0])
+            named = int(self.faces_db.execute("SELECT count(*) FROM faces WHERE person_id IS NOT NULL AND state!='ignored'").fetchone()[0])
+            unknown = int(self.faces_db.execute("SELECT count(*) FROM faces WHERE state IN ('unknown','suggested')").fetchone()[0])
+            persons = int(self.faces_db.execute("SELECT count(*) FROM persons").fetchone()[0])
+        with self._condition: pending = len(self._face_scan_queue) + len(self._face_active_ids)
+        return {"available": True, "scanned": scanned, "pending": pending, "faces": faces, "named": named, "unknown": unknown, "persons": persons}
+
+    @staticmethod
+    def _face_ids_arg(request: dict[str, Any], key: str, limit: int = 500) -> list[int]:
+        values = request.get(key)
+        if not isinstance(values, list) or len(values) > limit or any(isinstance(v, bool) or not isinstance(v, int) or v <= 0 for v in values):
+            raise RequestError(f"{key} musí byť zoznam kladných ID (max. {limit})")
+        return list(dict.fromkeys(values))
+
+    def _faces_persons(self) -> dict[str, Any]:
+        with self.faces_lock:
+            rows = self.faces_db.execute("""SELECT p.id,p.name,
+                sum(CASE WHEN f.state IN ('confirmed','acdsee') THEN 1 ELSE 0 END),
+                sum(CASE WHEN f.state='auto' THEN 1 ELSE 0 END),
+                count(DISTINCT CASE WHEN f.state IN ('confirmed','acdsee','auto') THEN f.asset_id END),
+                (SELECT f2.id FROM faces f2 JOIN face_thumbs t ON t.face_id=f2.id WHERE f2.person_id=p.id AND f2.state IN ('confirmed','acdsee') ORDER BY f2.id LIMIT 1)
+                FROM persons p LEFT JOIN faces f ON f.person_id=p.id GROUP BY p.id,p.name""").fetchall()
+        rows.sort(key=lambda r: str(r[1]).casefold())
+        return {"persons": [{"id": int(r[0]), "name": r[1], "confirmed": int(r[2] or 0), "auto": int(r[3] or 0), "assets": int(r[4] or 0), "cover": int(r[5]) if r[5] is not None else None} for r in rows]}
+
+    def _faces_person_assets(self, request: dict[str, Any]) -> dict[str, Any]:
+        person = request.get("person_id"); include_auto = request.get("include_auto", True)
+        if isinstance(person, bool) or not isinstance(person, int) or person <= 0 or not isinstance(include_auto, bool): raise RequestError("Neplatné person_id/include_auto")
+        states = "('confirmed','acdsee','auto')" if include_auto else "('confirmed','acdsee')"
+        with self.faces_lock:
+            ids = [int(r[0]) for r in self.faces_db.execute(f"SELECT DISTINCT asset_id FROM faces WHERE person_id=? AND state IN {states} ORDER BY asset_id", (person,))]
+        return {"asset_ids": ids}
+
+    def _faces_review(self, request: dict[str, Any]) -> dict[str, Any]:
+        person = request.get("person_id"); limit = request.get("limit", 200)
+        if isinstance(person, bool) or not isinstance(person, int) or person <= 0: raise RequestError("person_id musí byť kladné ID")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000: raise RequestError("limit musí byť od 1 do 1000")
+        with self.faces_lock:
+            rows = self.faces_db.execute("SELECT id,asset_id,score FROM faces WHERE person_id=? AND state='auto' ORDER BY score ASC,id LIMIT ?", (person, limit)).fetchall()
+        return {"faces": [{"face_id": int(a), "asset_id": int(b), "score": float(c) if c is not None else None} for a, b, c in rows]}
+
+    def _faces_for_assets(self, request: dict[str, Any]) -> dict[str, Any]:
+        asset_ids = self._face_ids_arg(request, "asset_ids")
+        results = []
+        with self.faces_lock:
+            for start in range(0, len(asset_ids), 400):
+                chunk = asset_ids[start:start + 400]; marks = ",".join("?" for _ in chunk)
+                rows = self.faces_db.execute(f"SELECT f.id,f.asset_id,f.x,f.y,f.w,f.h,f.person_id,p.name,f.state,f.score FROM faces f LEFT JOIN persons p ON p.id=f.person_id WHERE f.asset_id IN ({marks}) AND f.state!='ignored' ORDER BY f.asset_id,f.id", chunk).fetchall()
+                results.extend({"face_id": int(r[0]), "asset_id": int(r[1]), "x": r[2], "y": r[3], "w": r[4], "h": r[5], "person_id": int(r[6]) if r[6] is not None else None, "name": r[7], "state": r[8], "score": r[9]} for r in rows)
+        return {"faces": results}
+
+    def _faces_set(self, request: dict[str, Any]) -> dict[str, Any]:
+        ids = self._face_ids_arg(request, "face_ids"); action = request.get("action"); person = request.get("person_id")
+        if action not in ("confirm", "reject", "assign", "clear", "ignore"): raise RequestError("Neplatná face action")
+        if action == "assign" and (isinstance(person, bool) or not isinstance(person, int) or person <= 0): raise RequestError("assign vyžaduje person_id")
+        recognize = []
+        changed = 0
+        with self.faces_lock:
+            if action == "assign" and self.faces_db.execute("SELECT 1 FROM persons WHERE id=?", (person,)).fetchone() is None: raise RequestError("Osoba neexistuje")
+            for start in range(0, len(ids), 400):
+                chunk = ids[start:start + 400]; marks = ",".join("?" for _ in chunk)
+                rows = self.faces_db.execute(f"SELECT id,person_id FROM faces WHERE id IN ({marks})", chunk).fetchall() if chunk else []
+                for fid, current in rows:
+                    fid = int(fid)
+                    if action == "confirm":
+                        if current is not None: self.faces_db.execute("UPDATE faces SET state='confirmed',score=NULL WHERE id=?", (fid,)); changed += 1
+                    elif action == "assign": self.faces_db.execute("UPDATE faces SET person_id=?,state='confirmed',score=NULL WHERE id=?", (person, fid)); changed += 1
+                    elif action == "reject":
+                        if current is not None: self.faces_db.execute("INSERT OR IGNORE INTO face_rejected(face_id,person_id) VALUES(?,?)", (fid, current))
+                        self.faces_db.execute("UPDATE faces SET person_id=NULL,state='unknown',score=NULL WHERE id=?", (fid,)); recognize.append(fid); changed += 1
+                    elif action == "clear": self.faces_db.execute("UPDATE faces SET person_id=NULL,state='unknown',score=NULL WHERE id=?", (fid,)); changed += 1
+                    else: self.faces_db.execute("UPDATE faces SET person_id=NULL,state='ignored',score=NULL WHERE id=?", (fid,)); changed += 1
+            self.faces_db.commit(); self._refresh_face_references_locked()
+        if recognize: self._recognize_face_ids(recognize)
+        return {"changed": changed}
+
+    def _faces_person_create(self, request: dict[str, Any]) -> dict[str, Any]:
+        name = request.get("name")
+        if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100: raise RequestError("Meno musí mať 1 až 100 znakov")
+        name = name.strip()
+        with self.faces_lock:
+            row = self.faces_db.execute("SELECT id FROM persons WHERE name=? COLLATE NOCASE", (name,)).fetchone()
+            if row: return {"id": int(row[0])}
+            cur = self.faces_db.execute("INSERT INTO persons(name,created) VALUES(?,?)", (name, time.time())); self.faces_db.commit()
+            return {"id": int(cur.lastrowid)}
+
+    def _faces_person_rename(self, request: dict[str, Any]) -> dict[str, Any]:
+        person, name = request.get("person_id"), request.get("name")
+        if isinstance(person, bool) or not isinstance(person, int) or person <= 0 or not isinstance(name, str) or not 1 <= len(name.strip()) <= 100: raise RequestError("Neplatné ID alebo meno")
+        name = name.strip()
+        with self.faces_lock:
+            row = self.faces_db.execute("SELECT id FROM persons WHERE name=? COLLATE NOCASE AND id!=?", (name, person)).fetchone()
+            if row: raise RequestError("Toto meno už používa iná osoba")
+            cur = self.faces_db.execute("UPDATE persons SET name=? WHERE id=?", (name, person)); self.faces_db.commit()
+            if not cur.rowcount: raise RequestError("Osoba neexistuje")
+        return {"ok": True}
+
+    def _faces_recognize_all(self) -> dict[str, Any]:
+        if self.faces_db is None: return {"available": False}
+        with self.faces_lock:
+            ids = [int(r[0]) for r in self.faces_db.execute("SELECT id FROM faces WHERE vector IS NOT NULL AND state IN ('unknown','auto','suggested') ORDER BY id")]
+        # Batch matrix multiplication against the single in-memory reference matrix.
+        changed = 0
+        for start in range(0, len(ids), 256): changed += self._recognize_face_ids(ids[start:start + 256])
+        return {"changed": changed}
+
+    def _faces_command(self, request: dict[str, Any]) -> dict[str, Any]:
+        cmd = request.get("cmd")
+        if not self._ensure_face_models():
+            if cmd == "faces_status": return {"available": False, "scanned": 0, "pending": 0, "faces": 0, "named": 0, "unknown": 0, "persons": 0}
+            return {"available": False}
+        if cmd == "faces_status": return self._faces_status()
+        if cmd == "faces_persons": return self._faces_persons()
+        if cmd == "faces_person_assets": return self._faces_person_assets(request)
+        if cmd == "faces_review": return self._faces_review(request)
+        if cmd == "faces_for_assets": return self._faces_for_assets(request)
+        if cmd == "faces_set": return self._faces_set(request)
+        if cmd == "faces_person_create": return self._faces_person_create(request)
+        if cmd == "faces_person_rename": return self._faces_person_rename(request)
+        if cmd == "faces_recognize_all": return self._faces_recognize_all()
+        return {"available": False}
 
     def _process_batch(self, batch: list[dict[str, Any]], generation: int, pool: concurrent.futures.ThreadPoolExecutor) -> None:
         success, errors, offline, color_rows, quality_rows = [], [], [], [], []
@@ -1371,6 +1873,8 @@ class AIService:
             return self._index_command(request)
         if cmd == "forget":
             return self._forget_command(request)
+        if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+            return self._faces_command(request)
         if cmd == "learn_colors":
             return self._learn_colors(request)
         if cmd == "set_labels":
@@ -1455,7 +1959,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "clusters", "order_by_similarity"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)
@@ -1477,6 +1981,12 @@ class AIService:
             self._loader.join()
         if self._worker and self._worker is not threading.current_thread():
             self._worker.join()
+        if self._face_worker and self._face_worker is not threading.current_thread():
+            self._face_worker.join()
+        if self.faces_db is not None:
+            with self.faces_lock:
+                self.faces_db.commit()
+                self.faces_db.close()
         with self.db_lock:
             self.db.commit()
             self.db.close()

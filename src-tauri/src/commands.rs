@@ -127,6 +127,61 @@ pub struct AiUnsortedClusters { pub groups:Vec<AiUnsortedCluster>,pub unlabeled:
 pub fn ai_unsorted_clusters(state:State<'_,AiState>,min_size:Option<u32>)->Result<AiUnsortedClusters,String>{let value=state.0.unsorted_clusters(min_size)?;let groups=value.get("groups").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|g|AiUnsortedCluster{ids:g.get("ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect(),total:g.get("total").and_then(Value::as_u64).unwrap_or(0) as usize,cohesion:g.get("cohesion").and_then(Value::as_f64).unwrap_or(0.0),label_id:g.get("labelId").and_then(Value::as_i64),label_path:g.get("labelPath").and_then(Value::as_str).map(str::to_owned),name:g.get("name").and_then(Value::as_str).map(str::to_owned)}).collect();Ok(AiUnsortedClusters{groups,unlabeled:value.get("unlabeled").and_then(Value::as_u64).unwrap_or(0) as usize,clustered:value.get("clustered").and_then(Value::as_u64).unwrap_or(0) as usize})}
 #[tauri::command(async)]
 pub fn ai_category_paths(state:State<'_,AiState>)->Result<Vec<Value>,String>{Ok(state.0.category_paths()?.into_iter().map(|(id,path)|serde_json::json!({"id":id,"path":path})).collect())}
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFacesStatus { pub available:bool,pub scanned:usize,pub pending:usize,pub faces:usize,pub named:usize,pub unknown:usize,pub persons:usize }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFacePerson { pub id:i64,pub name:String,pub confirmed:usize,pub auto:usize,pub assets:usize,pub cover:Option<i64> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFacesPersons { pub persons:Vec<AiFacePerson> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFaceReview { pub face_id:i64,pub asset_id:i64,pub score:Option<f64> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFacesReview { pub faces:Vec<AiFaceReview> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFaceAsset { pub face_id:i64,pub asset_id:i64,pub x:Option<f64>,pub y:Option<f64>,pub w:Option<f64>,pub h:Option<f64>,pub person_id:Option<i64>,pub name:Option<String>,pub state:String,pub score:Option<f64> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiFaceThumb { pub face_id:i64,pub data_url:String }
+
+#[tauri::command(async)]
+pub fn ai_faces_status(state:State<'_,AiState>)->Result<AiFacesStatus,String>{let v=state.0.faces_status()?;Ok(AiFacesStatus{available:v["available"].as_bool().unwrap_or(false),scanned:v["scanned"].as_u64().unwrap_or(0) as usize,pending:v["pending"].as_u64().unwrap_or(0) as usize,faces:v["faces"].as_u64().unwrap_or(0) as usize,named:v["named"].as_u64().unwrap_or(0) as usize,unknown:v["unknown"].as_u64().unwrap_or(0) as usize,persons:v["persons"].as_u64().unwrap_or(0) as usize})}
+#[tauri::command(async)]
+pub fn ai_faces_persons(state:State<'_,AiState>)->Result<AiFacesPersons,String>{let v=state.0.faces_persons()?;let persons=v["persons"].as_array().cloned().unwrap_or_default().into_iter().filter_map(|p|Some(AiFacePerson{id:p["id"].as_i64()?,name:p["name"].as_str()?.to_owned(),confirmed:p["confirmed"].as_u64().unwrap_or(0) as usize,auto:p["auto"].as_u64().unwrap_or(0) as usize,assets:p["assets"].as_u64().unwrap_or(0) as usize,cover:p["cover"].as_i64()})).collect();Ok(AiFacesPersons{persons})}
+fn filter_listed_ids(db:&Db,ids:&[i64],sort_by_date:bool)->Result<Vec<i64>,String>{
+    if ids.is_empty(){return Ok(Vec::new())}
+    let conn=db.lock().map_err(|e|e.to_string())?;
+    if sort_by_date {
+        let mut dated=Vec::<(i64,Option<String>)>::new();
+        for chunk in ids.chunks(800){let marks=vec!["?";chunk.len()].join(",");let sql=format!("SELECT id,exif_date FROM assets WHERE is_listed=1 AND id IN ({marks})");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;dated.extend(stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<String>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?);}
+        dated.sort_by(|a,b|match (&a.1,&b.1){(Some(x),Some(y))=>x.cmp(y).then(a.0.cmp(&b.0)),(Some(_),None)=>std::cmp::Ordering::Less,(None,Some(_))=>std::cmp::Ordering::Greater,(None,None)=>a.0.cmp(&b.0)});
+        return Ok(dated.into_iter().map(|v|v.0).collect());
+    }
+    let mut listed=std::collections::HashSet::new();
+    for chunk in ids.chunks(800){let marks=vec!["?";chunk.len()].join(",");let sql=format!("SELECT id FROM assets WHERE is_listed=1 AND id IN ({marks})");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;listed.extend(stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?);}
+    let mut seen=std::collections::HashSet::new();Ok(ids.iter().copied().filter(|id|listed.contains(id)&&seen.insert(*id)).collect())
+}
+#[tauri::command(async)]
+pub fn ai_faces_person_assets(ai:State<'_,AiState>,db:State<'_,DatabaseState>,person_id:i64,include_auto:Option<bool>)->Result<Vec<i64>,String>{let v=ai.0.faces_person_assets(person_id,include_auto.unwrap_or(true))?;let ids=v["asset_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect::<Vec<_>>();filter_listed_ids(&db.0,&ids,true)}
+#[tauri::command(async)]
+pub fn ai_faces_review(ai:State<'_,AiState>,db:State<'_,DatabaseState>,person_id:i64,limit:Option<u32>)->Result<AiFacesReview,String>{let v=ai.0.faces_review(person_id,limit)?;let raw=v["faces"].as_array().cloned().unwrap_or_default();let ids=raw.iter().filter_map(|f|f["asset_id"].as_i64()).collect::<Vec<_>>();let listed=filter_listed_ids(&db.0,&ids,false)?.into_iter().collect::<std::collections::HashSet<_>>();let faces=raw.into_iter().filter_map(|f|{let asset_id=f["asset_id"].as_i64()?;if !listed.contains(&asset_id){return None}Some(AiFaceReview{face_id:f["face_id"].as_i64()?,asset_id,score:f["score"].as_f64()})}).collect();Ok(AiFacesReview{faces})}
+#[tauri::command(async)]
+pub fn ai_faces_for_assets(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>)->Result<Vec<AiFaceAsset>,String>{if asset_ids.len()>500{return Err("Najviac 500 asset ID naraz".into())}let ids=asset_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_for_assets(&ids)?;let raw=v["faces"].as_array().cloned().unwrap_or_default();let asset_ids=raw.iter().filter_map(|f|f["asset_id"].as_i64()).collect::<Vec<_>>();let listed=filter_listed_ids(&db.0,&asset_ids,false)?.into_iter().collect::<std::collections::HashSet<_>>();Ok(raw.into_iter().filter_map(|f|{let asset_id=f["asset_id"].as_i64()?;if !listed.contains(&asset_id){return None}Some(AiFaceAsset{face_id:f["face_id"].as_i64()?,asset_id,x:f["x"].as_f64(),y:f["y"].as_f64(),w:f["w"].as_f64(),h:f["h"].as_f64(),person_id:f["person_id"].as_i64(),name:f["name"].as_str().map(str::to_owned),state:f["state"].as_str()?.to_owned(),score:f["score"].as_f64()})}).collect())}
+#[tauri::command(async)]
+pub fn ai_faces_set(ai:State<'_,AiState>,face_ids:Vec<i64>,action:String,person_id:Option<i64>)->Result<usize,String>{if face_ids.len()>500{return Err("Najviac 500 tvárí naraz".into())}let ids=face_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_set(&ids,&action,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+#[tauri::command(async)]
+pub fn ai_faces_person_create(ai:State<'_,AiState>,name:String)->Result<i64,String>{let v=ai.0.faces_person_create(&name)?;v["id"].as_i64().ok_or_else(||"AI nevrátilo ID osoby".into())}
+#[tauri::command(async)]
+pub fn ai_faces_person_rename(ai:State<'_,AiState>,person_id:i64,name:String)->Result<bool,String>{let v=ai.0.faces_person_rename(person_id,&name)?;Ok(v["ok"].as_bool().unwrap_or(false))}
+#[tauri::command(async)]
+pub fn ai_faces_recognize_all(ai:State<'_,AiState>)->Result<usize,String>{let v=ai.0.faces_recognize_all()?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+#[tauri::command(async)]
+pub fn ai_face_thumbs(ai:State<'_,AiState>,face_ids:Vec<i64>)->Result<Vec<AiFaceThumb>,String>{Ok(ai.0.face_thumbs(&face_ids)?.into_iter().filter_map(|v|Some(AiFaceThumb{face_id:v["faceId"].as_i64()?,data_url:v["dataUrl"].as_str()?.to_owned()})).collect())}
 #[tauri::command(async)]
 pub fn ai_cluster_ignore(state:State<'_,AiState>,asset_ids:Vec<i64>)->Result<usize,String>{state.0.cluster_ignore(&asset_ids)}
 #[tauri::command(async)]
@@ -432,7 +487,7 @@ pub fn get_assets(
     // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
     // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
     if filter.kind == "folder" && filter.offset == 0 { let _ = auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter); }
-    if filter.sort == "similarity" && filter.kind != "series" {
+    if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people" {
         let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
         let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
         loop {base.offset=offset;let page=if filter.kind=="folder"{listing.0.page(&base)?}else{db::assets_page(&state.0,&base,&formats.0).map_err(|e|e.to_string())?};total=page.total;total_size=page.total_size;let count=page.items.len();all.extend(page.items);offset+=count as i64;if count<500||offset>=total{break}}
@@ -536,7 +591,7 @@ pub fn get_asset_ids(
     limit: i64,
 ) -> Result<Vec<i64>, String> {
     if filter.kind == "folder" { let mut f=filter; f.offset=offset; f.limit=limit; return Ok(listing.0.page(&f)?.items.into_iter().map(|a|a.id).collect()); }
-    if filter.kind == "series" { let mut f=filter;f.offset=offset;f.limit=limit;return Ok(db::assets_page(&state.0,&f,&formats.0).map_err(|e|e.to_string())?.items.into_iter().map(|a|a.id).collect()); }
+    if filter.kind == "ai" || filter.kind == "series" || filter.kind == "people" { let mut f=filter;f.offset=offset;f.limit=limit;return Ok(db::assets_page(&state.0,&f,&formats.0).map_err(|e|e.to_string())?.items.into_iter().map(|a|a.id).collect()); }
     db::asset_ids_page(&state.0, &filter, &formats.0, offset, limit).map_err(|e| e.to_string())
 }
 #[tauri::command(async)]

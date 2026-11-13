@@ -326,6 +326,26 @@ impl AiService {
         out.sort_by(|a,b|a.1.to_lowercase().cmp(&b.1.to_lowercase()));Ok(out)
     }
 
+    pub fn faces_status(&self)->Result<Value,String>{self.request("faces_status",json!({}),Duration::from_secs(30))}
+    pub fn faces_persons(&self)->Result<Value,String>{self.request("faces_persons",json!({}),Duration::from_secs(30))}
+    pub fn faces_person_assets(&self,person_id:i64,include_auto:bool)->Result<Value,String>{self.request("faces_person_assets",json!({"person_id":person_id,"include_auto":include_auto}),Duration::from_secs(30))}
+    pub fn faces_review(&self,person_id:i64,limit:Option<u32>)->Result<Value,String>{self.request("faces_review",json!({"person_id":person_id,"limit":limit.unwrap_or(200).clamp(1,1000)}),Duration::from_secs(30))}
+    pub fn faces_for_assets(&self,asset_ids:&[i64])->Result<Value,String>{self.request("faces_for_assets",json!({"asset_ids":asset_ids}),Duration::from_secs(30))}
+    pub fn faces_set(&self,face_ids:&[i64],action:&str,person_id:Option<i64>)->Result<Value,String>{self.request("faces_set",json!({"face_ids":face_ids,"action":action,"person_id":person_id}),Duration::from_secs(30))}
+    pub fn faces_person_create(&self,name:&str)->Result<Value,String>{self.request("faces_person_create",json!({"name":name}),Duration::from_secs(30))}
+    pub fn faces_person_rename(&self,person_id:i64,name:&str)->Result<Value,String>{self.request("faces_person_rename",json!({"person_id":person_id,"name":name}),Duration::from_secs(30))}
+    pub fn faces_recognize_all(&self)->Result<Value,String>{self.request("faces_recognize_all",json!({}),Duration::from_secs(300))}
+
+    pub fn face_thumbs(&self,face_ids:&[i64])->Result<Vec<Value>,String>{
+        if face_ids.len()>300{return Err("Najviac 300 náhľadov tvárí naraz".into());}
+        let path=self.ai_db_path().parent().unwrap_or_else(||std::path::Path::new(".")).join("faces.sqlite");
+        if !path.is_file(){return Ok(Vec::new());}
+        let conn=rusqlite::Connection::open_with_flags(path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY|rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX).map_err(|e|e.to_string())?;
+        let mut out=Vec::new();
+        for chunk in face_ids.chunks(300){if chunk.is_empty(){continue;}let marks=vec!["?";chunk.len()].join(",");let sql=format!("SELECT face_id,jpeg FROM face_thumbs WHERE face_id IN ({marks})");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;for row in stmt.query_map(rusqlite::params_from_iter(chunk.iter()),|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Vec<u8>>(1)?))).map_err(|e|e.to_string())?{let(id,jpeg)=row.map_err(|e|e.to_string())?;use base64::Engine;let encoded=base64::engine::general_purpose::STANDARD.encode(jpeg);out.push(json!({"faceId":id,"dataUrl":format!("data:image/jpeg;base64,{encoded}")}));}}
+        Ok(out)
+    }
+
     pub fn cluster_ignore(&self,asset_ids:&[i64])->Result<usize,String>{
         let result=self.request("cluster_ignore",json!({"asset_ids":asset_ids}),Duration::from_secs(30))?;
         Ok(result.get("ignored").and_then(Value::as_u64).unwrap_or(0) as usize)
