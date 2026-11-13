@@ -304,6 +304,38 @@ impl AiService {
 
     pub fn suggestion_groups(&self,kind:&str)->Result<Value,String>{let kind=valid_label_kind(kind)?;let result=self.request("suggest_batch",json!({"kind":kind,"asset_ids":"unlabeled"}),Duration::from_secs(300))?;let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();let conn=self.0.db.lock().map_err(|e|e.to_string())?;let mut out=Vec::new();for group in groups{let Some(label_id)=group.get("label_id").and_then(Value::as_i64)else{continue};let ids=group.get("asset_ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect::<Vec<_>>();let mut listed=std::collections::HashSet::new();let mut rejected=std::collections::HashSet::new();for id in &ids{if conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get::<_,bool>(0)).unwrap_or(false){listed.insert(*id);}if conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND kind=?2 AND label_id=?3)",rusqlite::params![id,kind,label_id],|r|r.get::<_,bool>(0)).unwrap_or(false){rejected.insert(*id);}}let accepted=filter_group_assets(&ids,&listed,&rejected);if !accepted.is_empty(){out.push(json!({"labelId":label_id,"path":label_path(&conn,kind,label_id)?,"count":accepted.len(),"assetIds":accepted}));}}out.sort_by(|a,b|b["count"].as_u64().cmp(&a["count"].as_u64()));Ok(Value::Array(out))}
 
+    pub fn unsorted_clusters(&self,min_size:Option<u32>)->Result<Value,String>{
+        let mut args=json!({"limit":30});if let Some(value)=min_size{args["min_size"]=json!(value);}
+        let result=self.request("clusters",args,Duration::from_secs(300))?;
+        let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();
+        let conn=self.0.db.lock().map_err(|e|e.to_string())?;let mut out=Vec::new();
+        for group in groups{
+            let ids=group.get("ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect::<Vec<_>>();
+            let mut listed=std::collections::HashSet::new();for id in &ids{if conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1 AND ext_lower<>'')",[id],|r|r.get::<_,bool>(0)).unwrap_or(false){listed.insert(*id);}}
+            let accepted=ids.into_iter().filter(|id|listed.contains(id)).collect::<Vec<_>>();if accepted.is_empty(){continue;}
+            let label_id=group.get("label_id").and_then(Value::as_i64);let label_path=label_id.map(|id|label_path(&conn,"category",id)).transpose()?;
+            out.push(json!({"ids":accepted,"total":group.get("total").and_then(Value::as_u64).unwrap_or(0),"cohesion":group.get("cohesion").and_then(Value::as_f64).unwrap_or(0.0),"labelId":label_id,"labelPath":label_path,"name":group.get("name").and_then(Value::as_str),"labelScore":group.get("label_score").and_then(Value::as_f64)}));
+        }
+        Ok(json!({"groups":out,"unlabeled":result.get("unlabeled").and_then(Value::as_u64).unwrap_or(0),"clustered":result.get("clustered").and_then(Value::as_u64).unwrap_or(0)}))
+    }
+
+    pub fn category_paths(&self)->Result<Vec<(i64,String)>,String>{
+        let conn=self.0.db.lock().map_err(|e|e.to_string())?;
+        let ids={let mut stmt=conn.prepare("SELECT id FROM categories").map_err(|e|e.to_string())?;let rows=stmt.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;rows};
+        let mut out=Vec::with_capacity(ids.len());for id in ids{if let Ok(path)=label_path(&conn,"category",id){out.push((id,path));}}
+        out.sort_by(|a,b|a.1.to_lowercase().cmp(&b.1.to_lowercase()));Ok(out)
+    }
+
+    pub fn cluster_ignore(&self,asset_ids:&[i64])->Result<usize,String>{
+        let result=self.request("cluster_ignore",json!({"asset_ids":asset_ids}),Duration::from_secs(30))?;
+        Ok(result.get("ignored").and_then(Value::as_u64).unwrap_or(0) as usize)
+    }
+
+    pub fn cluster_ignore_reset(&self)->Result<usize,String>{
+        let result=self.request("cluster_ignore_reset",json!({}),Duration::from_secs(30))?;
+        Ok(result.get("ignored").and_then(Value::as_u64).unwrap_or(0) as usize)
+    }
+
     fn request(&self, cmd: &str, args: Value, timeout: Duration) -> Result<Value, String> {
         let writer = self.0.process.lock().map_err(|e| e.to_string())?.writer.clone().ok_or_else(|| "AI server nie je spustený".to_string())?;
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);

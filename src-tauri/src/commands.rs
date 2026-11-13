@@ -117,6 +117,20 @@ pub fn ai_suggest(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String)->Resul
 pub fn ai_reject_suggestion(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String,label_id:i64)->Result<usize,String>{state.0.reject_suggestion(&asset_ids,&kind,label_id)}
 #[tauri::command(async)]
 pub fn ai_suggestion_groups(state:State<'_,AiState>,kind:String)->Result<Value,String>{state.0.suggestion_groups(&kind)}
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiUnsortedCluster { pub ids:Vec<i64>,pub total:usize,pub cohesion:f64,pub label_id:Option<i64>,pub label_path:Option<String>,pub name:Option<String> }
+#[derive(Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct AiUnsortedClusters { pub groups:Vec<AiUnsortedCluster>,pub unlabeled:usize,pub clustered:usize }
+#[tauri::command(async)]
+pub fn ai_unsorted_clusters(state:State<'_,AiState>,min_size:Option<u32>)->Result<AiUnsortedClusters,String>{let value=state.0.unsorted_clusters(min_size)?;let groups=value.get("groups").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().map(|g|AiUnsortedCluster{ids:g.get("ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect(),total:g.get("total").and_then(Value::as_u64).unwrap_or(0) as usize,cohesion:g.get("cohesion").and_then(Value::as_f64).unwrap_or(0.0),label_id:g.get("labelId").and_then(Value::as_i64),label_path:g.get("labelPath").and_then(Value::as_str).map(str::to_owned),name:g.get("name").and_then(Value::as_str).map(str::to_owned)}).collect();Ok(AiUnsortedClusters{groups,unlabeled:value.get("unlabeled").and_then(Value::as_u64).unwrap_or(0) as usize,clustered:value.get("clustered").and_then(Value::as_u64).unwrap_or(0) as usize})}
+#[tauri::command(async)]
+pub fn ai_category_paths(state:State<'_,AiState>)->Result<Vec<Value>,String>{Ok(state.0.category_paths()?.into_iter().map(|(id,path)|serde_json::json!({"id":id,"path":path})).collect())}
+#[tauri::command(async)]
+pub fn ai_cluster_ignore(state:State<'_,AiState>,asset_ids:Vec<i64>)->Result<usize,String>{state.0.cluster_ignore(&asset_ids)}
+#[tauri::command(async)]
+pub fn ai_cluster_ignore_reset(state:State<'_,AiState>)->Result<usize,String>{state.0.cluster_ignore_reset()}
 #[tauri::command(async)]
 pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("Neplatný typ štítku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
 

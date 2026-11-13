@@ -33,6 +33,30 @@ AUTO_GROUP_SCORE = 0.70
 DUP_SAME = 0.95  # candidate level; the app keeps only same capture time / base name
 DUP_SIMILAR = 0.93
 SUGGEST_BATCH_CHUNK = 128
+CLUSTER_MIN_SIZE = 8
+CLUSTER_MIN_SIM = 0.72
+CLUSTER_IGNORE_SIM = 0.95  # centroids of related groups easily reach 0.90
+CLUSTER_ITERATIONS = 12
+CLUSTER_VOCABULARY = tuple(dict.fromkeys((
+    "krajina", "hory", "kopce", "údolie", "les", "stromy", "lúka", "pole", "záhrada", "park",
+    "more", "pláž", "pobrežie", "ostrov", "útes", "rieka", "jazero", "vodopád", "prameň", "močiar",
+    "západ slnka", "východ slnka", "obloha", "oblaky", "dúha", "búrka", "blesk", "hmla", "noc", "hviezdy",
+    "sneh", "zima", "jar", "leto", "jeseň", "ľad", "voda", "oheň", "púšť", "skaly",
+    "mesto", "dedina", "ulica", "námestie", "architektúra", "kostol", "hrad", "zámok", "most", "veža",
+    "interiér", "dom", "byt", "izba", "kuchyňa", "múzeum", "galéria", "pamiatky", "ruiny", "schody",
+    "portrét", "deti", "rodina", "svadba", "oslava", "stretnutie", "ľudia", "skupina", "silueta", "móda",
+    "koncert", "hudba", "festival", "divadlo", "umenie", "tanec", "šport", "futbal", "cyklistika", "beh",
+    "pes", "mačka", "vtáky", "dravce", "kačice", "zvieratá", "kone", "hmyz", "motýle", "včely",
+    "kvety", "ruže", "rastliny", "huby", "ovocie", "zelenina", "jedlo", "dezert", "káva", "víno",
+    "auto", "motocykel", "bicykel", "vlak", "lietadlo", "loď", "autobus", "doprava", "cestovanie", "kempovanie",
+    "makro", "detail", "textúra", "abstrakcia", "čiernobiela fotografia", "odraz", "tieň", "svetlá", "ohnisko", "panoráma",
+    "dokumenty", "snímky obrazovky", "technika", "počítač", "telefón", "knihy", "hračky", "nástroje", "nábytok", "značky",
+    "počasie", "príroda", "zvieratká", "akvárium", "plazy", "zoo", "farmárstvo", "vinica", "olivový háj", "sad",
+    "turistika", "lyžovanie", "plávanie", "vodné športy", "lezenie", "preteky", "medaily", "výlet", "stan", "karavan",
+    "jedlo na tanieri", "pečivo", "ryby", "morské živočíchy", "lastúry", "kamene", "kvapky", "okno", "dvere", "fasáda",
+    "fontána", "socha", "pomník", "cintorín", "trh", "obchod", "reštaurácia", "hotel", "letisko", "prístav",
+    "silvester", "vianoce", "veľká noc", "narodeniny", "krst", "promócia", "školská fotografia", "pracovisko", "kancelária", "ulica v noci",
+)))
 BATCH_SIZE = 32
 DECODE_THREADS = 6
 CHROMATIC_COLORS = ("červená", "oranžová", "hnedá", "žltá", "zelená", "tyrkysová", "modrá", "fialová", "ružová")
@@ -363,6 +387,7 @@ class AIService:
             CREATE TABLE IF NOT EXISTS failures(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, error TEXT NOT NULL, at REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS colors(asset_id INTEGER PRIMARY KEY, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, shares TEXT NOT NULL, auto TEXT NOT NULL, version INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS quality(asset_id INTEGER PRIMARY KEY, size INTEGER, mtime_ns INTEGER, sharp REAL, hi REAL, lo REAL, mean REAL, version INTEGER);
+            CREATE TABLE IF NOT EXISTS cluster_ignored(id INTEGER PRIMARY KEY, vector BLOB NOT NULL, created REAL NOT NULL);
         """)
         self.db_lock = threading.RLock()
         self._lock = threading.RLock()
@@ -399,6 +424,7 @@ class AIService:
         self._device = "cuda" if embedder_factory is None else "cpu"
         self._labels: dict[str, dict[int, set[int]]] = {"category": {}, "keyword": {}}
         self._parents: dict[str, dict[int, int | None]] = {"category": {}, "keyword": {}}
+        self._cluster_text_vectors: dict[str, np.ndarray] | None = None
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
@@ -942,6 +968,197 @@ class AIService:
         rows.sort(key=lambda row: (-row["count"], row["label_id"]))
         return {"groups": rows}
 
+    @staticmethod
+    def _normalise_rows(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float32)
+        norms = np.linalg.norm(values, axis=1, keepdims=True)
+        return values / np.maximum(norms, 1e-12)
+
+    def _cluster_names(self) -> dict[str, np.ndarray] | None:
+        if self._cluster_text_vectors is not None:
+            return self._cluster_text_vectors
+        try:
+            embedder = self._wait_model()
+            get_text_vector = getattr(embedder, "_text_vector", None)
+            if get_text_vector is None:
+                return None
+            vectors = {}
+            for word in CLUSTER_VOCABULARY:
+                value = get_text_vector(f"a photo of {word}")
+                if hasattr(value, "float"):
+                    value = value.float().cpu().numpy()
+                vectors[word] = np.asarray(value, dtype=np.float32).reshape(-1)
+            with self._lock:
+                if self._cluster_text_vectors is None:
+                    self._cluster_text_vectors = vectors
+                return self._cluster_text_vectors
+        except Exception:
+            return None
+
+    def _clusters(self, request: dict[str, Any]) -> dict[str, Any]:
+        min_size = request.get("min_size", CLUSTER_MIN_SIZE)
+        min_sim = request.get("min_sim", CLUSTER_MIN_SIM)
+        limit = request.get("limit", 30)
+        if isinstance(min_size, bool) or not isinstance(min_size, int) or not 1 <= min_size <= 100000:
+            raise RequestError("min_size musí byť kladné celé číslo")
+        if isinstance(min_sim, bool) or not isinstance(min_sim, (int, float)) or not np.isfinite(min_sim) or not -1 <= min_sim <= 1:
+            raise RequestError("min_sim musí byť číslo od -1 do 1")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise RequestError("limit musí byť celé číslo od 1 do 100")
+        ids, matrix, positions = self._index_snapshot()
+        with self._lock:
+            labels = self._labels["category"]
+            targets = sorted(aid for aid in ids if not labels.get(aid))
+            category_labels = {aid: set(values) for aid, values in labels.items() if values and aid in positions}
+            parents = dict(self._parents["category"])
+        unlabeled = len(targets)
+        if unlabeled < min_size:
+            return {"groups": [], "unlabeled": unlabeled, "clustered": 0}
+        n = len(targets)
+        k = max(2, min(256, int(round(np.sqrt(n / 2.0)))))
+        core_clusters = []
+        if isinstance(matrix, dict):
+            vectors = self._normalise_rows(np.stack([matrix[aid] for aid in targets]))
+            centroids = vectors[np.linspace(0, n - 1, k, dtype=np.int64)].copy()
+            for _ in range(CLUSTER_ITERATIONS):
+                assignments = np.argmax(vectors @ centroids.T, axis=1)
+                for cluster_id in range(k):
+                    members = vectors[assignments == cluster_id]
+                    if len(members):
+                        centroids[cluster_id] = self._normalise_rows(members.mean(axis=0, keepdims=True))[0]
+            similarities = vectors @ centroids.T
+            assignments = np.argmax(similarities, axis=1)
+            assigned_scores = similarities[np.arange(n), assignments]
+            for cluster_id in range(k):
+                member_idx = np.flatnonzero((assignments == cluster_id) & (assigned_scores >= min_sim))
+                if len(member_idx) < min_size:
+                    continue
+                centroid = self._normalise_rows(vectors[member_idx].mean(axis=0, keepdims=True))[0]
+                core_sim = vectors[member_idx] @ centroid
+                keep = core_sim >= min_sim
+                member_idx, core_sim = member_idx[keep], core_sim[keep]
+                if len(member_idx) >= min_size:
+                    core_clusters.append((centroid, member_idx, core_sim))
+        else:
+            torch = self._embedder.torch
+            target_positions = torch.as_tensor([positions[aid] for aid in targets], device=matrix.device)
+            with torch.inference_mode():
+                tensor = matrix[target_positions].float()
+                tensor = tensor / tensor.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                centers = tensor[torch.as_tensor(np.linspace(0, n - 1, k, dtype=np.int64), device=matrix.device)].clone()
+                for _ in range(CLUSTER_ITERATIONS):
+                    assign_parts = [(tensor[start:start + 8192] @ centers.T).argmax(dim=1) for start in range(0, n, 8192)]
+                    assignments_t = torch.cat(assign_parts)
+                    counts = torch.bincount(assignments_t, minlength=k)
+                    sums = torch.zeros_like(centers)
+                    sums.index_add_(0, assignments_t, tensor)
+                    means = sums / counts.clamp_min(1).to(dtype=torch.float32).unsqueeze(1)
+                    means = means / means.norm(dim=1, keepdim=True).clamp_min(1e-12)
+                    centers = torch.where((counts > 0).unsqueeze(1), means, centers)
+                score_parts, assign_parts = [], []
+                for start in range(0, n, 8192):
+                    scores = tensor[start:start + 8192] @ centers.T
+                    values, chosen = scores.max(dim=1)
+                    score_parts.append(values)
+                    assign_parts.append(chosen)
+                assignments_t = torch.cat(assign_parts)
+                assigned_scores_t = torch.cat(score_parts)
+                assignments = assignments_t.cpu().numpy()
+                for cluster_id in range(k):
+                    member_idx = torch.nonzero((assignments_t == cluster_id) & (assigned_scores_t >= min_sim), as_tuple=False).flatten()
+                    if member_idx.numel() < min_size:
+                        continue
+                    centroid = tensor[member_idx].mean(dim=0)
+                    centroid = centroid / centroid.norm().clamp_min(1e-12)
+                    core_sim = tensor[member_idx] @ centroid
+                    keep = core_sim >= min_sim
+                    member_idx, core_sim = member_idx[keep], core_sim[keep]
+                    if member_idx.numel() >= min_size:
+                        core_clusters.append((centroid.cpu().numpy(), member_idx.cpu().numpy(), core_sim.cpu().numpy()))
+                vectors = tensor.cpu().numpy()
+        if not core_clusters:
+            return {"groups": [], "unlabeled": unlabeled, "clustered": 0}
+        with self.db_lock:
+            ignored_rows = self.db.execute("SELECT vector FROM cluster_ignored ORDER BY id").fetchall()
+        ignored = [np.frombuffer(blob, dtype=np.float16).astype(np.float32) for (blob,) in ignored_rows]
+        if ignored:
+            ignored_matrix = self._normalise_rows(np.stack(ignored))
+            core_clusters = [item for item in core_clusters if float((ignored_matrix @ item[0]).max()) < CLUSTER_IGNORE_SIM]
+        core_clusters.sort(key=lambda item: (-len(item[1]), min(targets[int(i)] for i in item[1])))
+        name_vectors = self._cluster_names()
+        candidate_ids = sorted(category_labels)
+        candidate_matrix = (np.stack([matrix[aid] for aid in candidate_ids]).astype(np.float32) if isinstance(matrix, dict) and candidate_ids
+                            else None)
+        if not isinstance(matrix, dict) and candidate_ids:
+            torch = self._embedder.torch
+            candidate_pos = torch.as_tensor([positions[aid] for aid in candidate_ids], device=matrix.device)
+            with torch.inference_mode():
+                candidate_matrix = matrix[candidate_pos].float().cpu().numpy()
+        groups, clustered = [], 0
+        for centroid, member_idx, _ in core_clusters[:limit]:
+            sims = vectors[member_idx] @ centroid
+            order = np.argsort(-sims, kind="stable")
+            ordered_idx = member_idx[order]
+            ordered_sims = sims[order]
+            member_ids = [targets[int(i)] for i in ordered_idx]
+            category_votes: dict[int, int] = {}
+            if candidate_ids and candidate_matrix is not None:
+                neighbor_similarities = vectors[ordered_idx[:40]] @ candidate_matrix.T
+                for row, target_id in enumerate(member_ids[:40]):
+                    scores = neighbor_similarities[row].copy()
+                    if target_id in candidate_ids:
+                        scores[candidate_ids.index(target_id)] = -np.inf
+                    take = min(SUGGEST_K, len(candidate_ids))
+                    chosen = np.argpartition(-scores, take - 1)[:take] if take else np.empty(0, dtype=np.int64)
+                    chosen = chosen[np.argsort(-scores[chosen], kind="stable")]
+                    neighbors = [(candidate_ids[int(i)], float(scores[i])) for i in chosen if np.isfinite(scores[i])]
+                    ranked = self._rank_neighbors(target_id, neighbors, 1, category_labels, parents)
+                    if ranked:
+                        category_votes[ranked[0]["label_id"]] = category_votes.get(ranked[0]["label_id"], 0) + 1
+            label_id, label_score = (None, None)
+            if category_votes:
+                winner, votes = min(category_votes.items(), key=lambda item: (-item[1], item[0]))
+                if votes >= min(20, len(member_ids[:40]) / 2):
+                    label_id, label_score = winner, votes / max(1, len(member_ids[:40]))
+            name = None
+            if name_vectors:
+                name = max(name_vectors, key=lambda word: float(np.dot(name_vectors[word], centroid))).capitalize()
+            total = len(member_ids)
+            clustered += total
+            groups.append({"ids": member_ids[:500], "total": total, "cohesion": float(ordered_sims.mean()),
+                           "label_id": label_id, "label_score": label_score, "name": name})
+        return {"groups": groups, "unlabeled": unlabeled, "clustered": clustered}
+
+    def _cluster_ignore(self, request: dict[str, Any]) -> dict[str, Any]:
+        asset_ids = request.get("asset_ids")
+        if not isinstance(asset_ids, list) or not asset_ids or any(isinstance(a, bool) or not isinstance(a, int) or a <= 0 for a in asset_ids):
+            raise RequestError("asset_ids musí byť zoznam kladných ID")
+        _, matrix, positions = self._index_snapshot()
+        vectors = [matrix[aid] for aid in dict.fromkeys(asset_ids) if aid in positions] if isinstance(matrix, dict) else None
+        if not isinstance(matrix, dict):
+            torch = self._embedder.torch
+            valid = [aid for aid in dict.fromkeys(asset_ids) if aid in positions]
+            if valid:
+                pos = torch.as_tensor([positions[aid] for aid in valid], device=matrix.device)
+                with torch.inference_mode():
+                    vectors = matrix[pos].float().cpu().numpy()
+            else:
+                vectors = []
+        if len(vectors) == 0:
+            return {"ignored": 0}
+        mean = self._normalise_rows(np.asarray(vectors, dtype=np.float32).mean(axis=0, keepdims=True))[0]
+        with self.db_lock:
+            self.db.execute("INSERT INTO cluster_ignored(vector,created) VALUES(?,?)", (mean.astype(np.float16).tobytes(), time.time()))
+            self.db.commit()
+            count = int(self.db.execute("SELECT count(*) FROM cluster_ignored").fetchone()[0])
+            return {"ignored": count}
+
+    def _cluster_ignore_reset(self, request: dict[str, Any]) -> dict[str, Any]:
+        with self.db_lock:
+            self.db.execute("DELETE FROM cluster_ignored")
+            self.db.commit()
+        return {"ignored": 0}
+
     def _similarity_scores(self, index: tuple[list[int], Any, dict[int, int]], rows: list[int], cols: list[int]) -> np.ndarray:
         ids, matrix, positions = index
         if isinstance(matrix, dict):
@@ -1164,6 +1381,12 @@ class AIService:
             return self._suggest_batch(request)
         if cmd == "duplicate_groups":
             return self._duplicate_groups(request)
+        if cmd == "clusters":
+            return self._clusters(request)
+        if cmd == "cluster_ignore":
+            return self._cluster_ignore(request)
+        if cmd == "cluster_ignore_reset":
+            return self._cluster_ignore_reset(request)
         if cmd == "series":
             return self._series(request)
         if cmd == "order_by_similarity":
@@ -1232,7 +1455,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "order_by_similarity"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "series", "clusters", "order_by_similarity"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

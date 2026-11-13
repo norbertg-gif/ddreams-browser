@@ -505,3 +505,9 @@ input[type=checkbox]{accent-color:var(--accent)}
 .asset-tile.duplicate-group-0{background:#132130}.asset-tile.duplicate-group-1{background:#241d13}
 .asset-tile.duplicate-group-0.selected,.asset-tile.duplicate-group-1.selected{background:var(--select)}
 .duplicate-group-badge{right:14px;top:auto;bottom:34px;background:#0b0d11cc;border-radius:6px}
+.cluster-controls{display:flex;gap:6px;align-items:center;margin:6px 0}.cluster-link{border:0!important;background:transparent!important;color:var(--muted)!important;text-decoration:underline;padding-inline:4px!important}
+.cluster-summary,.cluster-muted{display:block;color:var(--muted);font-size:11px;margin:5px 0}.cluster-card{display:flex;flex-direction:column;gap:5px;padding:8px;margin:7px 0;border:1px solid var(--line);border-radius:7px;background:var(--panel2);color:var(--text)}
+.cluster-thumbnails{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:4px}.cluster-thumbnails img{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:4px;background:var(--panel)}
+.cluster-card>small{color:var(--muted);font-size:11px}.cluster-actions{display:flex;gap:4px;flex-wrap:wrap}.cluster-actions select{min-width:0;max-width:100%;flex:1 1 130px}.cluster-create{display:flex;gap:4px}.cluster-create input{min-width:0;flex:1;background:var(--panel);border:1px solid var(--line);color:var(--text)}
+.cluster-card button,.cluster-controls button,.cluster-actions select{height:24px;border:1px solid var(--line);border-radius:7px;background:var(--panel);color:var(--text);padding:0 8px;font-size:12px}
+.cluster-actions select option{background:var(--panel);color:var(--text)}.cluster-card strong{color:var(--bright)}

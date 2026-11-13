@@ -172,6 +172,45 @@ class ServerTests(unittest.TestCase):
         groups = self.series([(40, 1.0), (41, 2.0), (42, 3.0)], {40: vector, 42: vector})
         self.assertEqual(groups, [])
 
+    def cluster_fixture(self, east=10, west=10, noise=2):
+        vectors = {}
+        for aid in range(1, east + 1): vectors[aid] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        for aid in range(east + 1, east + west + 1): vectors[aid] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        for aid in range(east + west + 1, east + west + noise + 1): vectors[aid] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        self.service._embedder.vectors.update(vectors)
+        return vectors
+
+    def test_clusters_separate_blobs_and_exclude_labeled_assets(self):
+        self.cluster_fixture()
+        self.service._labels["category"] = {1: {99}}
+        result = self.service.execute({"cmd": "clusters", "min_size": 8, "min_sim": 0.72})
+        groups = result["groups"]
+        self.assertEqual(result["unlabeled"], 21)
+        self.assertEqual([group["total"] for group in groups], [10, 9])
+        self.assertEqual({frozenset(group["ids"]) for group in groups}, {frozenset(range(2, 11)), frozenset(range(11, 21))})
+        self.assertNotIn(1, [aid for group in groups for aid in group["ids"]])
+
+    def test_clusters_min_size_filters_small_blob(self):
+        self.cluster_fixture(east=8, west=7, noise=2)
+        result = self.service.execute({"cmd": "clusters", "min_size": 8})
+        self.assertEqual([group["total"] for group in result["groups"]], [8])
+
+    def test_cluster_ignore_and_reset(self):
+        self.cluster_fixture()
+        first = self.service.execute({"cmd": "clusters", "min_size": 8})
+        ignored_ids = first["groups"][0]["ids"]
+        self.assertEqual(self.service.execute({"cmd": "cluster_ignore", "asset_ids": ignored_ids})["ignored"], 1)
+        filtered = self.service.execute({"cmd": "clusters", "min_size": 8})
+        self.assertEqual(len(filtered["groups"]), 1)
+        self.assertEqual(self.service.execute({"cmd": "cluster_ignore_reset"},)["ignored"], 0)
+        self.assertEqual(len(self.service.execute({"cmd": "clusters", "min_size": 8})["groups"]), 2)
+
+    def test_cluster_output_is_deterministic(self):
+        self.cluster_fixture()
+        first = self.service.execute({"cmd": "clusters", "min_size": 8})
+        second = self.service.execute({"cmd": "clusters", "min_size": 8})
+        self.assertEqual(first, second)
+
     def test_search_cutoff_and_decode_only_color_pass(self):
         item = self.make_file("east-colors.jpg")
         self.index([item]); self.wait_idle()
