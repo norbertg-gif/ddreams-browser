@@ -55,8 +55,8 @@ impl ListingService {
             let result = std::fs::read_dir(&root).map(|items| {
                 items.filter_map(Result::ok).filter_map(|entry| {
                     let p = entry.path(); let name = entry.file_name().to_string_lossy().to_string();
-                    if hidden_or_ignored(&name, &entry.metadata().ok()?, &formats) { return None; }
                     let meta = entry.metadata().ok()?;
+                    if hidden_or_ignored(&name, &meta, &formats) { return None; }
                     Some((p, name, meta))
                 }).collect::<Vec<_>>()
             });
@@ -79,11 +79,13 @@ impl ListingService {
         let contexts = db::folder_disk_context(&self.db, &context_ids).unwrap_or_default();
         let mut known = HashMap::<String, Asset>::new();
         for (_, catalog_path, assets) in contexts { if normalize(&catalog_path)==key { for asset in assets { known.insert(asset.name.to_lowercase(), asset); } } }
+        let folder_paths = disk.iter().filter(|(_, _, meta)| meta.is_dir()).map(|(path, _, _)| path.to_string_lossy().to_string()).collect::<Vec<_>>();
+        let matched_folders = db::folders_by_paths(&self.db, &folder_paths).unwrap_or_else(|_| folder_paths.iter().filter_map(|path| db::folder_by_path(&self.db, path).ok().flatten().map(|folder| (path.clone(), folder))).collect());
         let mut rows = Vec::with_capacity(disk.len());
         for (full, name, meta) in disk {
             let is_dir = meta.is_dir();
             let ext = if is_dir { String::new() } else { full.extension().unwrap_or_default().to_string_lossy().trim_start_matches('.').to_ascii_lowercase() };
-            let matched_folder = if is_dir { db::folder_by_path(&self.db, &full.to_string_lossy()).ok().flatten().map(|f|f.id) } else { None };
+            let matched_folder = if is_dir { matched_folders.get(full.to_string_lossy().as_ref()).map(|f| f.id) } else { None };
             let mut asset = known.remove(&name.to_lowercase()).unwrap_or_else(|| Asset {
                 id: self.id(), folder_id: if is_dir { matched_folder } else { parent_folder_id }, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,

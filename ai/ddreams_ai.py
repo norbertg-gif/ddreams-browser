@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from collections import deque
 import ctypes
 import gc
 import hashlib
@@ -522,7 +523,7 @@ class AIService:
         self._paused = False
         self._queue: list[dict[str, Any]] = []
         self._quality_queue: list[dict[str, Any]] = []
-        self._face_scan_queue: list[dict[str, Any]] = []
+        self._face_scan_queue: deque[dict[str, Any]] = deque()
         self._face_active_ids: set[int] = set()
         self._last_face_progress = 0.0
         self._face_refs_ids = np.empty(0, dtype=np.int64)
@@ -765,7 +766,7 @@ class AIService:
                 active_faces = pending_faces
                 self._face_scan_queue.extend(item for item in face_queued if item["asset_id"] not in active_faces)
             else:
-                self._face_scan_queue = face_queued
+                self._face_scan_queue = deque(face_queued)
             queued_ids = {item["asset_id"] for item in queued}
             self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in queued_ids]
             if append:
@@ -830,7 +831,7 @@ class AIService:
             self._queue = [item for item in self._queue if item["asset_id"] not in forget]
             before_quality = len(self._quality_queue)
             self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in forget]
-            self._face_scan_queue = [item for item in self._face_scan_queue if item["asset_id"] not in forget]
+            self._face_scan_queue = deque(item for item in self._face_scan_queue if item["asset_id"] not in forget)
             self._total = max(0, self._total - (before - len(self._queue)) - (before_quality - len(self._quality_queue)))
             self._condition.notify_all()
         return {"forgotten": len(known)}
@@ -914,7 +915,7 @@ class AIService:
                     self._condition.wait(timeout=0.5)
                 if self._stop:
                     return
-                item = self._face_scan_queue.pop(0)
+                item = self._face_scan_queue.popleft()
                 self._face_active_ids.add(item["asset_id"])
             self._model_ready.wait()
             with self._condition:

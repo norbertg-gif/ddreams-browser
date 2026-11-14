@@ -770,6 +770,39 @@ pub fn folder_by_path(db: &Db, path: &str) -> rusqlite::Result<Option<Folder>> {
     conn.query_row("SELECT id,parent_id,root_id,name,path,(SELECT count(*) FROM assets WHERE folder_id=folders.id AND is_listed=1) FROM folders WHERE lower(rtrim(replace(path,'/','\\'),'\\'))=lower(rtrim(replace(?,'/','\\'),'\\')) LIMIT 1", [path], |r| Ok(Folder { id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![r.get(0)?],virtual_node:None,offline:false,missing:false })).optional()
 }
 
+pub fn folders_by_paths(db: &Db, paths: &[String]) -> rusqlite::Result<HashMap<String, Folder>> {
+    let conn = db.lock().unwrap();
+    let mut result = HashMap::new();
+    for chunk in paths.chunks(500) {
+        let values = vec!["(?)"; chunk.len()].join(",");
+        let sql = format!("WITH requested(path) AS (VALUES {values}) SELECT requested.path,folders.id,folders.parent_id,folders.root_id,folders.name,folders.path,(SELECT count(*) FROM assets WHERE folder_id=folders.id AND is_listed=1) FROM requested JOIN folders ON lower(rtrim(replace(folders.path,'/','\\'),'\\'))=lower(rtrim(replace(requested.path,'/','\\'),'\\')) ORDER BY folders.rowid");
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(chunk), |r| {
+            let id = r.get(1)?;
+            Ok((r.get::<_, String>(0)?, Folder { id, parent_id:r.get(2)?, root_id:r.get(3)?, name:r.get(4)?, path:r.get(5)?, count:r.get(6)?, folder_ids:vec![id], virtual_node:None, offline:false, missing:false }))
+        })?;
+        for row in rows { let (path, folder) = row?; result.entry(path).or_insert(folder); }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod folder_path_tests {
+    use super::*;
+    #[test]
+    fn indexed_path_and_batch_match_single_lookup() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT,path TEXT); CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,is_listed INTEGER); CREATE INDEX folders_norm_path ON folders(lower(rtrim(replace(path,'/','\\'),'\\'))); CREATE INDEX idx_assets_folder_listed ON assets(folder_id,is_listed); INSERT INTO folders VALUES(1,NULL,1,'A','C:\\Photos\\A'),(2,NULL,2,'B','C:/Photos/B/'); INSERT INTO assets VALUES(1,1,1),(2,1,0);").unwrap();
+        let plan: String = conn.query_row("EXPLAIN QUERY PLAN SELECT id FROM folders WHERE lower(rtrim(replace(path,'/','\\'),'\\'))=lower(rtrim(replace(?,'/','\\'),'\\')) LIMIT 1", ["c:/photos/a/"], |r| r.get(3)).unwrap();
+        assert!(plan.contains("folders_norm_path"), "{plan}");
+        let db = Arc::new(Mutex::new(conn));
+        let paths = vec!["c:/photos/a/".to_string(), "C:\\PHOTOS\\B\\".to_string(), "C:/missing".to_string()];
+        let batch = folders_by_paths(&db, &paths).unwrap();
+        for path in paths { let single = folder_by_path(&db, &path).unwrap(); assert_eq!(batch.get(&path).map(|f| (f.id, f.count)), single.map(|f| (f.id, f.count))); }
+        assert_eq!(batch.get("c:/photos/a/").unwrap().count, 1);
+    }
+}
+
 pub fn folder_ancestors(db: &Db, id: i64) -> rusqlite::Result<Vec<Folder>> {
     let conn = db.lock().unwrap();
     let mut stmt=conn.prepare("WITH RECURSIVE chain(id,parent_id,root_id,name,path,depth) AS (SELECT id,parent_id,root_id,name,path,0 FROM folders WHERE id=? UNION ALL SELECT f.id,f.parent_id,f.root_id,f.name,f.path,c.depth+1 FROM folders f JOIN chain c ON f.id=c.parent_id) SELECT c.id,c.parent_id,c.root_id,c.name,c.path,(SELECT count(*) FROM assets a WHERE a.folder_id=c.id AND a.is_listed=1) FROM chain c ORDER BY c.depth DESC")?;

@@ -33,7 +33,7 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
         set_meta_if_absent(&transaction, "import_date", &iso_now())?;
         set_meta_if_absent(&transaction, "schema_version", "1")?;
     }
-    transaction.execute_batch("CREATE TABLE IF NOT EXISTS asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL CHECK(state IN (0,1)),PRIMARY KEY(asset_id,color)); CREATE TABLE IF NOT EXISTS ai_suggestion_rejections(asset_id INTEGER NOT NULL,kind TEXT NOT NULL,label_id INTEGER NOT NULL,PRIMARY KEY(asset_id,kind,label_id)); CREATE TABLE IF NOT EXISTS ddreams_folder_rules(path TEXT PRIMARY KEY COLLATE NOCASE,mode TEXT NOT NULL CHECK(mode IN ('include','exclude')),created TEXT NOT NULL);").map_err(|e|e.to_string())?;
+    transaction.execute_batch("CREATE INDEX IF NOT EXISTS folders_norm_path ON folders(lower(rtrim(replace(path,'/','\\'),'\\'))); CREATE INDEX IF NOT EXISTS idx_assets_folder_listed ON assets(folder_id,is_listed); CREATE TABLE IF NOT EXISTS asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL CHECK(state IN (0,1)),PRIMARY KEY(asset_id,color)); CREATE TABLE IF NOT EXISTS ai_suggestion_rejections(asset_id INTEGER NOT NULL,kind TEXT NOT NULL,label_id INTEGER NOT NULL,PRIMARY KEY(asset_id,kind,label_id)); CREATE TABLE IF NOT EXISTS ddreams_folder_rules(path TEXT PRIMARY KEY COLLATE NOCASE,mode TEXT NOT NULL CHECK(mode IN ('include','exclude')),created TEXT NOT NULL);").map_err(|e|e.to_string())?;
     transaction.commit().map_err(|e|e.to_string())
 }
 
@@ -64,7 +64,7 @@ mod tests {
 
     fn fixture() -> Connection {
         let connection=Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE assets(id INTEGER PRIMARY KEY,is_listed INTEGER,ext_lower TEXT,exif_date TEXT,acdsee_date TEXT,file_modified TEXT);").unwrap();
+        connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE folders(id INTEGER PRIMARY KEY,path TEXT);CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,is_listed INTEGER,ext_lower TEXT,exif_date TEXT,acdsee_date TEXT,file_modified TEXT);").unwrap();
         connection
     }
 
