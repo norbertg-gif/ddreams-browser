@@ -75,8 +75,10 @@ export default function App() {
   const [historyIndex, setHistoryIndex] = useState(-1);
   const [epoch, setEpoch] = useState(1);
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
-  const [primaryId, setPrimaryId] = useState<number | null>(null);
-  const [primaryAsset, setPrimaryAsset] = useState<Asset | null>(null);
+  const [storedPrimaryId, setPrimaryId] = useState<number | null>(null);
+  const [storedPrimaryAsset, setPrimaryAsset] = useState<Asset | null>(null);
+  const primaryId = storedPrimaryId != null && selectedIds.has(storedPrimaryId) ? storedPrimaryId : null;
+  const primaryAsset = primaryId != null && storedPrimaryAsset?.id === primaryId ? storedPrimaryAsset : null;
   const [total, setTotal] = useState(0);
   const [totalSize, setTotalSize] = useState(0);
   const [toast,setToast]=useState("");
@@ -150,11 +152,20 @@ export default function App() {
   const openMapNeighborhood=useCallback(async(ids:number[])=>{if(!ids.length)return;const next:View={kind:"people",ids,title:"Okolie na mape"};navigate(next);try{const page=await invoke<Page>("get_assets",{filter:{kind:"people",id:null,rootId:null,includeChildren:false,ids,folderPath:null,value:null,query:null,sort:"name",descending:false,offset:0,limit:1,ratingMode:null,ratingValue:null,labelFilter:null,taggedOnly:false,fileGroup:null,dateFrom:null,dateTo:null,dateSource:null,dateNoDate:false,includeCategories:false,includeKeywords:false}});const asset=page.items[0];if(asset){setViewer({asset,index:0});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));setViewerDimensions(null)}}catch(error){setToast(String(error))}},[navigate]);
   const travel = useCallback((index:number)=>{const next=history[index];if(!next)return;setHistoryIndex(index);setView(next);setQuery("");setFilters({});setSelectedIds(new Set());setPrimaryId(null);setPrimaryAsset(null);setViewer(null);},[history]);
   const select = useCallback((asset: Asset, _index: number, event: ReactMouseEvent | ReactKeyboardEvent) => {
-    setPrimaryId(asset.id); setPrimaryAsset(asset);
-    if (event.ctrlKey || event.metaKey) { const next=new Set(selectedIds);if(next.has(asset.id))next.delete(asset.id);else next.add(asset.id);setSelectedIds(next);if(!next.size){setPrimaryId(null);setPrimaryAsset(null)} }
-    else if (!event.shiftKey) setSelectedIds(new Set([asset.id]));
-  }, [selectedIds]);
-  const selectRange = useCallback((ids: number[], asset: Asset, _index: number) => { setSelectedIds(new Set(ids)); setPrimaryId(asset.id); setPrimaryAsset(asset); }, []);
+    if (event.ctrlKey || event.metaKey) {
+      const next = new Set(selectedIds);
+      if (next.has(asset.id)) {
+        next.delete(asset.id);
+        if (primaryId === asset.id || !next.size) { setPrimaryId(null); setPrimaryAsset(null); }
+      } else {
+        next.add(asset.id); setPrimaryId(asset.id); setPrimaryAsset(asset);
+      }
+      setSelectedIds(next);
+    } else if (!event.shiftKey) {
+      setSelectedIds(new Set([asset.id])); setPrimaryId(asset.id); setPrimaryAsset(asset);
+    }
+  }, [selectedIds, primaryId]);
+  const selectRange = useCallback((ids: number[], asset: Asset, _index: number, add = false) => { setSelectedIds(current => new Set(add ? [...current, ...ids] : ids)); setPrimaryId(asset.id); setPrimaryAsset(asset); }, []);
   const selectAll = useCallback(async (ids: number[]) => { setSelectedIds(new Set(ids)); if (!ids.length) {setPrimaryId(null);setPrimaryAsset(null);return;} const wanted=new Set(ids);const page = await invoke<Page>("get_assets", { filter: { kind: view.kind, id: view.id ?? null, rootId:view.rootId??null, includeChildren:(view.kind==="category"||view.kind==="keyword")&&includeChildren, ids: view.ids ?? null, folderPath: view.folderPath ?? null, value: view.value ?? null, query: queryDebounced, sort, descending,ratingMode:filters.ratingMode,ratingValue:filters.ratingValue,labelFilter:filters.labelFilter,taggedOnly:filters.taggedOnly,fileGroup:queryFilters.fileGroup,dateFrom:view.dateFrom,dateTo:view.dateTo,dateSource:view.dateSource,dateNoDate:view.dateNoDate, offset: 0, limit: 500 } }); const asset=page.items.find(a=>wanted.has(a.id));if(asset){setPrimaryId(asset.id);setPrimaryAsset(asset);} }, [view, queryDebounced, sort, descending,filters,includeChildren]);
   const updateViewport = useCallback(() => { setEpoch(v => { const next=v+1;void invoke("set_thumbnail_epoch",{epoch:next});return next; }); }, []);
   useEffect(()=>{updateViewport()},[view,updateViewport]);

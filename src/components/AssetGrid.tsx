@@ -26,7 +26,7 @@ type Props = {
   selectedIds: Set<number>; primaryId: number | null;
   cutIds?: number[];
   onSelect: (asset: Asset, index: number, event: MouseEvent | KeyboardEvent) => void;
-  onSelectRange: (ids: number[], asset: Asset, index: number) => void;
+  onSelectRange: (ids: number[], asset: Asset, index: number, add: boolean) => void;
   onSelectAll: (ids: number[]) => void;
   onOpen: (asset: Asset, index: number) => void;
   onCounts: (total: number, size: number) => void;
@@ -55,6 +55,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const pages = useRef(new Set<number>());
   const requestVersion = useRef(0);
   const anchorIndex = useRef(0);
+  const [focusIndex, setFocusIndex] = useState<number | null>(null);
   const scrollPulse = useRef(0);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
@@ -99,7 +100,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
 
   useEffect(() => {
     requestVersion.current++;
-    cache.current.clear(); pages.current.clear(); setTotal(0); setItemsVersion(v => v + 1);
+    cache.current.clear(); pages.current.clear(); setTotal(0); setFocusIndex(null); anchorIndex.current = 0; setItemsVersion(v => v + 1);
     folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setTileMetadata(new Map());
     scrollRef.current?.scrollTo({ top: 0 });
@@ -202,13 +203,26 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const getAt = (index: number) => cache.current.get(index);
   const fetchIds = async (extra: Record<string,unknown> = {}) => { const ids:number[]=[];for(let offset=0;offset<total;offset+=500){const batch=await invoke<number[]>("get_asset_ids",{filter:{...params,...extra,offset:0,limit:500},offset,limit:500});ids.push(...batch);if(batch.length<500)break;}return ids; };
   const fetchAssetsForIds = async (ids:number[]) => {const wanted=new Set(ids),files:number[]=[];for(let offset=0;offset<total&&wanted.size;offset+=500){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:500}});for(const a of p.items)if(wanted.has(a.id)){if(!a.isDirectory)files.push(a.id);wanted.delete(a.id)}if(p.items.length<500)break;}return files;};
+  const selectRangeTo = async (asset: Asset, index: number, add: boolean) => {
+    const version = requestVersion.current;
+    const start = Math.min(anchorIndex.current, index), end = Math.max(anchorIndex.current, index);
+    const ids: number[] = [];
+    for (let offset = Math.floor(start / PAGE_SIZE) * PAGE_SIZE; offset <= end; offset += PAGE_SIZE) {
+      const first = Math.max(start, offset), last = Math.min(end, offset + PAGE_SIZE - 1);
+      if (Array.from({length: last - first + 1}, (_, i) => getAt(first + i)).some(item => !item)) {
+        const page = await invoke<Page>("get_assets", { filter: { ...params, offset, limit: PAGE_SIZE } });
+        if (version !== requestVersion.current) return;
+        page.items.forEach((item, i) => cache.current.set(offset + i, item));
+      }
+      for (let i = first; i <= last; i++) { const item = getAt(i); if (item) ids.push(item.id); }
+    }
+    onSelectRange(ids, asset, index, add);
+  };
   const handleTileClick = async (event: MouseEvent<HTMLDivElement>, asset: Asset, index: number) => {
-    scrollRef.current?.focus();
-    if (event.shiftKey) {
-      const start=Math.min(anchorIndex.current,index),end=Math.max(anchorIndex.current,index);const ids:number[]=[];
-      for(let offset=Math.floor(start/PAGE_SIZE)*PAGE_SIZE;offset<=end;offset+=PAGE_SIZE){await fetchPage(offset,requestVersion.current);for(let i=Math.max(start,offset);i<=Math.min(end,offset+PAGE_SIZE-1);i++){const item=getAt(i);if(item)ids.push(item.id)}}
-      onSelectRange(ids,asset,index);
-    } else { anchorIndex.current=index;onSelect(asset,index,event); }
+    scrollRef.current?.focus({preventScroll:true});
+    setFocusIndex(index);
+    if (event.shiftKey) await selectRangeTo(asset, index, event.ctrlKey || event.metaKey);
+    else { anchorIndex.current = index; onSelect(asset, index, event); }
   };
   const onKeyDown = async (event: KeyboardEvent<HTMLDivElement>) => {
     if (document.activeElement !== event.currentTarget) return;
@@ -229,24 +243,36 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
       onSelectAll(await fetchIds());
       return;
     }
-    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(event.key)) return;
+    const current = focusIndex ?? [...cache.current.entries()].find(([, item]) => item.id === primaryId)?.[0] ?? 0;
+    if (event.ctrlKey && event.key === " " && !event.shiftKey) {
+      event.preventDefault();
+      const asset = getAt(current);
+      if (asset) { anchorIndex.current = current; onSelect(asset, current, event); }
+      return;
+    }
+    if (!["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(event.key) || !total) return;
     event.preventDefault();
-    const current = [...cache.current.entries()].find(([, a]) => a.id === primaryId)?.[0] ?? 0;
-    const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -columns : columns;
-    const next = Math.max(0, Math.min(total - 1, current + delta));
-    await fetchPage(next, requestVersion.current);
+    const pageRows = Math.max(1, Math.floor((scrollRef.current?.clientHeight ?? rowHeight) / rowHeight));
+    const delta = event.key === "ArrowLeft" ? -1 : event.key === "ArrowRight" ? 1 : event.key === "ArrowUp" ? -columns : event.key === "ArrowDown" ? columns : event.key === "PageUp" ? -columns * pageRows : columns * pageRows;
+    const next = event.key === "Home" ? 0 : event.key === "End" ? total - 1 : Math.max(0, Math.min(total - 1, current + delta));
+    const ctrl = event.ctrlKey || event.metaKey, shift = event.shiftKey;
+    const version = requestVersion.current;
+    if (!getAt(next)) {
+      const offset = Math.floor(next / PAGE_SIZE) * PAGE_SIZE;
+      const page = await invoke<Page>("get_assets", {filter: {...params, offset, limit: PAGE_SIZE}});
+      if (version !== requestVersion.current) return;
+      page.items.forEach((item, i) => cache.current.set(offset + i, item));
+      setItemsVersion(v => v + 1);
+    }
     const asset = getAt(next); if (!asset) return;
-    const synthetic = { key: event.key, ctrlKey: event.ctrlKey, shiftKey: event.shiftKey, metaKey: event.metaKey } as KeyboardEvent;
-    if (event.shiftKey) {
-      const start=Math.min(anchorIndex.current,next),end=Math.max(anchorIndex.current,next);const ids:number[]=[];
-      for(let offset=Math.floor(start/PAGE_SIZE)*PAGE_SIZE;offset<=end;offset+=PAGE_SIZE){await fetchPage(offset,requestVersion.current);for(let i=Math.max(start,offset);i<=Math.min(end,offset+PAGE_SIZE-1);i++){const item=getAt(i);if(item)ids.push(item.id)}}
-      onSelectRange(ids,asset,next);
-    } else { anchorIndex.current=next; onSelect(asset, next, synthetic); }
+    setFocusIndex(next);
+    if (shift) await selectRangeTo(asset, next, ctrl);
+    else if (!ctrl) { anchorIndex.current = next; onSelect(asset, next, event); }
     virtualizer.scrollToIndex(Math.floor(next / columns), { align: "auto" });
   };
   const beginRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(e.button!==0||(e.target as HTMLElement).closest(".asset-tile,.tile-context-menu"))return;const r=e.currentTarget.getBoundingClientRect();const v={x1:e.clientX-r.left,y1:e.clientY-r.top,x2:e.clientX-r.left,y2:e.clientY-r.top,add:e.ctrlKey||e.metaKey};rubberRef.current=v;setRubber(v);e.currentTarget.setPointerCapture(e.pointerId);e.preventDefault()};
   const moveRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(!rubberRef.current)return;const r=e.currentTarget.getBoundingClientRect();const v={...rubberRef.current,x2:e.clientX-r.left,y2:e.clientY-r.top};rubberRef.current=v;setRubber(v);if(v.y2<30)e.currentTarget.scrollTop-=22;else if(v.y2>r.height-30)e.currentTarget.scrollTop+=22};
-  const endRubber=async()=>{const v=rubberRef.current;if(!v)return;rubberRef.current=null;setRubber(null);const el=scrollRef.current;if(!el)return;const xlo=Math.min(v.x1,v.x2),xhi=Math.max(v.x1,v.x2),ylo=Math.min(v.y1,v.y2)+el.scrollTop,yhi=Math.max(v.y1,v.y2)+el.scrollTop;const indexes:number[]=[];for(let row=Math.max(0,Math.floor((ylo-10)/rowHeight));row<=Math.min(rowCount-1,Math.floor((yhi-10)/rowHeight));row++){const cy=row*rowHeight+10+Math.min(zoom,rowHeight-24)/2;if(cy<ylo||cy>yhi)continue;for(let col=0;col<columns;col++){const cx=12+col*(tileWidth+9)+tileWidth/2;if(cx>=xlo&&cx<=xhi){const i=row*columns+col;if(i<total)indexes.push(i)}}}const needed=[...new Set(indexes.map(i=>Math.floor(i/PAGE_SIZE)*PAGE_SIZE))];for(const offset of needed){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:PAGE_SIZE}});p.items.forEach((a,j)=>cache.current.set(offset+j,a));}const ids=indexes.map(i=>getAt(i)?.id).filter((id):id is number=>id!=null);onSelectAll(v.add?[...new Set([...selectedIds,...ids])]:ids);};
+  const endRubber=async()=>{const v=rubberRef.current;if(!v)return;rubberRef.current=null;setRubber(null);const el=scrollRef.current;if(!el)return;if(Math.hypot(v.x2-v.x1,v.y2-v.y1)<4){onSelectAll([]);return;}const xlo=Math.min(v.x1,v.x2),xhi=Math.max(v.x1,v.x2),ylo=Math.min(v.y1,v.y2)+el.scrollTop,yhi=Math.max(v.y1,v.y2)+el.scrollTop;const indexes:number[]=[];for(let row=Math.max(0,Math.floor((ylo-10)/rowHeight));row<=Math.min(rowCount-1,Math.floor((yhi-10)/rowHeight));row++){const cy=row*rowHeight+10+Math.min(zoom,rowHeight-24)/2;if(cy<ylo||cy>yhi)continue;for(let col=0;col<columns;col++){const cx=12+col*(tileWidth+9)+tileWidth/2;if(cx>=xlo&&cx<=xhi){const i=row*columns+col;if(i<total)indexes.push(i)}}}const needed=[...new Set(indexes.map(i=>Math.floor(i/PAGE_SIZE)*PAGE_SIZE))];for(const offset of needed){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:PAGE_SIZE}});p.items.forEach((a,j)=>cache.current.set(offset+j,a));}const ids=indexes.map(i=>getAt(i)?.id).filter((id):id is number=>id!=null);onSelectAll(v.add?[...new Set([...selectedIds,...ids])]:ids);};
   useEffect(()=>{if(!rubber)return;const timer=window.setInterval(()=>{const el=scrollRef.current,v=rubberRef.current;if(!el||!v)return;if(v.y2<30)el.scrollTop-=14;else if(v.y2>el.clientHeight-30)el.scrollTop+=14},24);return()=>window.clearInterval(timer)},[!!rubber]);
 
   return <div className="grid-shell">
@@ -258,7 +284,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={[...selectedIds]} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -266,7 +292,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, selected, primary, cut, onClick, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
+function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, selected, primary, focused, cut, onClick, onContextMenu, onDoubleClick, overlayMode, hoverMode, selectedIds, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; focused: boolean; cut:boolean; selectedIds:number[]; onClick: (event: MouseEvent<HTMLDivElement>) => void; onContextMenu: () => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
   // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
   // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
   const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
@@ -323,7 +349,7 @@ function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, sele
   useEffect(()=>{if(!popup)return;let current=true;void invoke<CatalogAssetMetadata|null>("get_catalog_asset_metadata",{assetId:asset.id}).then(m=>{if(current)setHoverMetadata(m)}).catch(()=>{});return()=>{current=false}},[popup,asset.id]);
   useEffect(()=>{const hide=()=>setPopup(false);window.addEventListener("ddreams-scroll",hide);window.addEventListener("resize",hide);return()=>{window.removeEventListener("ddreams-scroll",hide);window.removeEventListener("resize",hide)}},[]);
   return <div ref={tileRef} draggable={!asset.isDirectory} onDragStart={e=>{if(asset.isDirectory){e.preventDefault();return;}const ids=selected&&selectedIds.length?selectedIds:[asset.id];e.dataTransfer.setData("application/x-ddreams-asset-ids",JSON.stringify(ids));e.dataTransfer.effectAllowed="copyMove";const count=ids.length,noun=count===1?"súbor":count<=4?"súbory":"súborov",dragImage=document.createElement("div");dragImage.textContent=`${count} ${noun}`;Object.assign(dragImage.style,{position:"fixed",left:"-1000px",top:"-1000px",padding:"3px 8px",borderRadius:"10px",background:"#273644",color:"#d9dfe8",fontSize:"11px",lineHeight:"14px",border:"1px solid #465461",whiteSpace:"nowrap",pointerEvents:"none"});document.body.appendChild(dragImage);// Negative offsets place the image down and right of the cursor hotspot.
-  e.dataTransfer.setDragImage(dragImage,-14,-14);window.setTimeout(()=>dragImage.remove(),0);}} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""} ${cut?"cut-pending":""} ${rejected?"rejected":""} ${groupNumber!=null?`duplicate-group-${groupNumber%2}`:""}`} onContextMenu={e=>{e.preventDefault();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>{groupNumber!=null&&<span className="duplicate-group-badge">#{groupNumber}</span>}
+  e.dataTransfer.setDragImage(dragImage,-14,-14);window.setTimeout(()=>dragImage.remove(),0);}} className={`asset-tile overlay-${overlayMode} ${selected ? "selected" : ""} ${primary ? "primary" : ""} ${focused ? "focused" : ""} ${cut?"cut-pending":""} ${rejected?"rejected":""} ${groupNumber!=null?`duplicate-group-${groupNumber%2}`:""}`} onContextMenu={e=>{e.preventDefault();onContextMenu();setMenu({x:e.clientX,y:e.clientY})}} onMouseEnter={()=>setHover(true)} onMouseLeave={()=>{setHover(false);setPopup(false)}} onClick={onClick} onDoubleClick={onDoubleClick} title={asset.path ?? asset.name}>{groupNumber!=null&&<span className="duplicate-group-badge">#{groupNumber}</span>}
     <div className="thumb-wrap" style={{ height: size }}>
       {best&&<span className="best-badge" title="Najostrejšia v sérii">★ najlepšia</span>}
       {!asset.isDirectory && !broken && !offline && asset.path ? <img src={thumbUrl(asset, size, tileEpoch, retry)} loading="lazy" draggable={false} onError={async () => {
