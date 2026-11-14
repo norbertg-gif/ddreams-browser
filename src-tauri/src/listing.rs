@@ -88,7 +88,7 @@ impl ListingService {
                 id: self.id(), folder_id: if is_dir { matched_folder } else { parent_folder_id }, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,
                 label: None, file_modified: None, exif_date: None, acdsee_date: None, md_dirty: None, is_orphan: None,
-                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, has_categories: false, display_categories: None, display_keywords: None,
+                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, missing: false, has_categories: false, display_categories: None, display_keywords: None,
             });
             asset.name = name;
             asset.ext = ext;
@@ -158,17 +158,17 @@ impl ListingService {
         if !path_buf.is_dir(){return Ok(None)}
         let key=normalize(path);
         if let Some(id)=self.path_ids.lock().map_err(|_|"path map poisoned")?.get(&key).copied(){
-            if let Some(asset)=self.asset(id){let parent=self.directory_parents.lock().ok().and_then(|p|p.get(&id).copied());return Ok(Some(db::Folder{id,parent_id:parent,root_id:parent.and_then(|p|self.asset(p)).and_then(|a|a.folder_id).or_else(||parent.and_then(|p|db::folder_ancestors(&self.db,p).ok()?.last()?.root_id)),name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false}));}
+            if let Some(asset)=self.asset(id){let parent=self.directory_parents.lock().ok().and_then(|p|p.get(&id).copied());return Ok(Some(db::Folder{id,parent_id:parent,root_id:parent.and_then(|p|self.asset(p)).and_then(|a|a.folder_id).or_else(||parent.and_then(|p|db::folder_ancestors(&self.db,p).ok()?.last()?.root_id)),name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}));}
         }
         let parent_path=path_buf.parent().map(|p|p.to_string_lossy().to_string());
         let parent=if let Some(parent_path)=parent_path.filter(|p|!p.is_empty()&&normalize(p)!=key){self.resolve_folder(&parent_path)?}else{None};
         let name=path_buf.file_name().map(|n|n.to_string_lossy().to_string()).unwrap_or_else(||path.to_string());
         let id=self.id(); let parent_id=parent.as_ref().map(|p|p.id); let root_id=parent.as_ref().and_then(|p|p.root_id);
-        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,has_categories:false,display_categories:None,display_keywords:None};
+        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None};
         self.entries.lock().map_err(|_|"entry map poisoned")?.insert(id,asset);
         if let Some(parent_id)=parent_id{self.directory_parents.lock().map_err(|_|"folder map poisoned")?.insert(id,parent_id);}
         self.path_ids.lock().map_err(|_|"path map poisoned")?.insert(key,id);
-        Ok(Some(db::Folder{id,parent_id,root_id,name,path:Some(path_buf.to_string_lossy().to_string()),count:0,folder_ids:vec![id],virtual_node:None,offline:false}))
+        Ok(Some(db::Folder{id,parent_id,root_id,name,path:Some(path_buf.to_string_lossy().to_string()),count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}))
     }
 
     pub fn folder_ancestors(&self, id:i64) -> Result<Vec<db::Folder>,String> {
@@ -177,7 +177,7 @@ impl ListingService {
         let parent=self.directory_parents.lock().map_err(|_|"folder map poisoned")?.get(&id).copied().ok_or("folder parent not found")?;
         let mut chain=if parent <= -10_000_000 { self.folder_ancestors(parent)? } else { db::folder_ancestors(&self.db,parent).map_err(|e|e.to_string())? };
         let root_id=chain.last().and_then(|f|f.root_id);
-        chain.push(db::Folder{id,parent_id:Some(parent),root_id,name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false});
+        chain.push(db::Folder{id,parent_id:Some(parent),root_id,name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false});
         Ok(chain)
     }
 }

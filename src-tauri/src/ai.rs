@@ -335,6 +335,8 @@ impl AiService {
     pub fn faces_clusters(&self,min_size:Option<u32>)->Result<Value,String>{let args=min_size.map(|v|json!({"min_size":v})).unwrap_or_else(||json!({}));self.request("faces_clusters",args,Duration::from_secs(300))}
     pub fn faces_for_assets(&self,asset_ids:&[i64])->Result<Value,String>{self.request("faces_for_assets",json!({"asset_ids":asset_ids}),Duration::from_secs(30))}
     pub fn faces_set(&self,face_ids:&[i64],action:&str,person_id:Option<i64>)->Result<Value,String>{self.request("faces_set",json!({"face_ids":face_ids,"action":action,"person_id":person_id}),Duration::from_secs(30))}
+    pub fn faces_asset_assign(&self,asset_ids:&[i64],person_id:i64)->Result<Value,String>{self.request("faces_asset_assign",json!({"asset_ids":asset_ids,"person_id":person_id}),Duration::from_secs(30))}
+    pub fn faces_asset_remove(&self,asset_ids:&[i64],person_id:i64)->Result<Value,String>{self.request("faces_asset_remove",json!({"asset_ids":asset_ids,"person_id":person_id}),Duration::from_secs(30))}
     pub fn faces_person_create(&self,name:&str)->Result<Value,String>{self.request("faces_person_create",json!({"name":name}),Duration::from_secs(30))}
     pub fn faces_person_rename(&self,person_id:i64,name:&str)->Result<Value,String>{self.request("faces_person_rename",json!({"person_id":person_id,"name":name}),Duration::from_secs(30))}
     pub fn faces_recognize_all(&self)->Result<Value,String>{self.request("faces_recognize_all",json!({}),Duration::from_secs(300))}

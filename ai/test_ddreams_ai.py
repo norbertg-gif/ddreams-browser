@@ -170,6 +170,43 @@ class FaceTests(unittest.TestCase):
     def _person(self, name="Jana"):
         return self.service.execute({"cmd": "faces_person_create", "name": name})["id"]
 
+    def test_asset_assign_uses_single_eligible_face_or_inserts_photo_row(self):
+        person = self._person()
+        with self.service.faces_lock:
+            eligible = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,state) VALUES(1,0,0,1,1,'ai','unknown')").lastrowid
+            self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,state) VALUES(2,0,0,1,1,'ai','unknown')")
+            self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,state) VALUES(2,0,0,1,1,'ai','auto')")
+            self.service.faces_db.commit()
+        result = self.service.execute({"cmd":"faces_asset_assign","asset_ids":[1,2],"person_id":person})
+        self.assertEqual(result["changed"], 2)
+        row = self.service.faces_db.execute("SELECT person_id,state FROM faces WHERE id=?", (eligible,)).fetchone()
+        self.assertEqual(row, (person, "confirmed"))
+        photo = self.service.faces_db.execute("SELECT x,y,w,h,person_id,state FROM faces WHERE asset_id=2 AND person_id=?",(person,)).fetchone()
+        self.assertEqual(photo, (None,None,None,None,person,"confirmed"))
+
+    def test_asset_assign_confirms_existing_nonignored_person_and_remove_branches(self):
+        person = self._person()
+        with self.service.faces_lock:
+            boxed = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state) VALUES(3,0,0,1,1,'ai',?,'auto')", (person,)).lastrowid
+            photo = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state) VALUES(4,NULL,NULL,NULL,NULL,'ai',?,'confirmed')", (person,)).lastrowid
+            removable = self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state) VALUES(5,0,0,1,1,'ai',?,'confirmed')", (person,)).lastrowid
+            self.service.faces_db.commit()
+        self.assertEqual(self.service.execute({"cmd":"faces_asset_assign","asset_ids":[3],"person_id":person})["changed"],1)
+        result=self.service.execute({"cmd":"faces_asset_remove","asset_ids":[4,5],"person_id":person})
+        self.assertEqual(result["changed"],2)
+        self.assertIsNone(self.service.faces_db.execute("SELECT 1 FROM faces WHERE id=?",(photo,)).fetchone())
+        self.assertEqual(self.service.faces_db.execute("SELECT person_id,state FROM faces WHERE id=?",(removable,)).fetchone(),(None,"unknown"))
+        self.assertEqual(self.service.faces_db.execute("SELECT count(*) FROM face_rejected WHERE face_id=? AND person_id=?",(removable,person)).fetchone()[0],1)
+        self.assertEqual(self.service.execute({"cmd":"faces_for_assets","asset_ids":[3,4,5]})["faces"][0]["face_id"], boxed)
+
+    def test_boxless_confirmed_face_survives_scan(self):
+        person=self._person()
+        with self.service.faces_lock:
+            self.service.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,source,person_id,state) VALUES(9,NULL,NULL,NULL,NULL,'ai',?,'confirmed')",(person,))
+            self.service.faces_db.commit()
+        self.service._scan_face_asset({"asset_id":9,"size":1,"mtime_ns":2},Image.new("RGB",(160,120),"white"))
+        self.assertEqual(self.service.faces_db.execute("SELECT count(*) FROM faces WHERE asset_id=9 AND person_id=? AND state='confirmed'",(person,)).fetchone()[0],1)
+
     def test_scan_matches_imported_box_keeps_name_and_stores_vector(self):
         person = self._person()
         with self.service.faces_lock:

@@ -7,7 +7,7 @@ import type { Asset, AssetQuality, CatalogAssetMetadata, FormatTable, Page, View
 import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type ThumbnailInfoConfig } from "../thumbnailInfo";
 
 const PAGE_SIZE = 120;
-const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostr\u00e1", over:"Prep\u00e1len\u00e1", under:"Tmav\u00e1" };
+const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostrá", over:"Prepálená", under:"Tmavá" };
 type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
 declare global { interface Window { __ddreamsShift?: boolean } }
 export function formatBytes(bytes: number | null | undefined): string {
@@ -334,14 +334,14 @@ function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, sele
           else if (state === "offline") setOffline(true);
           else setBroken(true);
         } catch { setBroken(true); }
-      }} /> : asset.isDirectory ? <div className="folder-tile"><div className="folder-tab"/><div className="folder-body">{folderPreviews.slice(0, 4).map(preview => <img key={preview.id} className="folder-preview" src={thumbUrl(preview, 160, tileEpoch)} loading="lazy" draggable={false} onError={event => { event.currentTarget.style.display = "none"; }} />)}</div></div> : <div className="file-placeholder"><span>{offline || asset.offline ? "OFFLINE" : badge}</span>{(offline || asset.offline) && <small>Odpojené</small>}</div>}
+      }} /> : asset.isDirectory ? <div className="folder-tile"><div className="folder-tab"/><div className="folder-body">{folderPreviews.slice(0, 4).map(preview => <img key={preview.id} className="folder-preview" src={thumbUrl(preview, 160, tileEpoch)} loading="lazy" draggable={false} onError={event => { event.currentTarget.style.display = "none"; }} />)}</div></div> : <div className="file-placeholder"><span>{asset.missing ? "CHÝBA" : offline || asset.offline ? "OFFLINE" : badge}</span>{asset.missing ? <small>Súbor neexistuje</small> : (offline || asset.offline) && <small>Odpojené</small>}</div>}
       {overlayMode>0&&!asset.isDirectory && <span className="type-badge" title={`Typ súboru: ${badge}`}>{badge}</span>}
       {overlayMode>0&&(asset.hasCategories||!!asset.rating)&&<span className="tile-badges-left">{asset.hasCategories&&<span className="category-badge" title="Zaradené v kategórii">◆</span>}{!!asset.rating&&<span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}</span>}
       {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
       
       {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }} />}
       {overlayMode>0&&qualityReasons.length>0&&<span className="quality-badge" title={qualityReasons.join(", ")}>!</span>}
-      {overlayMode>0&&(offline||asset.offline)&&<span className="offline-badge" title="Súbor nie je dostupný, disk je odpojený alebo bol súbor presunutý">OFFLINE</span>}
+      {overlayMode>0&&(asset.missing||offline||asset.offline)&&<span className={asset.missing?"missing-badge":"offline-badge"} title={asset.missing?"Súbor na pripojenom disku neexistuje":"Disk nie je pripojený"}>{asset.missing?"CHÝBA":"OFFLINE"}</span>}
       {!asset.isDirectory && !hasSizeLine && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
     <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines, maxHeight: field.lines * 14 }} title={text}>{text || "\u00a0"}</div>; })}</div>
@@ -350,10 +350,10 @@ function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, sele
       <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>
         <div className="hover-image">{!asset.isDirectory && asset.path && <img src={thumbUrl(asset, 320, epoch)} />}</div>
         <b title={asset.name}>{asset.name}</b>
-        <small>{formatBytes(asset.size)} {"\u00b7"} {asset.width && asset.height ? `${asset.width} \u00d7 ${asset.height}` : "\u2014"}</small>
-        <small>{asset.exifDate ?? asset.fileModified ?? "\u2014"}</small>
-        <small>{asset.rating ? `\u2605 ${asset.rating}` : "Bez hodnotenia"} {label ? labelText(label) : ""}</small>
-        <small>{hoverMetadata?.categories.length ? `Kateg\u00f3rie: ${hoverMetadata.categories.join(", ")}` : "Bez kateg\u00f3ri\u00ed"}</small>
+        <small>{formatBytes(asset.size)} {"\u00b7"} {asset.width && asset.height ? `${asset.width} × ${asset.height}` : "—"}</small>
+        <small>{asset.exifDate ?? asset.fileModified ?? "—"}</small>
+        <small>{asset.rating ? `★ ${asset.rating}` : "Bez hodnotenia"} {label ? labelText(label) : ""}</small>
+        <small>{hoverMetadata?.categories.length ? `Kategórie: ${hoverMetadata.categories.join(", ")}` : "Bez kategórií"}</small>
       </div>, document.body
     )}
   </div>;
@@ -368,10 +368,10 @@ export function thumbUrl(asset: Pick<Asset, "id" | "path" | "fileModified">, siz
   return url.toString();
 }
 export function labelText(label: string): string {
-  const names: Record<string,string> = { red:"\u010cerven\u00e1", yellow:"\u017dlt\u00e1", green:"Zelen\u00e1", blue:"Modr\u00e1", purple:"Fialov\u00e1", gray:"Na vyradenie", "\u010derven\u00e1":"\u010cerven\u00e1", "\u017elt\u00e1":"\u017dlt\u00e1", "zelen\u00e1":"Zelen\u00e1", "modr\u00e1":"Modr\u00e1", "fialov\u00e1":"Fialov\u00e1" };
+  const names: Record<string,string> = { red:"Červená", yellow:"Žltá", green:"Zelená", blue:"Modrá", purple:"Fialová", gray:"Na vyradenie", "červená":"Červená", "žltá":"Žltá", "zelená":"Zelená", "modrá":"Modrá", "fialová":"Fialová" };
   return names[label.toLocaleLowerCase("sk-SK")] ?? label;
 }
 export function labelColor(label: string): string {
-  const colors: Record<string, string> = { red: "#c94c50", "\u010derven\u00e1": "#c94c50", yellow: "#c49b37", "\u017elt\u00e1": "#c49b37", green: "#4b9862", "zelen\u00e1": "#4b9862", blue: "#4e7db7", "modr\u00e1": "#4e7db7", purple: "#8866b4", "fialov\u00e1": "#8866b4", gray: "#8a8f98" };
+  const colors: Record<string, string> = { red: "#c94c50", "červená": "#c94c50", yellow: "#c49b37", "žltá": "#c49b37", green: "#4b9862", "zelená": "#4b9862", blue: "#4e7db7", "modrá": "#4e7db7", purple: "#8866b4", "fialová": "#8866b4", gray: "#8a8f98" };
   return colors[label.toLowerCase()] ?? "#6b7280";
 }

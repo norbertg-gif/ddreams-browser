@@ -71,6 +71,9 @@ pub struct CategoryDeleteInfo { pub id: i64, pub name: String, pub assigned_file
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ExclusionImpact { pub files: usize, pub with_categories: usize, pub with_keywords: usize, pub with_rating_label_tagged: usize, pub with_color_overrides: usize }
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct RemoveCatalogResult { pub change_id:Option<i64>,pub summary:String,pub removed_assets:usize,pub removed_folders:usize,pub asset_ids:Vec<i64> }
 
 /// Removes catalogue rows of `ids` (category/keyword/colour links, then the asset row) as journal
 /// events, so undo restores them exactly. Used by folder exclusion and by deleting files.
@@ -169,6 +172,18 @@ impl CatalogWriter {
             if has("SELECT EXISTS(SELECT 1 FROM asset_color_overrides WHERE asset_id=?1)")? {impact.with_color_overrides+=1;}
         }
         Ok(impact)
+    }
+
+    pub fn remove_folder_from_catalog(&self,path:&str)->Result<RemoveCatalogResult,String>{
+        self.require_write()?;let path=path.trim().trim_end_matches(['\\','/']).replace('/',"\\");if path.is_empty(){return Err("Cesta priečinka je prázdna".into())}
+        let mut conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
+        let normal=normalize_fs_path(&path);let prefix=format!("{normal}\\");let ids={let mut stmt=tx.prepare("SELECT id,path FROM assets WHERE path IS NOT NULL ORDER BY id").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?.into_iter().filter(|(_,p)|{let p=normalize_fs_path(p);p==normal||p.starts_with(&prefix)}).map(|(id,_)|id).collect::<Vec<_>>()};
+        let folder_rows={let mut stmt=tx.prepare("SELECT id,path,root_id FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};
+        let folders=folder_rows.into_iter().filter(|(_,p,_)|normalize_fs_path(p)==normalize_fs_path(&path)||normalize_fs_path(p).starts_with(&prefix)).collect::<Vec<_>>();
+        for chunk in ids.chunks(500){if chunk.is_empty(){continue}let marks=vec!["?";chunk.len()].join(",");for table in ["asset_categories","asset_keywords","asset_color_overrides"]{let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0)).unwrap_or(false);if exists{tx.execute(&format!("DELETE FROM {table} WHERE asset_id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}}tx.execute(&format!("DELETE FROM assets WHERE id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}
+        for chunk in folders.iter().map(|f|f.0).collect::<Vec<_>>().chunks(500){if !chunk.is_empty(){let marks=vec!["?";chunk.len()].join(",");tx.execute(&format!("DELETE FROM folders WHERE id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}}
+        let roots=folders.iter().filter_map(|f|f.2).collect::<std::collections::HashSet<_>>();for root in roots{tx.execute("DELETE FROM folder_roots WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM folders WHERE root_id=?1)",[root]).map_err(|e|e.to_string())?;}
+        tx.commit().map_err(|e|e.to_string())?;Ok(RemoveCatalogResult{change_id:None,summary:format!("Odstránené z katalógu: {} súborov a {} priečinkov",ids.len(),folders.len()),removed_assets:ids.len(),removed_folders:folders.len(),asset_ids:ids})
     }
 
     /// Saves (or clears, `mode=None`) the rule for `path`. Excluding removes every catalogue row under the
@@ -900,7 +915,7 @@ fn derive_path_root(path: &str) -> (String,String) {
 }
 
 fn path_parts(path:&str)->Vec<String>{path.split(['\\','/']).filter(|part|!part.is_empty()).map(str::to_owned).collect()}
-fn normalize_fs_path(path:&str)->String{path.trim_end_matches(['\\','/']).replace('/',"\\").to_lowercase()}
+pub(crate) fn normalize_fs_path(path:&str)->String{path.trim_end_matches(['\\','/']).replace('/',"\\").to_lowercase()}
 fn is_path_prefix(root:&str,target:&str)->bool{let root=normalize_fs_path(root);let target=normalize_fs_path(target);target==root||target.strip_prefix(&root).is_some_and(|suffix|suffix.starts_with('\\'))}
 
 fn next_id(transaction:&Transaction<'_>,table:&str)->Result<i64,String>{
@@ -1406,4 +1421,15 @@ mod tests {
 
     #[test]
     fn readonly_writer_refuses_keyword_mutations(){let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),false);assert!(writer.set_asset_keywords(&[1],&[],10,true).unwrap_err().contains("read-only"));assert!(writer.create_keyword(None,"Test").unwrap_err().contains("read-only"));assert!(writer.rename_keyword(10,"Test").unwrap_err().contains("read-only"));assert!(writer.move_keyword(11,None).unwrap_err().contains("read-only"));assert!(writer.delete_keyword(10).unwrap_err().contains("read-only"));assert_eq!(keyword_rows(&db),vec![(1,10),(2,12)]);}
+    #[test]
+    fn remove_catalog_source_deletes_subtree_rows_and_never_creates_journal_entry(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
+        let result=writer.remove_folder_from_catalog("F:\\Photos").unwrap();
+        assert_eq!(result.removed_assets,2);assert_eq!(result.removed_folders,1);assert_eq!(result.change_id,None);
+        let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id IN (1,2)",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM asset_categories WHERE asset_id IN (1,2)",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE lower(path) LIKE lower(?1)",["F:\\Photos%"],|r|r.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id=4",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+    }
+
 }

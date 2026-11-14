@@ -36,6 +36,51 @@ pub struct CatalogWriterState(pub Arc<CatalogWriter>);
 pub struct FileManagerState(pub Arc<FileManager>);
 pub struct AppInfoState(pub AppInfo);
 
+fn path_volume(path:&str)->String{let p=path.replace('/',"\\");if p.starts_with("\\\\"){let mut parts=p.trim_start_matches('\\').split('\\');let server=parts.next().unwrap_or("");let share=parts.next().unwrap_or("");return format!("\\\\{server}\\{share}")}if p.as_bytes().get(1)==Some(&b':'){return p[..3.min(p.len())].to_string()}"\\".into()}
+fn classify_source_with(path:&str,cache:&mut std::collections::HashMap<String,bool>,mut exists:impl FnMut(&str)->bool)->(bool,bool){let volume=path_volume(path);let reachable=*cache.entry(volume.clone()).or_insert_with(||exists(&volume));if !reachable{(true,false)}else{(false,!exists(path))}}
+fn classify_source(path:&str,cache:&mut std::collections::HashMap<String,bool>)->(bool,bool){classify_source_with(path,cache,|p|Path::new(p).exists())}
+fn require_missing_source(offline:bool,missing:bool)->Result<(),String>{if offline||missing{Ok(())}else{Err("Priečinok existuje na disku – z katalógu ho vyraď cez vylúčenie".into())}}
+fn tree_children_from_listing(disk:Vec<db::Folder>,_catalogue:Vec<db::Folder>)->Vec<db::Folder>{disk}
+fn classify_page(page:&mut db::AssetPage){let mut cache=std::collections::HashMap::new();for asset in &mut page.items{if let Some(path)=asset.path.as_deref(){let folder=Path::new(path).parent().and_then(Path::to_str).unwrap_or(path);(asset.offline,asset.missing)=classify_source(folder,&mut cache)}}}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct CatalogSourceStatus{pub path:String,pub assets:usize,pub offline:bool,pub missing:bool}
+#[derive(Clone)] struct CatalogFolderNode{id:i64,parent:Option<i64>,path:String,count:usize}
+fn collect_catalog_missing_sources(mut nodes:Vec<CatalogFolderNode>,mut exists:impl FnMut(&str)->bool)->Vec<CatalogSourceStatus>{
+    nodes.sort_by_key(|n|std::cmp::Reverse(n.path.len()));
+    let mut counts=nodes.iter().map(|n|(n.id,n.count)).collect::<std::collections::HashMap<_,_>>();
+    for node in &nodes { if let Some(parent)=node.parent {let count=counts.get(&node.id).copied().unwrap_or(0);*counts.entry(parent).or_default()+=count;} }
+    nodes.sort_by_key(|n|n.path.len());
+    let mut reachable=std::collections::HashMap::<String,bool>::new();let mut status=std::collections::HashMap::<i64,(bool,bool)>::new();
+    for node in &nodes {
+        let volume=path_volume(&node.path);let online=*reachable.entry(volume.clone()).or_insert_with(||exists(&volume));
+        let value=if !online {(true,false)} else {let parent_status=node.parent.and_then(|id|status.get(&id).copied()).unwrap_or((false,false));if parent_status.0||parent_status.1{parent_status}else{(false,!exists(&node.path))}};
+        status.insert(node.id,value);
+    }
+    let mut result=Vec::new();
+    for node in nodes {
+        let Some(&(offline,missing))=status.get(&node.id) else{continue};if !offline&&!missing{continue}
+        let parent_bad=node.parent.and_then(|id|status.get(&id).copied()).is_some_and(|(o,m)|o||m);
+        if !parent_bad {result.push(CatalogSourceStatus{path:node.path,assets:counts.get(&node.id).copied().unwrap_or(0),offline,missing});}
+    }
+    result
+}
+#[tauri::command(async)]
+pub fn get_catalog_missing_sources(state:State<'_,BackgroundDbState>)->Result<Vec<CatalogSourceStatus>,String>{
+    let conn=state.0.lock().map_err(|_|"catalog lock poisoned")?;
+    let mut stmt=conn.prepare("SELECT f.id,f.parent_id,f.path,count(a.id) FROM folders f LEFT JOIN assets a ON a.folder_id=f.id WHERE f.path IS NOT NULL GROUP BY f.id,f.parent_id,f.path").map_err(|e|e.to_string())?;
+    let nodes=stmt.query_map([],|r|Ok(CatalogFolderNode{id:r.get(0)?,parent:r.get(1)?,path:r.get(2)?,count:r.get::<_,i64>(3)?.max(0) as usize})).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;
+    drop(stmt);drop(conn);Ok(collect_catalog_missing_sources(nodes,|p|Path::new(p).is_dir()))
+}
+#[derive(serde::Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct RemoveCatalogInfo{pub assets:usize,pub folders:usize,pub offline:bool,pub missing:bool}
+#[tauri::command(async)]
+pub fn remove_folder_from_catalog_info(db:State<'_,BackgroundDbState>,folder_path:String)->Result<RemoveCatalogInfo,String>{let path=folder_path.trim().trim_end_matches(['\\','/']);let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let normal=crate::journal::normalize_fs_path(path);let prefix=format!("{}\\",normal);let asset_paths={let mut stmt=conn.prepare("SELECT path FROM assets WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let assets=asset_paths.iter().filter(|p|{let p=crate::journal::normalize_fs_path(p);p==normal||p.starts_with(&prefix)}).count();let all={let mut stmt=conn.prepare("SELECT path FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let prefix=format!("{}\\",path.replace('/',"\\").trim_end_matches('\\'));let folders=all.iter().filter(|p|p.eq_ignore_ascii_case(path)||p.to_lowercase().starts_with(&prefix.to_lowercase())).count();drop(conn);let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(path,&mut cache);Ok(RemoveCatalogInfo{assets,folders,offline,missing})}
+#[tauri::command(async)]
+pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,app:State<'_,AppInfoState>,listing:State<'_,ListingState>,folder_path:String)->Result<crate::journal::RemoveCatalogResult,String>{let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(&folder_path,&mut cache);if !offline&&!missing{return Err("PrieÄinok existuje na disku â€“ z katalÃ³gu ho vyraÄ cez vylÃºÄenie".into())}if app.0.readonly{return Err("KatalÃ³g je iba na ÄÃ­tanie".into())}crate::backup::backup_now(Path::new(&app.0.catalog),Path::new(&app.0.backups))?;let result=writer.0.remove_folder_from_catalog(&folder_path)?;for chunk in result.asset_ids.chunks(1000){ai.0.forget(chunk.to_vec())}let _=listing.0.invalidate_path(&folder_path);Ok(result)}
+
 #[tauri::command(async)]
 pub fn ai_status(state: State<'_, AiState>) -> AiStatus { state.0.status() }
 #[tauri::command(async)]
@@ -207,9 +252,13 @@ pub fn ai_faces_clusters(ai:State<'_,AiState>,db:State<'_,DatabaseState>,min_siz
 #[tauri::command(async)]
 pub fn ai_faces_for_assets(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>)->Result<Vec<AiFaceAsset>,String>{if asset_ids.len()>500{return Err("Najviac 500 asset ID naraz".into())}let ids=asset_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_for_assets(&ids)?;let raw=v["faces"].as_array().cloned().unwrap_or_default();let asset_ids=raw.iter().filter_map(|f|f["asset_id"].as_i64()).collect::<Vec<_>>();let listed=filter_listed_ids(&db.0,&asset_ids,false)?.into_iter().collect::<std::collections::HashSet<_>>();Ok(raw.into_iter().filter_map(|f|{let asset_id=f["asset_id"].as_i64()?;if !listed.contains(&asset_id){return None}Some(AiFaceAsset{face_id:f["face_id"].as_i64()?,asset_id,x:f["x"].as_f64(),y:f["y"].as_f64(),w:f["w"].as_f64(),h:f["h"].as_f64(),person_id:f["person_id"].as_i64(),name:f["name"].as_str().map(str::to_owned),state:f["state"].as_str()?.to_owned(),score:f["score"].as_f64()})}).collect())}
 #[tauri::command(async)]
-pub fn ai_faces_set(ai:State<'_,AiState>,face_ids:Vec<i64>,action:String,person_id:Option<i64>)->Result<usize,String>{if face_ids.len()>500{return Err("Najviac 500 tvárí naraz".into())}let ids=face_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_set(&ids,&action,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+pub fn ai_faces_set(ai:State<'_,AiState>,face_ids:Vec<i64>,action:String,person_id:Option<i64>)->Result<usize,String>{if face_ids.len()>500{return Err("Najviac 500 tvÃ¡rÃ­ naraz".into())}let ids=face_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_set(&ids,&action,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
 #[tauri::command(async)]
-pub fn ai_faces_person_create(ai:State<'_,AiState>,name:String)->Result<i64,String>{let v=ai.0.faces_person_create(&name)?;v["id"].as_i64().ok_or_else(||"AI nevrátilo ID osoby".into())}
+pub fn ai_faces_asset_assign(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>,person_id:i64)->Result<usize,String>{if asset_ids.len()>2000{return Err("Najviac 2000 fotiek naraz".into())}let ids=filter_listed_ids(&db.0,&asset_ids,false)?;let v=ai.0.faces_asset_assign(&ids,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+#[tauri::command(async)]
+pub fn ai_faces_asset_remove(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>,person_id:i64)->Result<usize,String>{if asset_ids.len()>2000{return Err("Najviac 2000 fotiek naraz".into())}let ids=filter_listed_ids(&db.0,&asset_ids,false)?;let v=ai.0.faces_asset_remove(&ids,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+#[tauri::command(async)]
+pub fn ai_faces_person_create(ai:State<'_,AiState>,name:String)->Result<i64,String>{let v=ai.0.faces_person_create(&name)?;v["id"].as_i64().ok_or_else(||"AI nevrÃ¡tilo ID osoby".into())}
 #[tauri::command(async)]
 pub fn ai_faces_person_rename(ai:State<'_,AiState>,person_id:i64,name:String)->Result<bool,String>{let v=ai.0.faces_person_rename(person_id,&name)?;Ok(v["ok"].as_bool().unwrap_or(false))}
 #[tauri::command(async)]
@@ -221,7 +270,7 @@ pub fn ai_cluster_ignore(state:State<'_,AiState>,asset_ids:Vec<i64>)->Result<usi
 #[tauri::command(async)]
 pub fn ai_cluster_ignore_reset(state:State<'_,AiState>)->Result<usize,String>{state.0.cluster_ignore_reset()}
 #[tauri::command(async)]
-pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("Neplatný typ štítku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
+pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("NeplatnÃ½ typ Å¡tÃ­tku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
 
 #[derive(Serialize,Clone)]
 #[serde(rename_all="camelCase")]
@@ -335,8 +384,8 @@ pub fn get_quality_counts(db:State<'_,BackgroundDbState>,ai:State<'_,AiState>)->
 
 #[tauri::command(async)]
 pub fn import_photosort_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,writer:State<'_,CatalogWriterState>)->Result<ColorImportResult,String>{
-    let Some(path)=ai.0.photosort_corrections_path() else{return Err("Photosort learned priečinok nie je dostupný".into())};let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let done:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).unwrap_or(false);if done{return Ok(ColorImportResult{done:true,matched:0,ambiguous:0,missing:0});}
-    let input=std::fs::read_to_string(&path).map_err(|e|format!("Nepodarilo sa načítať opravy Photosortu: {e}"))?;let corrections:serde_json::Map<String,Value>=serde_json::from_str(&input).map_err(|e|e.to_string())?;let rows=conn.prepare("SELECT id,name FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(conn);
+    let Some(path)=ai.0.photosort_corrections_path() else{return Err("Photosort learned prieÄinok nie je dostupnÃ½".into())};let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let done:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).unwrap_or(false);if done{return Ok(ColorImportResult{done:true,matched:0,ambiguous:0,missing:0});}
+    let input=std::fs::read_to_string(&path).map_err(|e|format!("Nepodarilo sa naÄÃ­taÅ¥ opravy Photosortu: {e}"))?;let corrections:serde_json::Map<String,Value>=serde_json::from_str(&input).map_err(|e|e.to_string())?;let rows=conn.prepare("SELECT id,name FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(conn);
     let mut imported=Vec::new();let(mut matched,mut ambiguous,mut missing)=(0,0,0);
     for(name,record)in corrections{match crate::colors::unique_name_match(&name,&rows){Ok(Some(id))=>{matched+=1;let colors=record.get("colors").and_then(Value::as_array).map(|v|v.iter().filter_map(Value::as_str).collect::<std::collections::HashSet<_>>()).unwrap_or_default();for c in crate::colors::PALETTE{imported.push((id,c.value.to_string(),colors.contains(c.value)));}},Ok(None)=>missing+=1,Err(())=>ambiguous+=1}}
     writer.0.import_asset_colors(&imported,"Import farieb z photosortu")?;let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;conn.execute("INSERT OR REPLACE INTO ddreams_meta(key,value) VALUES('photosort_colors_imported','1')",[]).map_err(|e|e.to_string())?;drop(conn);ai.0.learn_colors_debounced();Ok(ColorImportResult{done:true,matched,ambiguous,missing})
@@ -358,11 +407,11 @@ pub async fn undo_last_change(state: State<'_, FileManagerState>,ai:State<'_,AiS
 #[tauri::command(async)]
 pub fn get_file_operation_conflicts(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String)->Result<usize,String>{state.0.preview_conflicts(&asset_ids,&target_folder_path,None)}
 #[tauri::command]
-pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Presúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"PresÃºvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
-pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Kopírujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"KopÃ­rujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
-pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Premenúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"PremenÃºvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
 pub async fn create_folder(state:State<'_,FileManagerState>,parent_path:String,name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.create_folder(&parent_path,&name)).await.map_err(|e|e.to_string())?}
 
@@ -525,10 +574,10 @@ pub fn get_assets(
         let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
         let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
         loop {base.offset=offset;let page=if filter.kind=="folder"{listing.0.page(&base)?}else{db::assets_page(&state.0,&base,&formats.0).map_err(|e|e.to_string())?};total=page.total;total_size=page.total_size;let count=page.items.len();all.extend(page.items);offset+=count as i64;if count<500||offset>=total{break}}
-        let order=if ai.0.status().available{Some(ai.0.order_by_similarity(all.iter().filter(|a|!a.is_directory).map(|a|a.id).collect())?)}else{None};let all=apply_similarity_order(all,order.as_deref());let items=all.into_iter().skip(filter.offset.max(0) as usize).take(filter.limit.clamp(1,500) as usize).collect();return Ok(db::AssetPage{items,total,total_size});
+        let order=if ai.0.status().available{Some(ai.0.order_by_similarity(all.iter().filter(|a|!a.is_directory).map(|a|a.id).collect())?)}else{None};let mut all=apply_similarity_order(all,order.as_deref());let items=all.into_iter().skip(filter.offset.max(0) as usize).take(filter.limit.clamp(1,500) as usize).collect();let mut page=db::AssetPage{items,total,total_size};classify_page(&mut page);return Ok(page);
     }
-    if filter.kind == "folder" { return listing.0.page(&filter); }
-    db::assets_page(&state.0, &filter, &formats.0).map_err(|e| e.to_string())
+    if filter.kind == "folder" { let mut page=listing.0.page(&filter)?;classify_page(&mut page);return Ok(page); }
+    let mut page=db::assets_page(&state.0,&filter,&formats.0).map_err(|e|e.to_string())?;classify_page(&mut page);Ok(page)
 }
 
 #[tauri::command(async)]
@@ -554,8 +603,8 @@ pub fn get_asset_paths(db: State<'_, DatabaseState>, listing: State<'_, ListingS
 }
 #[tauri::command(async)]
 pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_id: i64, action: String) -> Result<(), String> {
-    let path = listing.0.asset(asset_id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,asset_id).ok().flatten().and_then(|m|m.asset.path)).ok_or("Cesta súboru sa nenašla")?;
-    if !Path::new(&path).exists() { return Err("Súbor je offline".into()); }
+    let path = listing.0.asset(asset_id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,asset_id).ok().flatten().and_then(|m|m.asset.path)).ok_or("Cesta sÃºboru sa nenaÅ¡la")?;
+    if !Path::new(&path).exists() { return Err("SÃºbor je offline".into()); }
     let mut command=std::process::Command::new("explorer.exe");
     match action.as_str() {
         "open" => { command.arg(&path); }
@@ -563,7 +612,7 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
             use std::os::windows::process::CommandExt;
             let escaped=path.replace('"',"\"\"");command.raw_arg(format!("/select,\"{escaped}\""));
         }
-        _ => return Err("Neznáma akcia".into()),
+        _ => return Err("NeznÃ¡ma akcia".into()),
     }
     command.spawn().map(|_|()).map_err(|e|e.to_string())
 }
@@ -572,15 +621,15 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
 #[tauri::command(async)]
 pub fn open_in_editor(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, exe: String, multi: bool) -> Result<usize, String> {
     let exe = exe.trim();
-    if !Path::new(exe).is_file() { return Err(format!("Program sa nenašiel: {exe}")); }
+    if !Path::new(exe).is_file() { return Err(format!("Program sa nenaÅ¡iel: {exe}")); }
     let paths: Vec<String> = asset_ids.into_iter()
         .filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path)))
         .filter(|p| Path::new(p).is_file()).collect();
-    if paths.is_empty() { return Err("Žiadny z vybraných súborov nie je dostupný".into()); }
+    if paths.is_empty() { return Err("Å½iadny z vybranÃ½ch sÃºborov nie je dostupnÃ½".into()); }
     if multi {
         std::process::Command::new(exe).args(&paths).spawn().map_err(|e| e.to_string())?;
     } else {
-        if paths.len() > 20 { return Err("Tento program berie súbory po jednom – vyber najviac 20 súborov".into()); }
+        if paths.len() > 20 { return Err("Tento program berie sÃºbory po jednom â€“ vyber najviac 20 sÃºborov".into()); }
         for path in &paths { std::process::Command::new(exe).arg(path).spawn().map_err(|e| e.to_string())?; }
     }
     Ok(paths.len())
@@ -646,16 +695,21 @@ pub fn get_folder_children(
             for asset in page.items.into_iter().filter(|a|a.is_directory) {
                 let matched=asset.path.as_deref().and_then(|p|db::folder_by_path(&state.0,p).ok().flatten());
                 let id=matched.as_ref().map(|f|f.id).unwrap_or(asset.id);
-                dirs.push(db::Folder{id,parent_id:Some(parent),root_id:matched.as_ref().and_then(|f|f.root_id),name:asset.name,path:asset.path,count:matched.as_ref().map(|f|f.count).unwrap_or(0),folder_ids:matched.map(|f|f.folder_ids).unwrap_or_else(||vec![id]),virtual_node:None,offline:false});
+                dirs.push(db::Folder{id,parent_id:Some(parent),root_id:matched.as_ref().and_then(|f|f.root_id),name:asset.name,path:asset.path,count:matched.as_ref().map(|f|f.count).unwrap_or(0),folder_ids:matched.map(|f|f.folder_ids).unwrap_or_else(||vec![id]),virtual_node:None,offline:false,missing:false});
             }
-            let fallback=db::folders_page(&state.0,Some(parent),parent_ids.clone(),0,limit.clamp(1,500)).map_err(|e|e.to_string())?;
-            let mut seen=dirs.iter().filter_map(|f|f.path.as_deref()).map(|p|p.to_lowercase()).collect::<std::collections::HashSet<_>>();
-            for mut folder in fallback { if !folder.path.as_deref().is_some_and(|p|seen.contains(&p.to_lowercase())) { folder.offline=true; seen.insert(folder.path.as_deref().unwrap_or("").to_lowercase()); dirs.push(folder); } }
             dirs.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            return Ok(dirs.into_iter().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect());
+            return Ok(tree_children_from_listing(dirs,Vec::new()).into_iter().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect());
         }
     }
-    db::folders_page(&state.0, parent_id, parent_ids, offset, limit).map_err(|e| e.to_string())
+    let mut rows=db::folders_page(&state.0,parent_id,parent_ids,0,500).map_err(|e|e.to_string())?;
+    let mut volumes=std::collections::HashMap::new();let mut live=Vec::new();
+    for mut folder in rows.drain(..){
+        if folder.virtual_node.as_deref()==Some("devices"){
+            let mut ids=Vec::new();for id in folder.folder_ids{let path=db::folder_ancestors(&state.0,id).ok().and_then(|chain|chain.last().and_then(|f|f.path.clone()));if path.as_deref().is_some_and(|p|Path::new(p).is_dir()){ids.push(id)}}
+            if !ids.is_empty(){folder.folder_ids=ids;live.push(folder)}
+        }else if let Some(path)=folder.path.as_deref(){let (offline,missing)=classify_source(path,&mut volumes);folder.offline=offline;folder.missing=missing;if !offline&&!missing{live.push(folder)}}
+    }
+    Ok(live.into_iter().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect())
 }
 #[tauri::command(async)]
 pub fn find_folder_path(
@@ -739,11 +793,11 @@ fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
     add("Caption", a.caption.clone()); add("Notes", a.notes.clone()); add("Author", a.author.clone());
     add("Rating", Some(a.rating.filter(|v| *v > 0).map(|v| v.to_string()).unwrap_or_else(|| "0".into())));
     add("Label", Some(a.label.clone().unwrap_or_else(|| "-".into())));
-    add("Tagged", Some(if a.tagged.unwrap_or(0) != 0 { "Áno" } else { "Nie" }.into()));
+    add("Tagged", Some(if a.tagged.unwrap_or(0) != 0 { "Ãno" } else { "Nie" }.into()));
     add("Categories", (!data.categories.is_empty()).then(||data.categories.join(", ")));
     add("Keywords", (!data.keywords.is_empty()).then(||data.keywords.join(", ")));
     add("Date taken", a.exif_date.clone());
-    add("Dimensions", match (a.width,a.height) {(Some(w),Some(h))=>Some(format!("{w} × {h}")),_=>None});
+    add("Dimensions", match (a.width,a.height) {(Some(w),Some(h))=>Some(format!("{w} Ã— {h}")),_=>None});
     add("Bits per pixel", a.bpp.map(|v| v.to_string()));
     add("File modified", a.file_modified.clone());
     tags
@@ -758,7 +812,7 @@ fn apply_similarity_order(mut assets:Vec<db::Asset>,order:Option<&[i64]>)->Vec<d
 #[cfg(test)]
 mod similarity_order_tests{
     use super::*;
-    fn asset(id:i64,name:&str)->db::Asset{db::Asset{id,folder_id:None,name:name.into(),ext:"jpg".into(),size:None,width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,has_categories:false,display_categories:None,display_keywords:None}}
+    fn asset(id:i64,name:&str)->db::Asset{db::Asset{id,folder_id:None,name:name.into(),ext:"jpg".into(),size:None,width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None}}
     #[test]fn similarity_order_pages_from_cached_ids(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ordered=apply_similarity_order(all,Some(&[3,1,2]));let ids=ordered.into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(&ids[0..2],&[3,1]);assert_eq!(&ids[2..3],&[2]);}
     #[test]fn unavailable_ai_falls_back_to_name_order(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ids=apply_similarity_order(all,None).into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(ids,vec![2,3,1]);}
 }
@@ -894,4 +948,42 @@ pub fn set_folder_rule(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,
     if count>0{ai.0.forget(removed);}
     let _=listing.0.invalidate_path(&path);
     Ok(count)
+}
+
+#[cfg(test)]
+mod source_tests{
+    use super::*;
+    #[test]
+    fn missing_and_offline_sources_are_mutually_exclusive_and_volume_is_cached(){
+        let mut cache=std::collections::HashMap::new();let mut probes=0;
+        let offline=classify_source_with("X:\\photos",&mut cache,|p|{probes+=1;p!="X:\\"});
+        assert_eq!(offline,(true,false));assert_eq!(probes,1);let second=classify_source_with("X:\\other",&mut cache,|p|{probes+=1;p!="X:\\"});assert_eq!(second,(true,false));assert_eq!(probes,1,"volume probe is cached and unreachable paths are not probed");
+        let mut cache=std::collections::HashMap::new();let missing=classify_source_with("F:\\missing",&mut cache,|p|p=="F:\\");
+        assert_eq!(missing,(false,true));
+        assert_eq!(require_missing_source(false,false).unwrap_err(),"Priečinok existuje na disku – z katalógu ho vyraď cez vylúčenie");
+    }
+
+    #[test]
+    fn settings_sources_are_topmost_and_include_descendant_asset_counts(){
+        let nodes=vec![
+            CatalogFolderNode{id:1,parent:None,path:"X:\\archive".into(),count:2},
+            CatalogFolderNode{id:2,parent:Some(1),path:"X:\\archive\\child".into(),count:3},
+            CatalogFolderNode{id:3,parent:None,path:"F:\\missing".into(),count:4},
+            CatalogFolderNode{id:4,parent:Some(3),path:"F:\\missing\\child".into(),count:5},
+            CatalogFolderNode{id:5,parent:None,path:"F:\\live".into(),count:1},
+        ];
+        let sources=collect_catalog_missing_sources(nodes,|p|p=="F:\\"||p=="F:\\live");
+        assert_eq!(sources.len(),2);
+        assert_eq!((sources[0].path.as_str(),sources[0].assets,sources[0].offline,sources[0].missing),("X:\\archive",5,true,false));
+        assert_eq!((sources[1].path.as_str(),sources[1].assets,sources[1].offline,sources[1].missing),("F:\\missing",9,false,true));
+    }
+
+    #[test]
+    fn tree_child_rows_ignore_catalogue_only_folders(){
+        let live=db::Folder{id:1,parent_id:Some(10),root_id:Some(10),name:"exists".into(),path:Some("F:\\root\\exists".into()),count:4,folder_ids:vec![1],virtual_node:None,offline:false,missing:false};
+        let catalogue_only=db::Folder{id:2,parent_id:Some(10),root_id:Some(10),name:"removed".into(),path:Some("F:\\root\\removed".into()),count:2,folder_ids:vec![2],virtual_node:None,offline:false,missing:false};
+        let rows=tree_children_from_listing(vec![live],vec![catalogue_only]);
+        assert_eq!(rows.len(),1);assert_eq!(rows[0].name,"exists");
+    }
+
 }

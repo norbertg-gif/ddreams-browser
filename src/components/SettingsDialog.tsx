@@ -14,12 +14,14 @@ type Props = {
   onToggleAi: () => void;
   uiScale: number;
   onUiScale: (value: number) => void;
+  onRemoveSource:(path:string)=>void|Promise<void>;
 };
 
+type MissingSource={path:string;assets:number;offline:boolean;missing:boolean};
 type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
 
 /** Application settings. Sections grow as features arrive. */
-export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale }: Props) {
+export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
@@ -27,6 +29,9 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupDone, setBackupDone] = useState(false);
   const [backupError, setBackupError] = useState("");
+  const [missingSources,setMissingSources]=useState<MissingSource[]>([]);
+  const [showEmptySources,setShowEmptySources]=useState(false);
+  const [sourcesLoading,setSourcesLoading]=useState(false);
   const box = useRef<HTMLDivElement>(null);
   const editors = useEditors();
   const [editorError, setEditorError] = useState("");
@@ -44,11 +49,14 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
     } catch (e) { setEditorError(String(e)); } finally { setPicking(false); }
   };
   useEffect(() => {
+    const reloadSources=()=>{setSourcesLoading(true);void invoke<MissingSource[]>("get_catalog_missing_sources").then(setMissingSources).catch(()=>setMissingSources([])).finally(()=>setSourcesLoading(false))};window.addEventListener("ddreams-catalog-changed",reloadSources);return()=>window.removeEventListener("ddreams-catalog-changed",reloadSources);
+  }, []);
+  useEffect(() => {
     const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
     window.addEventListener("keydown", key, true);
     return () => window.removeEventListener("keydown", key, true);
   }, [onClose]);
-  useEffect(() => { void invoke<BackupStatus>("get_backup_status").then(setBackup).catch(e => setBackupError(String(e))); }, []);
+  useEffect(() => { void invoke<BackupStatus>("get_backup_status").then(setBackup).catch(e => setBackupError(String(e)));setSourcesLoading(true);void invoke<MissingSource[]>("get_catalog_missing_sources").then(setMissingSources).catch(()=>setMissingSources([])).finally(()=>setSourcesLoading(false)); }, []);
   const backupNow = async () => {
     setBackupBusy(true); setBackupDone(false); setBackupError("");
     try { await invoke<string>("backup_catalog_now"); setBackup(await invoke<BackupStatus>("get_backup_status")); setBackupDone(true); window.setTimeout(() => setBackupDone(false), 1800); }
@@ -92,6 +100,7 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
           {backupError && <small className="settings-error">{backupError}</small>}
         </div>
       </section>
+      <section className="settings-section"><div className="settings-section-heading"><h3>Offline a chýbajúce zdroje</h3><button disabled={sourcesLoading} onClick={()=>window.dispatchEvent(new Event("ddreams-catalog-changed"))}>{sourcesLoading?"Obnovujem…":"Obnoviť zoznam"}</button></div>{(()=>{const merged=new Map<string,MissingSource>();for(const source of missingSources){const key=source.path.toLowerCase();const old=merged.get(key);if(old)old.assets+=source.assets;else merged.set(key,{...source});}const all=[...merged.values()].sort((x,y)=>y.assets-x.assets||x.path.localeCompare(y.path,"sk"));const withAssets=all.filter(x=>x.assets>0);const empty=all.length-withAssets.length;const shown=showEmptySources?all:withAssets;const kind=(x:MissingSource)=>x.offline?"Disk nie je pripojený":/^[A-Za-z]:\\|^\\\\/.test(x.path)?"Priečinok neexistuje":"Zariadenie nie je pripojené";return <>{withAssets.length>0&&<small className="settings-empty">Spolu {withAssets.reduce((n,x)=>n+x.assets,0).toLocaleString("sk-SK")} záznamov o súboroch v {withAssets.length} zdrojoch, ktoré teraz nie sú dostupné.</small>}{shown.map(source=><div className="settings-missing-source" key={source.path}><span><b>{kind(source)}</b><span title={source.path}>{source.path}</span><small>{source.assets.toLocaleString("sk-SK")} záznamov o súboroch</small></span><button onClick={()=>void onRemoveSource(source.path)}>Odstrániť z katalógu…</button></div>)}{!all.length&&<small className="settings-empty">Katalóg neobsahuje žiadne offline ani chýbajúce zdroje.</small>}{empty>0&&<label className="settings-empty"><input type="checkbox" checked={showEmptySources} onChange={e=>setShowEmptySources(e.target.checked)}/> Zobraziť aj {empty} prázdnych záznamov priečinkov (bez fotiek)</label>}</>})()}</section>
       <section className="settings-section">
         <h3>Zobrazenie</h3>
         <label className="settings-check"><input type="checkbox" checked={showOtherFiles} onChange={e => onShowOtherFiles(e.target.checked)} /> Zobrazovať aj iné súbory než fotky a videá</label>

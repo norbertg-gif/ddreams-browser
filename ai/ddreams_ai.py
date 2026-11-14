@@ -972,6 +972,8 @@ class AIService:
             x1, y1, x2, y2 = map(float, box)
             norm_box = (x1 / rgb.width, y1 / rgb.height, (x2 - x1) / rgb.width, (y2 - y1) / rgb.height)
             for row in existing:
+                if any(value is None for value in row[1:5]):
+                    continue
                 iou = _box_iou(norm_box, (float(row[1]), float(row[2]), float(row[3]), float(row[4])))
                 if iou >= 0.3 and (min(x2 - x1, y2 - y1) >= FACE_MIN_SIDE or row[5] == "acdsee"):
                     candidates.append((iou, i, row))
@@ -1226,6 +1228,46 @@ class AIService:
         if recognize: self._recognize_face_ids(recognize)
         return {"changed": changed}
 
+    def _faces_asset_ids_arg(self, request: dict[str, Any]) -> list[int]:
+        ids=request.get("asset_ids")
+        if not isinstance(ids,list) or len(ids)>2000 or any(isinstance(a,bool) or not isinstance(a,int) or a<=0 for a in ids): raise RequestError("asset_ids musí obsahovať najviac 2000 kladných ID")
+        return list(dict.fromkeys(ids))
+
+    def _faces_asset_assign(self, request: dict[str, Any]) -> dict[str, Any]:
+        ids=self._faces_asset_ids_arg(request);person=request.get("person_id")
+        if isinstance(person,bool) or not isinstance(person,int) or person<=0: raise RequestError("person_id musí byť kladné ID")
+        changed=0
+        with self.faces_lock:
+            if self.faces_db.execute("SELECT 1 FROM persons WHERE id=?",(person,)).fetchone() is None: raise RequestError("Osoba neexistuje")
+            for aid in ids:
+                rows=self.faces_db.execute("SELECT id,state FROM faces WHERE asset_id=? AND state!='ignored' ORDER BY id",(aid,)).fetchall()
+                if self.faces_db.execute("SELECT 1 FROM faces WHERE asset_id=? AND person_id=? AND state!='ignored' LIMIT 1",(aid,person)).fetchone():
+                    self.faces_db.execute("UPDATE faces SET state='confirmed',score=NULL WHERE asset_id=? AND person_id=? AND state!='ignored'",(aid,person))
+                else:
+                    eligible=[r for r in rows if r[1] in ('unknown','auto','suggested')]
+                    if len(eligible)==1:self.faces_db.execute("UPDATE faces SET person_id=?,state='confirmed',score=NULL WHERE id=?",(person,int(eligible[0][0])))
+                    else:self.faces_db.execute("INSERT INTO faces(asset_id,x,y,w,h,det_score,source,ext_id,person_id,state,score,vector) VALUES(?,NULL,NULL,NULL,NULL,NULL,'ai',NULL,?,'confirmed',NULL,NULL)",(aid,person))
+                changed+=1
+            self.faces_db.commit();self._refresh_face_references_locked()
+        return {"changed":changed}
+
+    def _faces_asset_remove(self, request: dict[str, Any]) -> dict[str, Any]:
+        ids=self._faces_asset_ids_arg(request);person=request.get("person_id")
+        if isinstance(person,bool) or not isinstance(person,int) or person<=0: raise RequestError("person_id musí byť kladné ID")
+        changed=0
+        with self.faces_lock:
+            for aid in ids:
+                rows=self.faces_db.execute("SELECT id,x,y,w,h FROM faces WHERE asset_id=? AND person_id=?",(aid,person)).fetchall()
+                if not rows:continue
+                for fid,x,y,w,h in rows:
+                    if any(v is None for v in (x,y,w,h)):
+                        self.faces_db.execute("DELETE FROM face_thumbs WHERE face_id=?",(fid,));self.faces_db.execute("DELETE FROM face_rejected WHERE face_id=?",(fid,));self.faces_db.execute("DELETE FROM faces WHERE id=?",(fid,))
+                    else:
+                        self.faces_db.execute("INSERT OR IGNORE INTO face_rejected(face_id,person_id) VALUES(?,?)",(fid,person));self.faces_db.execute("UPDATE faces SET person_id=NULL,state='unknown',score=NULL WHERE id=?",(fid,))
+                changed+=1
+            self.faces_db.commit();self._refresh_face_references_locked()
+        return {"changed":changed}
+
     def _faces_person_create(self, request: dict[str, Any]) -> dict[str, Any]:
         name = request.get("name")
         if not isinstance(name, str) or not 1 <= len(name.strip()) <= 100: raise RequestError("Meno musí mať 1 až 100 znakov")
@@ -1268,6 +1310,8 @@ class AIService:
         if cmd == "faces_clusters": return self._faces_clusters(request)
         if cmd == "faces_for_assets": return self._faces_for_assets(request)
         if cmd == "faces_set": return self._faces_set(request)
+        if cmd == "faces_asset_assign": return self._faces_asset_assign(request)
+        if cmd == "faces_asset_remove": return self._faces_asset_remove(request)
         if cmd == "faces_person_create": return self._faces_person_create(request)
         if cmd == "faces_person_rename": return self._faces_person_rename(request)
         if cmd == "faces_recognize_all": return self._faces_recognize_all()
@@ -2117,7 +2161,7 @@ class AIService:
             return self._index_command(request)
         if cmd == "forget":
             return self._forget_command(request)
-        if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+        if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
             return self._faces_command(request)
         if cmd == "learn_colors":
             return self._learn_colors(request)
@@ -2205,7 +2249,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "map_build", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "map_build", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

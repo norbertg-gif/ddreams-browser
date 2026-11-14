@@ -87,6 +87,8 @@ pub struct Asset {
     #[serde(default)]
     pub offline: bool,
     #[serde(default)]
+    pub missing: bool,
+    #[serde(default)]
     pub has_categories: bool,
     #[serde(default)]
     pub display_categories: Option<String>,
@@ -168,6 +170,8 @@ pub struct Folder {
     pub virtual_node: Option<String>,
     #[serde(default)]
     pub offline: bool,
+    #[serde(default)]
+    pub missing: bool,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -245,6 +249,7 @@ fn map_asset(row: &rusqlite::Row<'_>, include_categories: bool, include_keywords
         path: row.get(19)?,
         is_directory: false,
         offline: false,
+        missing: false,
         has_categories: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
         display_categories: if include_categories { row.get(21)? } else { None },
         display_keywords: if include_keywords { row.get(if include_categories { 22 } else { 21 })? } else { None },
@@ -744,9 +749,9 @@ pub fn folders_page(
         let mut grouped: std::collections::BTreeMap<String,Vec<(i64,i64,Option<String>,i64)>>=std::collections::BTreeMap::new();
         for (id,root,name,path,count) in rows { if count>0 { let label=if name=="\\" || name=="/" { path.as_deref().unwrap_or(&name).trim_end_matches(['\\','/']).to_string() } else { name }; let key=label.to_lowercase(); grouped.entry(key).or_default().push((id,root,Some(label),count)); } }
         let mut result=Vec::new(); let mut devices=Vec::new();
-        for (key,items) in grouped { let name=items.first().and_then(|i|i.2.clone()).unwrap_or(key); let drive=name.len()==2 && name.ends_with(':'); let ids=items.iter().map(|i|i.0).collect::<Vec<_>>(); let roots=items.iter().map(|i|i.1).collect::<Vec<_>>(); let count=items.iter().map(|i|i.3).sum(); let path=conn.query_row("SELECT path FROM folders WHERE id=?",[ids[0]],|r|r.get::<_,Option<String>>(0)).ok().flatten(); let node=Folder{id:ids[0],parent_id:None,root_id:roots.first().copied(),name,path,count,folder_ids:ids,virtual_node:None,offline:false}; if drive {result.push(node)} else {devices.push(node)} }
+        for (key,items) in grouped { let name=items.first().and_then(|i|i.2.clone()).unwrap_or(key); let drive=name.len()==2 && name.ends_with(':'); let ids=items.iter().map(|i|i.0).collect::<Vec<_>>(); let roots=items.iter().map(|i|i.1).collect::<Vec<_>>(); let count=items.iter().map(|i|i.3).sum(); let path=conn.query_row("SELECT path FROM folders WHERE id=?",[ids[0]],|r|r.get::<_,Option<String>>(0)).ok().flatten(); let node=Folder{id:ids[0],parent_id:None,root_id:roots.first().copied(),name,path,count,folder_ids:ids,virtual_node:None,offline:false,missing:false}; if drive {result.push(node)} else {devices.push(node)} }
         result.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-        if !devices.is_empty() { result.push(Folder{id:-2,parent_id:None,root_id:None,name:"Zariadenia".into(),path:None,count:devices.iter().map(|d|d.count).sum(),folder_ids:devices.iter().flat_map(|d|d.folder_ids.clone()).collect(),virtual_node:Some("devices".into()),offline:false}); }
+        if !devices.is_empty() { result.push(Folder{id:-2,parent_id:None,root_id:None,name:"Zariadenia".into(),path:None,count:devices.iter().map(|d|d.count).sum(),folder_ids:devices.iter().flat_map(|d|d.folder_ids.clone()).collect(),virtual_node:Some("devices".into()),offline:false,missing:false}); }
         return Ok(result.into_iter().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect());
     }
     let parents=parent_ids.filter(|v|!v.is_empty()).unwrap_or_else(||vec![parent_id.unwrap_or(0)]);
@@ -754,7 +759,7 @@ pub fn folders_page(
     let sql=format!("WITH RECURSIVE candidate AS (SELECT f.id,f.parent_id,f.root_id,f.name,f.path FROM folders f WHERE f.parent_id IN ({placeholders})), d(folder_id,id) AS (SELECT c.id,c.id FROM candidate c UNION ALL SELECT d.folder_id,f.id FROM folders f JOIN d ON f.parent_id=d.id), counts AS (SELECT d.folder_id,count(a.id) n FROM d JOIN assets a ON a.folder_id=d.id AND a.is_listed=1 GROUP BY d.folder_id) SELECT c.id,c.parent_id,c.root_id,c.name,c.path,coalesce(n,0) FROM candidate c LEFT JOIN counts ON counts.folder_id=c.id WHERE coalesce(n,0)>0 ORDER BY c.name COLLATE NOCASE,c.id LIMIT ? OFFSET ?");
     let mut args:Vec<rusqlite::types::Value>=parents.into_iter().map(Into::into).collect(); args.push(limit.clamp(1,500).into()); args.push(offset.max(0).into());
     let mut stmt=conn.prepare(&sql)?;
-    let rows=stmt.query_map(rusqlite::params_from_iter(args),|r|{let id=r.get(0)?; Ok(Folder{id, parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![id],virtual_node:None,offline:false})})?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=stmt.query_map(rusqlite::params_from_iter(args),|r|{let id=r.get(0)?; Ok(Folder{id, parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![id],virtual_node:None,offline:false,missing:false})})?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut merged:std::collections::BTreeMap<String,Folder>=std::collections::BTreeMap::new();
     for folder in rows { let key=folder.name.to_lowercase(); if let Some(existing)=merged.get_mut(&key) {existing.count+=folder.count;existing.folder_ids.push(folder.id);} else {merged.insert(key,folder);} }
     Ok(merged.into_values().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect())
@@ -762,14 +767,14 @@ pub fn folders_page(
 
 pub fn folder_by_path(db: &Db, path: &str) -> rusqlite::Result<Option<Folder>> {
     let conn = db.lock().unwrap();
-    conn.query_row("SELECT id,parent_id,root_id,name,path,(SELECT count(*) FROM assets WHERE folder_id=folders.id AND is_listed=1) FROM folders WHERE lower(rtrim(replace(path,'/','\\'),'\\'))=lower(rtrim(replace(?,'/','\\'),'\\')) LIMIT 1", [path], |r| Ok(Folder { id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![r.get(0)?],virtual_node:None,offline:false })).optional()
+    conn.query_row("SELECT id,parent_id,root_id,name,path,(SELECT count(*) FROM assets WHERE folder_id=folders.id AND is_listed=1) FROM folders WHERE lower(rtrim(replace(path,'/','\\'),'\\'))=lower(rtrim(replace(?,'/','\\'),'\\')) LIMIT 1", [path], |r| Ok(Folder { id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![r.get(0)?],virtual_node:None,offline:false,missing:false })).optional()
 }
 
 pub fn folder_ancestors(db: &Db, id: i64) -> rusqlite::Result<Vec<Folder>> {
     let conn = db.lock().unwrap();
     let mut stmt=conn.prepare("WITH RECURSIVE chain(id,parent_id,root_id,name,path,depth) AS (SELECT id,parent_id,root_id,name,path,0 FROM folders WHERE id=? UNION ALL SELECT f.id,f.parent_id,f.root_id,f.name,f.path,c.depth+1 FROM folders f JOIN chain c ON f.id=c.parent_id) SELECT c.id,c.parent_id,c.root_id,c.name,c.path,(SELECT count(*) FROM assets a WHERE a.folder_id=c.id AND a.is_listed=1) FROM chain c ORDER BY c.depth DESC")?;
     let mut rows=stmt.query([id])?; let mut result=Vec::new();
-    while let Some(r)=rows.next()? { let folder_id=r.get(0)?; result.push(Folder{id:folder_id,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![folder_id],virtual_node:None,offline:false}); }
+    while let Some(r)=rows.next()? { let folder_id=r.get(0)?; result.push(Folder{id:folder_id,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![folder_id],virtual_node:None,offline:false,missing:false}); }
     Ok(result)
 }
 
@@ -1040,7 +1045,7 @@ pub fn keyword_options(db:&Db,query:&str)->rusqlite::Result<Vec<KeywordOption>>{
 mod feature_tests {
     use super::*;
     use std::cmp::Ordering;
-    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,has_categories:false,display_categories:None,display_keywords:None} }
+    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None} }
     #[test]
     fn filter_logic_supports_modes_and_groups() {
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
