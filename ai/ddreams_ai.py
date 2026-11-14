@@ -1082,7 +1082,7 @@ class AIService:
         return len(changes)
 
     def _faces_status(self) -> dict[str, Any]:
-        available = self._ensure_face_models() if self.faces_db is not None and self._model_ready.is_set() else self._faces_available
+        available = self._faces_data_ready()
         if not available or self.faces_db is None:
             return {"available": False, "scanned": 0, "pending": 0, "faces": 0, "named": 0, "unknown": 0, "persons": 0}
         with self.faces_lock:
@@ -1299,9 +1299,25 @@ class AIService:
         for start in range(0, len(ids), 256): changed += self._recognize_face_ids(ids[start:start + 256])
         return {"changed": changed}
 
+    def _face_files_present(self) -> bool:
+        base = Path(self.model_dir).parent
+        return (base / "faces" / "det_10g.onnx").is_file() and (base / "faces" / "w600k_r50.onnx").is_file() and (base / "pylibs").is_dir()
+
+    def _faces_data_ready(self) -> bool:
+        """Face data commands only read/write faces.sqlite and stored vectors; they must not
+        wait for the SigLIP/ONNX models (loading them takes tens of seconds). Only scanning needs models."""
+        if self.faces_db is None or self._faces_error or not (self._faces_available or self._face_files_present()):
+            return False
+        if not getattr(self, "_face_refs_ready", False):
+            with self.faces_lock:
+                if not getattr(self, "_face_refs_ready", False):
+                    self._refresh_face_references_locked()
+                    self._face_refs_ready = True
+        return True
+
     def _faces_command(self, request: dict[str, Any]) -> dict[str, Any]:
         cmd = request.get("cmd")
-        if not self._ensure_face_models():
+        if not self._faces_data_ready():
             if cmd == "faces_status": return {"available": False, "scanned": 0, "pending": 0, "faces": 0, "named": 0, "unknown": 0, "persons": 0}
             return {"available": False}
         if cmd == "faces_status": return self._faces_status()
