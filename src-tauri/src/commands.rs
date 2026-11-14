@@ -412,7 +412,22 @@ pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,as
 pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"KopÃ­rujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
 pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"PremenÃºvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
-#[tauri::command]
+#[derive(serde::Serialize)]
+#[serde(rename_all="camelCase")]
+pub struct FolderRenameResult{pub change_id:Option<i64>,pub summary:String,pub new_path:String}
+#[tauri::command(async)]
+pub fn reveal_in_explorer(state:State<'_,FileManagerState>,path:String)->Result<(),String>{state.0.reveal_in_explorer(&path)}
+#[tauri::command(async)]
+pub async fn rename_folder(state:State<'_,FileManagerState>,path:String,new_name:String)->Result<FolderRenameResult,String>{let manager=state.0.clone();let original_path=path.clone();let result=tauri::async_runtime::spawn_blocking(move||manager.rename_folder(&path,&new_name)).await.map_err(|e|e.to_string())??;let new_path=result.affected_folder_paths.get(1).cloned().unwrap_or(original_path);Ok(FolderRenameResult{change_id:result.change_id,summary:result.summary,new_path})}
+#[tauri::command(async)]
+pub fn delete_folder_info(state:State<'_,FileManagerState>,path:String)->Result<crate::file_ops::DeleteFolderInfo,String>{state.0.delete_folder_info(&path)}
+#[tauri::command(async)]
+pub async fn delete_folder(state:State<'_,FileManagerState>,path:String)->Result<crate::file_ops::FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.delete_folder(&path)).await.map_err(|e|e.to_string())?}
+#[tauri::command(async)]
+pub async fn move_folder(app:tauri::AppHandle,state:State<'_,FileManagerState>,path:String,target:String)->Result<crate::file_ops::FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_folder_with_progress(&path,&target,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Presúvam priečinok".into(),done,total});})).await.map_err(|e|e.to_string())?}
+#[tauri::command(async)]
+pub async fn copy_folder(app:tauri::AppHandle,state:State<'_,FileManagerState>,path:String,target:String)->Result<crate::file_ops::FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_folder_with_progress(&path,&target,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Kopírujem priečinok".into(),done,total});})).await.map_err(|e|e.to_string())?}
+#[tauri::command(async)]
 pub async fn create_folder(state:State<'_,FileManagerState>,parent_path:String,name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.create_folder(&parent_path,&name)).await.map_err(|e|e.to_string())?}
 
 #[derive(Serialize,Clone)]
