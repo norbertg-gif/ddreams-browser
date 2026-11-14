@@ -209,7 +209,7 @@ export default function App() {
     if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");setToastUndo(false);window.setTimeout(()=>setToast(""),2200);return;}
     try{const change=await invoke<RecentChange|null>("undo_last_change");if(!change){setToast("Nie sú žiadne zmeny na vrátenie");setToastUndo(false);window.setTimeout(()=>setToast(""),1800);return;}
       const inserted=new Set(insertedByChange.current.get(change.id)??[]);if(inserted.size){setSelectedIds(previous=>new Set([...previous].filter(id=>!inserted.has(id))));if(primaryId!=null&&inserted.has(primaryId)){setPrimaryId(null);setPrimaryAsset(null)}}
-      insertedByChange.current.delete(change.id);setToast(`Vrátené: ${change.summary}`);setToastUndo(false);refreshAfterWrite(true,view.folderPath?[view.folderPath]:[]);window.setTimeout(()=>setToast(""),2600);
+      insertedByChange.current.delete(change.id);setToast(`Vrátené: ${change.summary}`);setToastUndo(false);refreshAfterWrite(true,[]);window.setTimeout(()=>setToast(""),2600);
     }catch(error){setToast(String(error));setToastUndo(false);window.setTimeout(()=>setToast(""),3000);}
   },[appInfo,primaryId,refreshAfterWrite,view]);
   const selectTaggedInView=useCallback(async()=>{
