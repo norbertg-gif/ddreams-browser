@@ -81,8 +81,10 @@ export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFol
       let level = roots;
       for (const ancestor of ancestors) {
         if (cancelled) return;
-        const node = level.find(item => (item.folderIds ?? [item.id]).includes(ancestor.id));
-        if (!node) { setError(`Tree path is missing ancestor: ${ancestor.name}`); return; }
+        const norm = (v?: string | null) => (v ?? "").replace(/[\\/]+$/, "").toLowerCase();
+        const node = level.find(item => (item.folderIds ?? [item.id]).includes(ancestor.id)) ?? (ancestor.path ? level.find(item => norm(item.path) === norm(ancestor.path)) : undefined);
+        // The tree shows only folders that exist on disk; catalogue-only ancestors (e.g. a synthetic "\\" root) are skipped.
+        if (!node) { if (level === roots) continue; return; }
         setExpanded(prev => new Set(prev).add(node.id));
         level = await loadChildren(node);
         if (cancelled) return;
