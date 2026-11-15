@@ -232,6 +232,8 @@ fn shell_image(path: &Path, requested: u32) -> Result<DynamicImage, String> {
 pub struct ThumbService { pub db: Db, pub listing: Arc<ListingService>, pub formats: Arc<FormatTable>, chain: PreviewChain, pub cache: PathBuf, pub epoch: AtomicU64, pub workers: Arc<Semaphore>, writes: [AtomicUsize; 2], evicting: [Arc<AtomicBool>; 2] }
 #[derive(Clone, Debug)]
 pub struct RenderedPreview { pub bytes: Vec<u8>, pub source: String }
+pub enum CacheLookup { Hit(RenderedPreview), NeedsRender(RenderJob) }
+pub struct RenderJob { path: PathBuf, ext: String, target: u32, store: usize, directory: PathBuf, cache_file: PathBuf, miss_file: PathBuf, source_file: PathBuf }
 impl ThumbService {
     pub fn new(db: Db, listing: Arc<ListingService>, exif: Arc<ExifTool>, formats: Arc<FormatTable>, cache: PathBuf, raw_plugin: Option<RawPluginConfig>) -> Arc<Self> {
         let chain=PreviewChain::new(exif.clone(), raw_plugin);
@@ -250,7 +252,7 @@ impl ThumbService {
         if epoch < self.epoch.load(Ordering::Relaxed){return ThumbnailState::Stale}
         match self.asset_path(id){Err(_)=>ThumbnailState::Unavailable,Ok((p,_)) if p.is_empty()=>ThumbnailState::Unavailable,Ok((p,_))=>match Path::new(&p).try_exists(){Ok(true)=>ThumbnailState::Ready,Ok(false)=>ThumbnailState::Offline,Err(_)=>ThumbnailState::Unavailable}}
     }
-    pub fn render(&self,id:i64,size:u32,epoch:u64)->Result<RenderedPreview,ThumbnailError>{
+    pub fn lookup(&self,id:i64,size:u32,epoch:u64)->Result<CacheLookup,ThumbnailError>{
         self.set_epoch(epoch); if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}
         let (path,ext)=self.asset_path(id)?; if path.is_empty(){return Err(ThumbnailError::Unavailable)}
         let file=Path::new(&path);
@@ -259,9 +261,16 @@ impl ThumbService {
         let modified=meta.modified().ok().and_then(|v|v.duration_since(std::time::UNIX_EPOCH).ok()).map(|v|v.as_nanos()).unwrap_or(0);
         let key=cache_key(&path,target,modified,meta.len());let store=if size==0 {1}else{0};let directory=self.cache.join(if store==1{"viewer"}else{"thumbs"});
         let cache_file=directory.join(format!("{key}.jpg"));let miss_file=directory.join(format!("{key}.miss"));let source_file=directory.join(format!("{key}.source"));
-        if let Ok(bytes)=std::fs::read(&cache_file){if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}touch_if_stale(&cache_file);let source=std::fs::read_to_string(source_file).unwrap_or_else(|_|"Cache".into());return Ok(RenderedPreview{bytes,source})}
+        if let Ok(bytes)=std::fs::read(&cache_file){if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}touch_if_stale(&cache_file);let source=std::fs::read_to_string(source_file).unwrap_or_else(|_|"Cache".into());return Ok(CacheLookup::Hit(RenderedPreview{bytes,source}))}
         if miss_file.is_file(){return Err(ThumbnailError::Unsupported)}
-        let request=PreviewRequest{path:file.to_path_buf(),size:target};
+        Ok(CacheLookup::NeedsRender(RenderJob{path:file.to_path_buf(),ext,target,store,directory,cache_file,miss_file,source_file}))
+    }
+    pub fn render(&self,id:i64,size:u32,epoch:u64)->Result<RenderedPreview,ThumbnailError>{
+        match self.lookup(id,size,epoch)? { CacheLookup::Hit(data)=>Ok(data), CacheLookup::NeedsRender(job)=>self.generate(job,epoch) }
+    }
+    fn generate(&self,job:RenderJob,epoch:u64)->Result<RenderedPreview,ThumbnailError>{
+        let RenderJob{path,ext,target,store,directory,cache_file,miss_file,source_file}=job;
+        let request=PreviewRequest{path,size:target};
         let preview=match self.chain.preview(&request,self.formats.group(&ext)){Ok(v)=>v,Err(ThumbnailError::Unsupported)=>{std::fs::create_dir_all(&directory).map_err(|_|ThumbnailError::Unavailable)?;let _=std::fs::write(&miss_file,b"");return Err(ThumbnailError::Unsupported)},Err(e)=>return Err(e)};
         let image=if preview.image.width()<=target&&preview.image.height()<=target{preview.image}else{preview.image.thumbnail(target,target)};
         let bytes=encode_jpeg(image).map_err(|_|ThumbnailError::Decode)?;
@@ -338,6 +347,22 @@ mod tests {
     }
     #[test] fn chain_preserves_order_and_falls_through(){let first=Arc::new(Fake::new("first","image",false));let second=Arc::new(Fake::new("second","image",true));let chain=PreviewChain::with_sources(vec![first.clone(),second.clone()]);let p=chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("image")).unwrap();assert_eq!(p.source,"second");assert_eq!(first.calls.load(Ordering::Relaxed),1);assert_eq!(second.calls.load(Ordering::Relaxed),1);}
     #[test] fn chain_skips_sources_for_other_groups(){let native=Arc::new(Fake::new("native","image",true));let shell=Arc::new(Fake::new("shell","other",true));let chain=PreviewChain::with_sources(vec![native.clone(),shell.clone()]);assert_eq!(chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("other")).unwrap().source,"shell");assert_eq!(native.calls.load(Ordering::Relaxed),0);}
+    #[test] fn lookup_returns_cached_entry_without_preview() {
+        let dir=temp_dir("lookup"); std::fs::create_dir_all(dir.join("thumbs")).unwrap();
+        let file=dir.join("photo.jpg"); std::fs::write(&file,b"original").unwrap();
+        let path=file.to_string_lossy().into_owned(); let meta=std::fs::metadata(&file).unwrap();
+        let modified=meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let key=cache_key(&path,cache_bucket(180),modified,meta.len());
+        std::fs::write(dir.join("thumbs").join(format!("{key}.jpg")),b"cached").unwrap();
+        let conn=rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT,ext TEXT)",[]).unwrap();
+        conn.execute("INSERT INTO assets VALUES(1,?1,'jpg')",[&path]).unwrap();
+        let db=Arc::new(std::sync::Mutex::new(conn)); let formats=FormatTable::load_selected(None);
+        let listing=ListingService::new(db.clone(),formats.clone()); let fake=Arc::new(Fake::new("fake","image",true));
+        let service=ThumbService{db,listing,formats,chain:PreviewChain::with_sources(vec![fake.clone()]),cache:dir.clone(),epoch:AtomicU64::new(0),workers:Arc::new(Semaphore::new(4)),writes:[AtomicUsize::new(0),AtomicUsize::new(0)],evicting:[Arc::new(AtomicBool::new(false)),Arc::new(AtomicBool::new(false))]};
+        match service.lookup(1,180,1).unwrap(){CacheLookup::Hit(data)=>assert_eq!(data.bytes,b"cached"),CacheLookup::NeedsRender(_)=>panic!("cache miss")};
+        assert_eq!(fake.calls.load(Ordering::Relaxed),0); let _=std::fs::remove_dir_all(dir);
+    }
     #[test] fn cache_miss_marker_round_trip(){let path=std::env::temp_dir().join(format!("ddreams-{}.miss",std::process::id()));let _=std::fs::remove_file(&path);assert!(!miss_marker_exists(&path));std::fs::write(&path,b"").unwrap();assert!(miss_marker_exists(&path));let _=std::fs::remove_file(path);}
     #[test] fn cache_key_is_versioned_and_size_specific(){assert_ne!(cache_key("a.jpg",cache_bucket(180),1,2),cache_key("a.jpg",cache_bucket(2048),1,2));}
     #[test] fn bucket_mapping_is_fixed(){assert_eq!([cache_bucket(0),cache_bucket(48),cache_bucket(160),cache_bucket(161),cache_bucket(320),cache_bucket(321),cache_bucket(1200)],[2048,160,160,320,320,480,480]);}

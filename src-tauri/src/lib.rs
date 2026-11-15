@@ -103,22 +103,27 @@ pub fn run() {
                     return;
                 };
                 service.set_epoch(epoch);
-                let permit = service.workers.clone().acquire_owned().await;
-                if permit.is_err() {
-                    responder.respond(
-                        Response::builder()
-                            .status(StatusCode::SERVICE_UNAVAILABLE)
-                            .body(Vec::new())
-                            .unwrap(),
-                    );
-                    return;
-                }
-                if epoch < service.epoch.load(Ordering::Relaxed) {
-                    responder.respond(Response::builder().status(StatusCode::CONFLICT).header(header::CACHE_CONTROL,"no-store").body(Vec::new()).unwrap());
-                    return;
-                }
                 let worker = service.clone();
-                let result = tauri::async_runtime::spawn_blocking(move || worker.render(id, size, epoch)).await;
+                let lookup = tauri::async_runtime::spawn_blocking(move || worker.lookup(id, size, epoch)).await;
+                let result = match lookup {
+                    Ok(Ok(thumbs::CacheLookup::Hit(data))) => Ok(Ok(data)),
+                    Ok(Err(error)) => Ok(Err(error)),
+                    Err(error) => Err(error),
+                    Ok(Ok(thumbs::CacheLookup::NeedsRender(_))) => {
+                        let permit = service.workers.clone().acquire_owned().await;
+                        if permit.is_err() {
+                            responder.respond(Response::builder().status(StatusCode::SERVICE_UNAVAILABLE).body(Vec::new()).unwrap());
+                            return;
+                        }
+                        if epoch < service.epoch.load(Ordering::Relaxed) {
+                            responder.respond(Response::builder().status(StatusCode::CONFLICT).header(header::CACHE_CONTROL,"no-store").body(Vec::new()).unwrap());
+                            return;
+                        }
+                        let worker = service.clone();
+                        // Recheck after acquiring the permit in case another worker filled the cache.
+                        tauri::async_runtime::spawn_blocking(move || worker.render(id, size, epoch)).await
+                    }
+                };
                 match result {
                     Ok(Ok(data)) => responder.respond(
                         Response::builder().status(StatusCode::OK).header(header::CONTENT_TYPE,"image/jpeg").header(header::CACHE_CONTROL,"no-store").body(data.bytes).unwrap()),
