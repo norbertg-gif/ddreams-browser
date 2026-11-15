@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useFolderRules, type FolderRuleAction } from "../folderRules";
-import { saveEditors, useEditors, type Editor } from "../editors";
+import { saveEditors, useEditors, editorsSuggested, type Editor } from "../editors";
 
 type Props = {
   onClose: () => void;
@@ -120,7 +120,7 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
             <button disabled={index === 0} onClick={() => moveEditor(index, 0)} title="Nastaviť ako predvolený">Predvolený</button>
             <button onClick={() => saveEditors(editors.filter((_, i) => i !== index))} title="Odstrániť zo zoznamu">Odstrániť</button>
           </div>)}</div>}
-        <div className="settings-add"><button disabled={picking} onClick={() => void addEditor()}>{picking ? "Vyberáš program…" : "Pridať program…"}</button></div>
+        <div className="settings-add">{editorsSuggested()&&<button onClick={() => saveEditors(editors)}>Uložiť zistený editor</button>}<button disabled={picking} onClick={() => void addEditor()}>{picking ? "Vyberáš program…" : "Pridať program…"}</button></div>
         {editorError && <small className="settings-error">{editorError}</small>}
       </section>
       <section className="settings-section">

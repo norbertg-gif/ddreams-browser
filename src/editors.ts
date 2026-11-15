@@ -1,29 +1,35 @@
 import { useEffect, useState } from "react";
-import { readStored, writeStored } from "./storage";
+import { invoke } from "@tauri-apps/api/core";
+import { readStored } from "./storage";
 
-/** External program for opening photos. The first one in the list is the default. */
 export type Editor = { name: string; path: string; multi: boolean };
-
 const KEY = "ddreams.editors";
 const EVENT = "ddreams-editors-changed";
-
-export function loadEditors(): Editor[] {
-  const value = readStored<Editor[]>(KEY, []);
-  return Array.isArray(value) ? value.filter(e => e && typeof e.path === "string" && e.path) : [];
+let editors: Editor[] = [];
+let suggested = false;
+let initialized: Promise<void> | null = null;
+let pending = Promise.resolve();
+let revision = 0;
+const notify = () => window.dispatchEvent(new Event(EVENT));
+function initialize() {
+  if (!initialized) initialized = (async () => {
+    const startRevision = revision;
+    let disk = await invoke<Editor[]>("get_editors");
+    const legacy = readStored<Editor[]>(KEY, []);
+    if (!disk.length && Array.isArray(legacy) && legacy.length) { await invoke("set_editors", { editors: legacy }); disk = legacy; }
+    try { window.localStorage.removeItem(KEY); } catch { /* storage may be unavailable */ }
+    if (!disk.length) { const detected = await invoke<Editor | null>("detect_photoshop"); if (detected) { disk = [detected]; if (revision === startRevision) suggested = true; } }
+    if (revision === startRevision) { editors = disk; notify(); }
+  })().catch(error => { initialized = null; throw error; });
+  return initialized;
 }
-
-export function saveEditors(editors: Editor[]) {
-  writeStored(KEY, editors);
-  window.dispatchEvent(new Event(EVENT));
+export function saveEditors(next: Editor[]) {
+  revision++; editors = next; suggested = false; notify();
+  pending = pending.then(async () => { await initialize(); await invoke("set_editors", { editors: next }); }).catch(error => { window.alert(`Nastavenia editorov sa nepodarilo uložiť: ${String(error)}`); });
 }
-
-/** Live list of configured editors; updates when Settings change it. */
 export function useEditors(): Editor[] {
-  const [editors, setEditors] = useState(loadEditors);
-  useEffect(() => {
-    const refresh = () => setEditors(loadEditors());
-    window.addEventListener(EVENT, refresh);
-    return () => window.removeEventListener(EVENT, refresh);
-  }, []);
-  return editors;
+  const [value, setValue] = useState(editors);
+  useEffect(() => { const refresh = () => setValue(editors); window.addEventListener(EVENT, refresh); void initialize().catch(error => console.error("Editor settings failed to load", error)); return () => window.removeEventListener(EVENT, refresh); }, []);
+  return value;
 }
+export function editorsSuggested() { return suggested; }

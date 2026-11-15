@@ -631,6 +631,56 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
     }
     command.spawn().map(|_|()).map_err(|e|e.to_string())
 }
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Editor { name: String, path: String, multi: bool }
+
+fn read_editor_settings(path: &Path) -> Result<Vec<Editor>, String> {
+    let text = match std::fs::read_to_string(path) { Ok(text) => text, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]), Err(e) => return Err(e.to_string()) };
+    let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    if !value.is_object() { return Err("settings.json must contain an object".into()); }
+    match value.get("editors") { Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string()), None => Ok(vec![]) }
+}
+fn write_editor_settings(path: &Path, editors: &[Editor]) -> Result<(), String> {
+    let mut value: Value = match std::fs::read_to_string(path) { Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string())?, Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}), Err(e) => return Err(e.to_string()) };
+    value.as_object_mut().ok_or("settings.json must contain an object")?.insert("editors".into(), serde_json::to_value(editors).map_err(|e| e.to_string())?);
+    std::fs::write(path, serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+#[tauri::command(async)]
+pub fn get_editors(info: State<'_, AppInfoState>) -> Result<Vec<Editor>, String> { read_editor_settings(Path::new(&info.0.settings)) }
+#[tauri::command(async)]
+pub fn set_editors(info: State<'_, AppInfoState>, editors: Vec<Editor>) -> Result<(), String> { write_editor_settings(Path::new(&info.0.settings), &editors) }
+
+fn newest_photoshop(paths: impl IntoIterator<Item=PathBuf>) -> Option<PathBuf> {
+    paths.into_iter().filter(|p| p.is_file()).max_by(|a,b| a.parent().cmp(&b.parent()))
+}
+#[tauri::command(async)]
+pub fn detect_photoshop() -> Option<Editor> {
+    use std::os::windows::process::CommandExt;
+    let output = std::process::Command::new("reg.exe").args(["query", r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Photoshop.exe", "/ve"]).creation_flags(0x0800_0000).output().ok();
+    let registry = output.filter(|o| o.status.success()).and_then(|o| String::from_utf8_lossy(&o.stdout).lines().find_map(|line| line.split_once("REG_SZ").map(|(_,v)| PathBuf::from(v.trim().trim_matches('"'))))).filter(|p| p.is_file());
+    let fallback = || { let root = Path::new(r"C:\Program Files\Adobe"); newest_photoshop(std::fs::read_dir(root).ok()?.filter_map(Result::ok).filter(|e| e.file_name().to_string_lossy().to_ascii_lowercase().starts_with("adobe photoshop")).map(|e| e.path().join("Photoshop.exe"))) };
+    registry.or_else(fallback).map(|p| Editor { name: "Adobe Photoshop".into(), path: p.to_string_lossy().into_owned(), multi: true })
+}
+
+#[cfg(test)]
+mod editor_tests {
+    use super::*;
+    #[test] fn editor_settings_round_trip() {
+        let dir = std::env::temp_dir().join(format!("ddreams-editors-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap(); let path=dir.join("settings.json");
+        std::fs::write(&path, r#"{"other":42}"#).unwrap(); let editors=vec![Editor{name:"Test".into(),path:"x.exe".into(),multi:true}];
+        write_editor_settings(&path,&editors).unwrap(); assert_eq!(read_editor_settings(&path).unwrap(),editors);
+        let json: Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap(); assert_eq!(json["other"],42);
+        write_editor_settings(&path,&[]).unwrap(); assert!(read_editor_settings(&path).unwrap().is_empty()); std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test] fn photoshop_fallback_selects_newest_installed() {
+        let dir=std::env::temp_dir().join(format!("ddreams-photoshop-{}-{:?}",std::process::id(),std::thread::current().id()));
+        let old=dir.join("Adobe Photoshop 2024/Photoshop.exe");let new=dir.join("Adobe Photoshop 2026/Photoshop.exe");let missing=dir.join("Adobe Photoshop 2027/Photoshop.exe");
+        for p in [&old,&new] { std::fs::create_dir_all(p.parent().unwrap()).unwrap();std::fs::write(p,"").unwrap(); }
+        assert_eq!(newest_photoshop([old,new.clone(),missing]),Some(new));std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
 /// Opens the given files in an external editor chosen in Settings. `multi` = the program takes all
 /// files in one launch; otherwise it is started once per file (at most 20).
 #[tauri::command(async)]

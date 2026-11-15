@@ -225,7 +225,7 @@ pub fn run() {
             commands::set_folder_rule,
             commands::refresh_folder_listing,
             commands::get_asset_paths,
-            commands::asset_action,commands::startup_mark,commands::open_in_editor,commands::pick_editor_program,commands::program_exists,
+            commands::asset_action,commands::startup_mark,commands::open_in_editor,commands::get_editors,commands::set_editors,commands::detect_photoshop,commands::pick_editor_program,commands::program_exists,
             commands::get_asset_ids,
             commands::get_folder_children,
             commands::find_folder_path,
