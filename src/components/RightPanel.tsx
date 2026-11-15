@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, type MouseEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent, type DragEvent as ReactDragEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
 import type { Asset, AssetQuality, CatalogAssetLinks, Node as CatalogNode, Metadata, MetadataRow, Root, ValueCount, View } from "../types";
@@ -72,16 +72,31 @@ export default function RightPanel({ thumbEpoch = 0, hosts, catalogReady = true,
   const previousColorToken=useRef(colorToken);
   useEffect(()=>{if(previousColorToken.current===colorToken)return;previousColorToken.current=colorToken;if(!aiAvailable||!aiReady||facePersonsTimer.current!==undefined)return;const delay=Math.max(0,20000-(Date.now()-facePersonsLastLoad.current));facePersonsTimer.current=window.setTimeout(()=>{facePersonsTimer.current=undefined;void reloadFacePersons()},delay)},[colorToken,aiAvailable,aiReady]);
   useEffect(() => writeStored("ddreams.metadataOpen", [...openGroups]), [openGroups]);
+  // User-defined row order, per group + subgroup, as a list of row names. Names missing from the
+  // list keep their original order after the listed ones.
+  const [rowOrder,setRowOrder]=useState<Record<string,string[]>>(()=>{const v=readStored<Record<string,string[]>>("ddreams.metadataOrder",{});return v&&typeof v==="object"&&!Array.isArray(v)?v:{};});
+  useEffect(()=>writeStored("ddreams.metadataOrder",rowOrder),[rowOrder]);
+  const bucketKey=(row:MetadataRow)=>`${row.group}\u0000${row.subgroup}`;
+  const orderRows=(rows:MetadataRow[])=>{const first=new Map<string,number>();rows.forEach((r,i)=>{const b=bucketKey(r);if(!first.has(b))first.set(b,i)});const rank=(r:MetadataRow)=>{const i=rowOrder[bucketKey(r)]?.indexOf(r.name)??-1;return i<0?Number.MAX_SAFE_INTEGER:i};return rows.map((row,i)=>({row,i})).sort((a,b)=>first.get(bucketKey(a.row))!-first.get(bucketKey(b.row))!||rank(a.row)-rank(b.row)||a.i-b.i).map(x=>x.row)};
+  const dragRow=useRef<MetadataRow|null>(null);
+  const [dropMark,setDropMark]=useState<{key:string;after:boolean}|null>(null);
   const groups = useMemo(() => {
-    const rows = metadata?.rows ?? [];
+    const rows = orderRows(metadata?.rows ?? []);
     const fixed = ["IPTC", "EXIF", "Katalóg"];
     const extra = [...new Set(rows.map(row => row.group).filter(name => !fixed.includes(name)))].sort((a,b) => {
       if (a === "Všetky metadáta") return 1; if (b === "Všetky metadáta") return -1; return a.localeCompare(b);
     });
     return [...fixed, ...extra].map(name => ({name, rows: rows.filter(row => row.group === name)})).filter(group => group.rows.length);
-  }, [metadata]);
+  }, [metadata, rowOrder]);
   const rowKey = (row: MetadataRow) => `${row.group}\u0000${row.subgroup}\u0000${row.name}`;
   const rowList = groups.flatMap(g => g.rows);
+  const dropAfter=(event:ReactDragEvent<HTMLElement>)=>{const box=event.currentTarget.getBoundingClientRect();return event.clientY>box.top+box.height/2};
+  const moveRow=(target:MetadataRow,after:boolean)=>{
+    const source=dragRow.current;dragRow.current=null;setDropMark(null);
+    if(!source||bucketKey(source)!==bucketKey(target)||source.name===target.name)return;
+    const bucket=bucketKey(target);const visible=rowList.filter(r=>bucketKey(r)===bucket).map(r=>r.name);
+    setRowOrder(prev=>{const stored=prev[bucket]??[];const list=[...stored,...visible.filter(n=>!stored.includes(n))].filter(n=>n!==source.name);const at=list.indexOf(target.name);list.splice(at<0?list.length:at+(after?1:0),0,source.name);return{...prev,[bucket]:list}});
+  };
   const selectRow = (row: MetadataRow, event: MouseEvent) => {
     const key = rowKey(row); setRowAnchor(key);
     if (event.shiftKey && rowAnchor) {
@@ -98,7 +113,7 @@ export default function RightPanel({ thumbEpoch = 0, hosts, catalogReady = true,
     const payloads = await Promise.all(ids.map(assetId => invoke<Metadata | null>("get_metadata", { assetId })));
     let rowCount = 0;
     const blocks = payloads.filter((m): m is Metadata => !!m).map(m => {
-      const rows = m.rows.filter(r => (!group || r.group === group) && (keys == null || keys.includes(rowKey(r))));
+      const rows = orderRows(m.rows).filter(r =>(!group || r.group === group) && (keys == null || keys.includes(rowKey(r))));
       rowCount += rows.length;
       if (!rows.length) return "";
       const lines = rows.map(r => mode === "values" ? r.value : `${r.name}: ${r.value}`);
@@ -161,8 +176,11 @@ export default function RightPanel({ thumbEpoch = 0, hosts, catalogReady = true,
         {openGroups.has(group.name) && <div className="metadata-rows">
           {[...new Set(group.rows.map(row=>row.subgroup))].map(subgroup=><div className="metadata-subgroup" key={subgroup}>
             {subgroup && subgroup !== group.name && <div className="metadata-subgroup-title">{subgroup}</div>}
-            {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row checkable ${selectedRows.includes(rowKey(row)) ? "selected" : ""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setCopyMenu(true); }}>
-              <input type="checkbox" className="meta-check" tabIndex={-1} readOnly checked={selectedRows.includes(rowKey(row))} title="Zaškrtnuté riadky sa kopírujú tlačidlom Kopírovať zaškrtnuté" /><span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "Katalóg" ? catalogText(row) : row.value}</b>
+            {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row checkable ${selectedRows.includes(rowKey(row)) ? "selected" : ""} ${dropMark?.key===rowKey(row)?(dropMark.after?"drop-after":"drop-before"):""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setCopyMenu(true); }}
+              draggable onDragStart={e=>{dragRow.current=row;e.dataTransfer.effectAllowed="move";e.dataTransfer.setData("text/plain",row.name)}} onDragEnd={()=>{dragRow.current=null;setDropMark(null)}}
+              onDragOver={e=>{const source=dragRow.current;if(!source||bucketKey(source)!==bucketKey(row))return;e.preventDefault();e.dataTransfer.dropEffect="move";const key=rowKey(row),after=dropAfter(e);setDropMark(mark=>mark&&mark.key===key&&mark.after===after?mark:{key,after})}}
+              onDrop={e=>{if(!dragRow.current)return;e.preventDefault();moveRow(row,dropAfter(e))}}>
+              <input type="checkbox" className="meta-check" tabIndex={-1} readOnly checked={selectedRows.includes(rowKey(row))} title="Zaškrtnuté riadky sa kopírujú tlačidlami dole. Poradie riadkov zmeníš ťahaním." /><span title={row.name}>{row.name}</span><b title={row.value}>{group.name === "Katalóg" ? catalogText(row) : row.value}</b>
             </div>)}
           </div>)}
         </div>}
@@ -170,8 +188,8 @@ export default function RightPanel({ thumbEpoch = 0, hosts, catalogReady = true,
         {group.name==="Katalóg"&&quality&&<div className="meta-row"><span>Kvalita</span><b title={qualityTitle}>{qualityText}</b></div>}
       </section>)}
       {assetFaces.length>0&&<section className="property-group face-properties"><div className="accordion-head"><span>Tváre</span><span>{assetFaces.length}</span></div><div className="face-property-list">{assetFaces.map(face=><div className="face-property-row" key={face.faceId}>{face.x==null||face.y==null||face.w==null||face.h==null?<span className="face-photo-level">Cel? fotka</span>:<img src={assetFaceThumbs[face.faceId]} alt=""/>}<div className="face-property-main"><strong>{face.name??"Neznáma tvár"}</strong>{face.state==="auto"&&<small>navrhnuté</small>}{face.state==="suggested"&&<small>návrh ACDSee</small>}</div><select disabled={readOnly} aria-label="Osoba" value={face.personId?.toString()??""} onChange={event=>void chooseFacePerson(face,event.target.value)}><option value="">Neznáma tvár</option>{facePersons.map(person=><option value={person.id} key={person.id}>{person.name}</option>)}<option value="__new__">Nová osoba…</option><option value="__clear__">Zrušiť meno</option><option value="__ignore__">Nie je osoba (ignorovať)</option></select>{(face.state==="auto"||face.state==="suggested")&&<span className="face-review-buttons"><button disabled={readOnly} title="Potvrdiť" onClick={()=>void updateFace(face.faceId,"confirm")}>✓</button><button disabled={readOnly} title="Odmietnuť" onClick={()=>void updateFace(face.faceId,"reject")}>✗</button></span>}</div>)}</div></section>}
-      <div className="copy-controls">{selectedRows.length > 0 && <button title="Zrušiť všetky zaškrtnutia" onClick={() => setSelectedRows([])}>Zrušiť</button>}<button disabled={!metadata || selectedRows.length === 0} onClick={() => void copy("selected")}>Kopírovať zaškrtnuté{selectedRows.length ? ` (${selectedRows.length})` : ""}</button><button disabled={!metadata} onClick={() => setCopyMenu(v => !v)}>▾</button>
-        {copyMenu && <div className="copy-menu"><button onClick={() => void copy("values")}>Kopírovať len hodnoty</button>{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}</div>}
+      <div className="copy-controls">{selectedRows.length > 0 && <button title="Zrušiť všetky zaškrtnutia" onClick={() => setSelectedRows([])}>✕</button>}<span className="copy-label">Kopírovať{selectedRows.length ? ` (${selectedRows.length})` : ""}:</span><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje zaškrtnuté riadky ako „Názov: hodnota“ (Ctrl+C)" onClick={() => void copy("selected")}>S popisom</button><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje len hodnoty zaškrtnutých riadkov" onClick={() => void copy("values")}>Bez popisu</button><button disabled={!metadata} title="Ďalšie možnosti" onClick={() => setCopyMenu(v => !v)}>▾</button>
+        {copyMenu && <div className="copy-menu">{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}{Object.keys(rowOrder).length>0&&<button onClick={()=>{setRowOrder({});setCopyMenu(false)}}>Obnoviť pôvodné poradie riadkov</button>}</div>}
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
     </div>
   </aside>, hosts.properties)}

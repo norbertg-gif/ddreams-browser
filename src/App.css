@@ -469,6 +469,8 @@ input[type=checkbox]{accent-color:var(--accent)}
 .meta-row.checkable{grid-template-columns:16px minmax(0,40%) minmax(0,1fr);cursor:pointer}
 .meta-check{width:13px;height:13px;margin:2px 0 0;pointer-events:none}
 .meta-row.selected{background:#16202d;border-radius:0}
+.meta-row.drop-before{box-shadow:inset 0 2px 0 #6ea8ff}.meta-row.drop-after{box-shadow:inset 0 -2px 0 #6ea8ff}
+.copy-controls{flex-wrap:wrap;align-items:center}.copy-label{color:var(--muted);font-size:12px;white-space:nowrap}
 .copy-controls{gap:6px}.copy-controls>button,.copy-controls>button:first-child,.copy-controls>button:nth-child(2){border-radius:7px;height:28px;padding:0 10px}
 
 /* toolbar: one wrapping row of items, sort and view controls pushed to the right */
