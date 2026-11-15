@@ -1,0 +1,96 @@
+/* Compact photographic workspace. Layout and interaction remain in the components. */
+:root {
+  --bg: #242424;
+  --panel: #202020;
+  --panel2: #2d2d2d;
+  --line: #393939;
+  --muted: #a9a9a9;
+  --text: #d0d0d0;
+  --bright: #f0f0f0;
+  --accent: #8db5df;
+  --hover: #3a3a3a;
+  --select: #555;
+}
+
+.topbar { height: 34px; gap: 8px; padding: 0 8px; background: #242424; }
+.top-left, .top-right { gap: 6px; }
+.brand-mark { width: 22px; height: 22px; border-radius: 2px; font-size: 12px; }
+.brand-title { margin-right: 5px; font-size: 11px; }
+.brand-title b { font-size: 9px; }
+.topbar .search-box { height: 23px; border-radius: 2px; background: #202020; }
+.topbar .search-box kbd { border-radius: 2px; }
+.count-pill, .ai-chip, .catalog-label { height: auto; min-height: 22px; padding: 2px 7px; border-radius: 2px; font-size: 10px; }
+.settings-button { height: 24px; width: 24px; border-radius: 2px; }
+
+.workspace, .center-pane { background: #292929; }
+.dock-group { background: #202020; }
+.dock-tabs { height: 25px; padding: 0 4px; gap: 0; background: #292929; }
+.dock-tabs > button { padding: 0 7px; font-size: 11px; border-bottom-width: 1px; }
+.dock-drop-overlay { inset: 25px 0 0; }
+.shortcuts-pane { padding: 0 2px 3px; }
+.pane-title { padding: 3px 5px; font-size: 11px; letter-spacing: 0; text-transform: none; background: #303030; }
+.shortcut-row, .shortcut, .tree-row { border-radius: 0; }
+.shortcut { height: 21px; padding: 0 5px; gap: 5px; }
+.shortcut b { font-size: 11px; }
+.shortcut-add, .shortcut-remove { width: 19px; height: 19px; line-height: 17px; border-radius: 0; }
+.folder-tree, .catalog-content, .properties-content { padding: 3px 4px; }
+.tree-row { height: 20px; }
+.tree-label, .tree-toggle, .tree-toggle-placeholder { height: 20px; }
+.tree-label { gap: 4px; font-size: 11px; }
+.tree-label small { font-size: 10px; }
+.tree-toggle { width: 16px; min-width: 16px; }
+.tree-row.active { background: #626262; }
+
+.center-pane .toolbar { min-height: 29px; padding: 2px 6px; gap: 3px 5px; background: #292929; }
+.center-pane .toolbar-left, .center-pane .toolbar-right { gap: 3px; }
+.toolbar button, .toolbar-menu summary, .toolbar select { height: 23px; padding: 0 7px; border-radius: 2px; line-height: 21px; font-size: 11px; }
+.toolbar select { padding-right: 20px; }
+.toolbar .nav-btn, .toolbar .direction-button { width: 25px; }
+.type-pills { gap: 1px; margin-left: 2px; }
+.toolbar .pill { padding: 0 7px; border-radius: 2px; }
+.toolbar .pill.active, .toolbar .pill.active:hover { background: #666; border-color: #777; color: #fff; }
+.toolbar .zoom-control { height: 23px; padding: 0 5px; border-radius: 2px; gap: 4px; }
+.toolbar .zoom-control input { width: 85px; }
+.toolbar-pop { top: 27px; }
+.ai-search-box { height: 23px; margin-left: 3px; padding: 0 6px; border-radius: 2px; }
+.center-mode-pills { border-radius: 2px; padding: 0; }
+.center-mode-pills button { padding: 0 7px; border-radius: 0; }
+
+.asset-scroll { background: #303030; }
+.asset-tile { padding: 5px 5px 3px; border: 0; border-right: 1px solid #222; border-bottom: 1px solid #222; border-radius: 0; background: #303030; }
+.asset-tile:hover { background: #3d3d3d; }
+.asset-tile.selected, .asset-tile.selected:hover { background: #666; box-shadow: inset 0 0 0 1px #aaa; }
+.asset-tile.primary .thumb-wrap { box-shadow: none; }
+.asset-scroll:focus .asset-tile.focused { outline: 1px dotted #eee; outline-offset: -2px; }
+.thumb-wrap { background: transparent; border-radius: 0; }
+.type-badge { left: auto; right: 1px; top: 1px; padding: 0 4px; border-radius: 1px; background: #26395c; font-size: 9px; }
+.tagged-badge { width: auto; height: auto; right: 3px; top: auto; bottom: 3px; padding: 1px 3px; border-radius: 1px; box-shadow: none; }
+.size-badge, .tagged-badge ~ .size-badge { right: 3px; bottom: 2px; border-radius: 1px; }
+.tile-info-lines { padding: 3px 2px 0; }
+.tile-info-line, .tile-info-line.tile-name { text-align: center; font-size: 10px; font-weight: 400; }
+.status-bar { height: 21px; background: #292929; font-size: 10px; }
+.status-bar > * { border-right: 1px solid #484848; padding: 0 7px; }
+
+.selected-summary { padding: 4px; font-size: 11px; }
+.stat-cards { gap: 1px; margin: 0 0 5px; }
+.stat-cards > div { flex-direction: row; align-items: baseline; gap: 5px; padding: 3px 5px; border-radius: 0; }
+.stat-cards b { font-size: 11px; }
+.property-group { margin-bottom: 3px; }
+.accordion-head { height: 22px; padding: 0 5px; background: #303030; border: 1px solid #171717; font-size: 10px; letter-spacing: 0; text-transform: none; }
+.metadata-subgroup-title { padding: 4px 4px 1px; }
+.meta-row { min-height: 21px; padding: 2px 4px; font-size: 11px; }
+.meta-row.selected { border-radius: 0; }
+.copy-controls { margin: 5px -4px -3px; }
+
+.catalog-edit-disclosure { flex: none; max-height: 50%; overflow: auto; border-bottom: 1px solid #111; }
+.catalog-edit-disclosure > summary { padding: 4px 6px; cursor: pointer; background: #303030; color: #ddd; font-size: 11px; }
+.catalog-content .catalog-editor { max-height: none; margin: 0; padding: 5px; border: 0; border-radius: 0; background: #272727; box-shadow: none; }
+.catalog-editor .editor-row { min-height: 22px; }
+.catalog-filter-scroll { padding-top: 3px; }
+.catalog-zone-title.filter-zone { margin: 0 0 3px; padding: 3px 5px; border-radius: 0; background: #303030; color: #ccc; }
+.keyword-filter, .filter-zone-content .keyword-filter { height: 23px; border-radius: 1px; }
+.catalog-section { margin-bottom: 3px; }
+.catalog-section-heading, .filter-zone-content .catalog-section-heading { min-height: 22px; padding: 1px 4px; margin-bottom: 1px; background: #303030; }
+.catalog-section-heading > button:first-child { letter-spacing: 0; }
+.value-row { height: 21px; min-height: 21px; border-radius: 0; }
+.category-assign-box { border-radius: 1px; }

@@ -18,6 +18,7 @@ import type { Asset, Folder, FormatTable, Page, View, ViewFilters, ValueCount } 
 import { readStored, writeStored } from "./storage";
 import { DEFAULT_THUMBNAIL_INFO, normalizeThumbnailInfo, type ThumbnailInfoConfig } from "./thumbnailInfo";
 import "./App.css";
+import "./manage.css";
 
 const DEFAULT_PATH = String.raw`F:\My_docs\My Pictures\Fotky`;
 type AppInfo = { root: string; catalog: string; backups: string; cache: string; exiftool: string; formats: string; metadataView: string; settings: string; portable: boolean; readonly: boolean };
