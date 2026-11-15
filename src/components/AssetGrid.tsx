@@ -338,6 +338,8 @@ function AssetTile({ asset, folderPreviews, groupNumber, best, size, epoch, sele
   const menuRef=useRef<HTMLDivElement>(null);
   const [menuPosition,setMenuPosition]=useState<{left:number;top:number}|null>(null);
   const [hoverMetadata,setHoverMetadata]=useState<CatalogAssetMetadata|null>(null);
+  // Only one tile menu may be open: any press outside it, Escape, scrolling or leaving the window closes it.
+  useEffect(()=>{if(!menu)return;const close=()=>setMenu(null);const down=(e:PointerEvent)=>{if(!menuRef.current?.contains(e.target as Node))close()};const key=(e:globalThis.KeyboardEvent)=>{if(e.key==="Escape"){e.stopPropagation();close()}};const scroll=(e:Event)=>{if(!menuRef.current?.contains(e.target as Node))close()};window.addEventListener("pointerdown",down,true);window.addEventListener("keydown",key,true);window.addEventListener("scroll",scroll,true);window.addEventListener("blur",close);return()=>{window.removeEventListener("pointerdown",down,true);window.removeEventListener("keydown",key,true);window.removeEventListener("scroll",scroll,true);window.removeEventListener("blur",close)}},[menu]);
   useLayoutEffect(()=>{if(!menu)return;const element=menuRef.current;if(!element)return;const pad=8,rect=element.getBoundingClientRect(),vw=window.innerWidth/uiScale,vh=window.innerHeight/uiScale;setMenuPosition({left:Math.max(pad,Math.min(menu.x,Math.max(pad,vw-rect.width-pad))),top:Math.max(pad,Math.min(menu.y,Math.max(pad,vh-rect.height-pad)))})},[menu,uiScale]);
   const [hover,setHover]=useState(false);const [popup,setPopup]=useState(false);const timer=useRef<number|undefined>(undefined);
   const [shiftDown,setShiftDown]=useState(!!window.__ddreamsShift);
