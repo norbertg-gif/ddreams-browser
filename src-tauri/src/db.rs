@@ -468,9 +468,9 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
     match filter.kind.as_str() {
         "auto" => {
             let pair=filter.value.as_deref().and_then(|v|v.split_once('\t'));
-            if let Some((field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(field,value))) {
+            if let Some((group,field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(group,field,value))) {
                 where_sql.push_str(&format!(" AND a.id IN (SELECT asset_id FROM auto_exif.exif_index WHERE {field}=?)"));
-                match field { "iso"|"focal"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture"|"exposure" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
+                match group { "iso"|"focal"|"exposure"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
             } else { where_sql.push_str(" AND 0"); }
         }
         "folder" => {
@@ -671,9 +671,9 @@ pub fn asset_ids_page(
     match filter.kind.as_str() {
         "auto" => {
             let pair=filter.value.as_deref().and_then(|v|v.split_once('\t'));
-            if let Some((field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(field,value))) {
+            if let Some((group,field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(group,field,value))) {
                 where_sql.push_str(&format!(" AND a.id IN (SELECT asset_id FROM auto_exif.exif_index WHERE {field}=?)"));
-                match field { "iso"|"focal"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture"|"exposure" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
+                match group { "iso"|"focal"|"exposure"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
             } else { where_sql.push_str(" AND 0"); }
         }
         "folder" => {
