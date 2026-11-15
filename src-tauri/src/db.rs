@@ -19,6 +19,8 @@ pub fn open_catalog(path: &Path, readonly: bool) -> rusqlite::Result<Connection>
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "cache_size", -32000)?;
+    conn.pragma_update(None, "mmap_size", 268435456)?;
     Ok(conn)
 }
 
@@ -27,6 +29,8 @@ pub fn open_read_only(path: &Path) -> rusqlite::Result<Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX | OpenFlags::SQLITE_OPEN_URI,
     )?;
+    conn.pragma_update(None, "cache_size", -32000)?;
+    conn.pragma_update(None, "mmap_size", 268435456)?;
     conn.pragma_update(None, "query_only", "ON")?;
     conn.busy_timeout(std::time::Duration::from_secs(4))?;
     Ok(conn)
@@ -454,7 +458,6 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
     let ai_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let quality_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
     let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
-    let extra_cols = filter.include_categories as i64 + filter.include_keywords as i64;
     let mut from_sql = String::from("assets a");
     let mut with_sql = String::new();
     let mut where_sql = format!("a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
@@ -555,46 +558,66 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         args.push(format!("%{escaped}%").into());
     }
     add_view_filters(&mut where_sql, &mut args, filter, formats);
-    if !with_sql.is_empty() {
-        let order=order_clause(&filter.sort,filter.descending);
-        let sql = format!("{with_sql}, agg AS (SELECT count(*) AS total_count,coalesce(sum(a.size),0) AS total_size FROM {from_sql} WHERE {where_sql}), page AS (SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?) SELECT page.*,agg.total_count,agg.total_size FROM agg LEFT JOIN page ON 1");
-        let mut query_args=args.clone();
-        query_args.extend(args.iter().skip(1).cloned());
-        query_args.push(filter.limit.clamp(1,500).into());
-        query_args.push(filter.offset.max(0).into());
-        let mut stmt=conn.prepare(&sql)?;
-        let rows=stmt.query_map(rusqlite::params_from_iter(query_args.iter()),|r|{
-            let id:Option<i64>=r.get(0)?;
-            let total=r.get((21+extra_cols) as usize)?;
-            let total_size=r.get((22+extra_cols) as usize)?;
-            let asset=if id.is_some(){Some(map_asset(r,filter.include_categories,filter.include_keywords)?)}else{None};
-            Ok((asset,total,total_size))
-        })?;
-        let mut items=Vec::new();let mut total=0;let mut total_size=0.0;
-        for row in rows { let (asset,count,size)=row?;total=count;total_size=size;if let Some(asset)=asset{items.push(asset);} }
-        return Ok(AssetPage{items,total,total_size});
-    }
     let order = order_clause(&filter.sort, filter.descending);
-    let count_sql =
-        format!("{with_sql} SELECT count(*),coalesce(sum(a.size),0) FROM {from_sql} WHERE {where_sql}");
-    let (total, total_size): (i64, f64) =
-        conn.query_row(&count_sql, rusqlite::params_from_iter(args.iter()), |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
-    let sql = format!(
-        "{with_sql} SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?"
-    );
-    args.push(filter.limit.clamp(1, 500).into());
-    args.push(filter.offset.max(0).into());
-    let mut stmt = conn.prepare(&sql)?;
-    let items = stmt
-        .query_map(rusqlite::params_from_iter(args.iter()), |r| map_asset(r,filter.include_categories,filter.include_keywords))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(AssetPage {
-        items,
-        total,
-        total_size,
-    })
+    let cacheable = conn.is_autocommit() && !matches!(filter.kind.as_str(), "auto" | "color" | "quality")
+        && !where_sql.contains("ai.") && !where_sql.contains("auto_exif.");
+    let key = (Arc::as_ptr(db) as usize, with_sql.clone(), from_sql.clone(), where_sql.clone(), order.to_string(), args.clone());
+    type CacheKey = (usize, String, String, String, String, Vec<rusqlite::types::Value>);
+    struct Entry {
+        db: std::sync::Weak<Mutex<Connection>>,
+        key: CacheKey,
+        at: std::time::Instant,
+        changes: u64,
+        version: i64,
+        ids: Arc<Vec<i64>>,
+        total_size: f64,
+    }
+    static CACHE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
+    // total_changes catches writes on this connection; data_version catches commits by others.
+    // Transactions and attached-database filters are not cached; the weak pointer prevents address reuse.
+    let changes = conn.total_changes();
+    let version: i64 = conn.query_row("PRAGMA main.data_version", [], |r| r.get(0))?;
+    let cached = if cacheable {
+        let mut cache = CACHE.lock().unwrap();
+        let pos = cache.iter().position(|entry| entry.key == key && entry.db.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, db))
+            && entry.at.elapsed().as_secs() < 60 && entry.changes == changes && entry.version == version);
+        pos.map(|pos| { let entry = cache.remove(pos); let result = (entry.ids.clone(), entry.total_size); cache.push(entry); result })
+    } else { None };
+    let (ids, total_size) = match cached {
+        Some(result) => result,
+        None => {
+            let sql = format!("{with_sql} SELECT a.id,a.size FROM {from_sql} WHERE {where_sql} ORDER BY {order}");
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
+            let mut ids = Vec::new();
+            let mut total_size = 0.0;
+            while let Some(row) = rows.next()? {
+                ids.push(row.get(0)?);
+                total_size += row.get::<_, Option<f64>>(1)?.unwrap_or(0.0);
+            }
+            let ids = Arc::new(ids);
+            if cacheable {
+                let mut cache = CACHE.lock().unwrap();
+                cache.retain(|entry| entry.key != key && entry.db.strong_count() > 0 && entry.at.elapsed().as_secs() < 60);
+                if cache.len() >= 2 { cache.remove(0); }
+                cache.push(Entry { db: Arc::downgrade(db), key, at: std::time::Instant::now(), changes, version, ids: ids.clone(), total_size });
+            }
+            (ids, total_size)
+        }
+    };
+    let total = ids.len() as i64;
+    let start = (filter.offset.max(0) as u64).min(ids.len() as u64) as usize;
+    let end = start.saturating_add(filter.limit.clamp(1, 500) as usize).min(ids.len());
+    let page_ids = &ids[start..end];
+    let mut items = Vec::with_capacity(page_ids.len());
+    if !page_ids.is_empty() {
+        let sql = format!("SELECT {selected_cols} FROM assets a WHERE a.id IN ({})", vec!["?"; page_ids.len()].join(","));
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(page_ids.iter()), |r| map_asset(r, filter.include_categories, filter.include_keywords))?;
+        let mut by_id = rows.map(|row| row.map(|asset| (asset.id, asset))).collect::<rusqlite::Result<HashMap<_, _>>>()?;
+        for id in page_ids { if let Some(asset) = by_id.remove(id) { items.push(asset); } }
+    }
+    Ok(AssetPage { items, total, total_size })
 }
 
 fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
@@ -1123,6 +1146,25 @@ mod feature_tests {
         assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
+    #[test]
+    fn cached_catalog_pages_keep_order_totals_and_invalidate_on_write() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size) VALUES (1,'z.jpg','jpg','jpg',1,10),(2,'a.jpg','jpg','jpg',1,20),(3,'m.jpg','jpg','jpg',1,NULL),(4,'b.jpg','jpg','jpg',1,40),(5,'hidden.jpg','jpg','jpg',0,100)").unwrap();
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let mut filter = test_filter("special", "all_photos");
+        filter.limit = 2;
+        for (offset, expected) in [(0, vec![2,4]), (2, vec![3,1]), (3, vec![1]), (9, vec![])] {
+            filter.offset = offset;
+            let page = assets_page(&db, &filter, &formats).unwrap();
+            assert_eq!(page.items.iter().map(|a| a.id).collect::<Vec<_>>(), expected);
+            assert_eq!((page.total, page.total_size), (4, 70.0));
+        }
+        db.lock().unwrap().execute_batch("UPDATE assets SET name='0.jpg',size=5 WHERE id=1; UPDATE assets SET is_listed=0 WHERE id=4").unwrap();
+        filter.offset = 0;
+        let page = assets_page(&db, &filter, &formats).unwrap();
+        assert_eq!(page.items.iter().map(|a| a.id).collect::<Vec<_>>(), vec![1,2]);
+        assert_eq!((page.total, page.total_size), (3, 25.0));
+    }
     #[test]
     fn auto_category_view_filters_and_pages_catalog() {
         let db=test_db();
