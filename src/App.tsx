@@ -149,7 +149,7 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const viewResolved = useRef(0);
   const markReady = useCallback((why: string) => { setReady(was => { if (!was) void invoke("startup_mark", { label: `ready (${why})` }).catch(() => {}); return true; }); }, []);
-  const counts = useCallback((n: number, size: number) => { setTotal(n); setTotalSize(size); if (viewResolved.current && performance.now() - viewResolved.current > 150 && n > 0) markReady("first page"); }, [markReady]);
+  const counts = useCallback((n: number, size: number) => { setTotal(n); setTotalSize(size); if (viewResolved.current) markReady("first page"); }, [markReady]);
   useEffect(() => { void invoke("startup_mark", { label: "ui mounted" }).catch(() => {}); const timer = window.setTimeout(() => markReady("timeout 20 s"), 20000); return () => window.clearTimeout(timer); }, [markReady]);
   useEffect(()=>{if(!ready||!aiEnabled)return;const timer=window.setTimeout(()=>{void invoke<AiStatus>("ai_status").then(status=>{if(status.available&&status.state==="off")void invoke<AiStatus>("ai_start").then(setAiStatus).catch(error=>setAiStatus(s=>({...s,state:"error",lastError:String(error)})));}).catch(()=>{});},4000);return()=>window.clearTimeout(timer);},[ready]);
   const navigate = useCallback((next: View) => { setView(next);setHistory(h=>{const base=h.slice(0,historyIndex+1);base.push(next);setHistoryIndex(base.length-1);return base;}); setQuery(""); setQueryDebounced(""); setFilters({});setSelectedIds(new Set()); setPrimaryId(null); setPrimaryAsset(null); setViewer(null);if(next.kind==="folder")writeStored("ddreams.lastFolder",next.folderPath??next.title); }, [historyIndex]);
