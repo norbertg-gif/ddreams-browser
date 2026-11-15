@@ -1,5 +1,5 @@
 use crate::{db::{self, Asset, AssetFilter, AssetPage, Db}, formats::FormatTable};
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::{atomic::{AtomicI64, Ordering}, mpsc}, time::Duration};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, Ordering}, mpsc}, time::Duration};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFLINE_RETRY: Duration = Duration::from_secs(8);
@@ -10,13 +10,21 @@ pub struct ListingService {
     entries: std::sync::Mutex<HashMap<i64, Asset>>,
     directory_parents: std::sync::Mutex<HashMap<i64, i64>>,
     path_ids: std::sync::Mutex<HashMap<String,i64>>,
-    listings: std::sync::Mutex<HashMap<String, (std::time::Instant, Vec<Asset>)>>,
+    listings: std::sync::Mutex<HashMap<String, (std::time::Instant, Arc<Vec<Asset>>)>>,
+    prepared: std::sync::Mutex<Option<PreparedListing>>,
     next_id: AtomicI64,
+}
+
+struct PreparedListing {
+    source: Arc<Vec<Asset>>,
+    key: String,
+    rows: Arc<Vec<Asset>>,
+    total_size: f64,
 }
 
 impl ListingService {
     pub fn new(db: Db, formats: std::sync::Arc<FormatTable>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db, formats, entries: std::sync::Mutex::new(HashMap::new()), directory_parents: std::sync::Mutex::new(HashMap::new()), path_ids:std::sync::Mutex::new(HashMap::new()), listings: std::sync::Mutex::new(HashMap::new()), next_id: AtomicI64::new(-10_000_000) })
+        std::sync::Arc::new(Self { db, formats, entries: std::sync::Mutex::new(HashMap::new()), directory_parents: std::sync::Mutex::new(HashMap::new()), path_ids:std::sync::Mutex::new(HashMap::new()), listings: std::sync::Mutex::new(HashMap::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000) })
     }
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
@@ -29,6 +37,7 @@ impl ListingService {
 
     pub fn invalidate_path(&self, path: &str) -> Result<(), String> {
         self.listings.lock().map_err(|_| "listing cache poisoned")?.remove(&normalize(path));
+        *self.prepared.lock().map_err(|_| "prepared listing cache poisoned")? = None;
         Ok(())
     }
 
@@ -41,7 +50,7 @@ impl ListingService {
         self.invalidate_path(&parent)
     }
 
-    fn list(&self, path: &str, folder_ids: &[i64]) -> (Vec<Asset>, bool) {
+    fn list(&self, path: &str, folder_ids: &[i64]) -> (Arc<Vec<Asset>>, bool) {
         let key = normalize(path);
         if let Ok(cache) = self.listings.lock() {
             if let Some((when, rows)) = cache.get(&key) {
@@ -67,6 +76,7 @@ impl ListingService {
             if let Ok(context) = db::folder_disk_context(&self.db, folder_ids) {
                 for (_, _, assets) in context { rows.extend(assets.into_iter().filter(|a| !a.ext.is_empty() && !self.formats.is_hidden(&a.ext)).map(|mut a| { a.offline = true; a })); }
             }
+            let rows = Arc::new(rows);
             if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
             return (rows, true);
         }};
@@ -107,6 +117,7 @@ impl ListingService {
             rows.push(asset);
         }
         rows.sort_by(|a,b| a.is_directory.cmp(&b.is_directory).reverse().then_with(||a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.id.cmp(&b.id)));
+        let rows = Arc::new(rows);
         if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
         (rows, false)
     }
@@ -127,12 +138,22 @@ impl ListingService {
     pub fn uncatalogued_files(&self, filter: &AssetFilter) -> Result<(String, Vec<Asset>), String> {
         let (path, ids) = self.folder_of_filter(filter)?;
         let (rows, _) = self.list(&path, &ids);
-        Ok((path, rows.into_iter().filter(|a| !a.is_directory && a.id < 0 && !a.ext.is_empty() && a.path.is_some()).collect()))
+        Ok((path, rows.iter().filter(|a| !a.is_directory && a.id < 0 && !a.ext.is_empty() && a.path.is_some()).cloned().collect()))
     }
 
     pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
         let (path, ids) = self.folder_of_filter(filter)?;
-        let (mut rows, _) = self.list(&path, &ids);
+        let (source, _) = self.list(&path, &ids);
+        // Pagination and display-only fields do not change the filtered order.
+        let mut key_filter = filter.clone();
+        key_filter.offset = 0; key_filter.limit = 0;
+        key_filter.include_categories = false; key_filter.include_keywords = false;
+        let key = serde_json::to_string(&key_filter).map_err(|e| e.to_string())?;
+        let cached = self.prepared.lock().map_err(|_| "prepared listing cache poisoned")?
+            .as_ref().filter(|p| p.key == key && Arc::ptr_eq(&p.source, &source))
+            .map(|p| (p.rows.clone(), p.total_size));
+        let (rows, total_size) = if let Some(cached) = cached { cached } else {
+        let mut rows = source.as_ref().clone();
         rows.retain(|a| a.is_directory || (!a.ext.is_empty() && !self.formats.is_hidden(&a.ext)));
         if let Some(q) = filter.query.as_deref().filter(|q| !q.trim().is_empty()) { let q=q.to_lowercase(); rows.retain(|a|a.is_directory||a.name.to_lowercase().contains(&q)||a.caption.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))||a.notes.as_deref().is_some_and(|s|s.to_lowercase().contains(&q))); }
         rows.retain(|a| a.is_directory || db::asset_filter_matches(a, filter, &self.formats));
@@ -143,9 +164,16 @@ impl ListingService {
         dirs.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         files.sort_by(ordering);
         dirs.extend(files);
-        let total = dirs.len() as i64; let total_size=dirs.iter().filter(|a|!a.is_directory).map(|a|a.size.unwrap_or(0.0)).sum();
+        let total_size=dirs.iter().filter(|a|!a.is_directory).map(|a|a.size.unwrap_or(0.0)).sum();
+        let rows = Arc::new(dirs);
+        *self.prepared.lock().map_err(|_| "prepared listing cache poisoned")? = Some(PreparedListing { source, key, rows: rows.clone(), total_size });
+        (rows, total_size)
+        };
+        let total = rows.len() as i64;
         let offset=filter.offset.max(0) as usize; let limit=filter.limit.clamp(1,500) as usize;
-        let mut items=dirs.into_iter().skip(offset).take(limit).collect::<Vec<_>>();
+        let start=offset.min(rows.len());
+        let end=start.saturating_add(limit).min(rows.len());
+        let mut items=rows[start..end].to_vec();
         db::attach_display_values(&self.db,&mut items,filter.include_categories,filter.include_keywords).map_err(|e|e.to_string())?;
         Ok(AssetPage { items, total, total_size })
     }
@@ -181,6 +209,45 @@ impl ListingService {
         let root_id=chain.last().and_then(|f|f.root_id);
         chain.push(db::Folder{id,parent_id:Some(parent),root_id,name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false});
         Ok(chain)
+    }
+}
+
+#[cfg(test)]
+mod listing_cache_tests {
+    use super::*;
+    use rusqlite::Connection;
+    use std::sync::Mutex;
+
+    fn asset(id: i64, name: &str, is_directory: bool, size: f64) -> Asset {
+        serde_json::from_value(serde_json::json!({"id":id,"name":name,"ext":if is_directory { "" } else { "jpg" },"isDirectory":is_directory,"size":size})).unwrap()
+    }
+
+    #[test]
+    fn pages_reuse_order_but_filters_and_invalidation_refresh_it() {
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let service = ListingService::new(db, FormatTable::load_selected(None));
+        let path = "C:\\photos";
+        let source = Arc::new(vec![asset(-1,"folder",true,0.0), asset(-2,"b.jpg",false,20.0), asset(-3,"a.jpg",false,10.0)]);
+        service.listings.lock().unwrap().insert(normalize(path), (std::time::Instant::now(), source));
+        let mut filter: AssetFilter = serde_json::from_value(serde_json::json!({"kind":"folder","folderPath":path,"sort":"name","descending":false,"offset":0,"limit":2})).unwrap();
+        let first = service.page(&filter).unwrap();
+        assert_eq!(first.items.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["folder", "a.jpg"]);
+        assert_eq!((first.total, first.total_size), (3, 30.0));
+        let prepared = service.prepared.lock().unwrap().as_ref().unwrap().rows.clone();
+        filter.offset = 2; filter.limit = 1; filter.include_categories = true;
+        let second = service.page(&filter).unwrap();
+        assert_eq!(second.items[0].name, "b.jpg");
+        assert!(Arc::ptr_eq(&prepared, &service.prepared.lock().unwrap().as_ref().unwrap().rows));
+        filter.query = Some("b.jpg".into()); filter.offset = 0;
+        let filtered = service.page(&filter).unwrap();
+        assert_eq!((filtered.total, filtered.total_size), (2, 20.0));
+        assert!(!Arc::ptr_eq(&prepared, &service.prepared.lock().unwrap().as_ref().unwrap().rows));
+        service.invalidate_path(path).unwrap();
+        assert!(service.prepared.lock().unwrap().is_none());
+        service.listings.lock().unwrap().insert(normalize(path), (std::time::Instant::now(), Arc::new(vec![asset(-4,"new.jpg",false,7.0)])));
+        filter.query = None;
+        let refreshed = service.page(&filter).unwrap();
+        assert_eq!((refreshed.total, refreshed.total_size, refreshed.items[0].name.as_str()), (1, 7.0, "new.jpg"));
     }
 }
 
