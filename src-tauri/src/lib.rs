@@ -6,6 +6,7 @@ mod colors;
 mod db;
 mod display_metadata;
 mod exiftool;
+mod exif_index;
 mod file_ops;
 mod formats;
 mod folder_rules;
@@ -57,6 +58,7 @@ pub fn run() {
     writer.set_change_hook(Arc::new(move|kinds|for kind in kinds { journal_ai.sync_labels_debounced(kind); }));
     let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
     let _=ai_service.ensure_colors_attached();
+    let auto_exif = exif_index::ExifIndex::new(paths.catalog.clone(),paths.exiftool.clone(),formats.clone(),&db);
     let setup_ai = ai_service.clone();
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
@@ -64,6 +66,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| { setup_ai.set_app(app.handle().clone()); Ok(()) })
+        .manage(commands::AutoExifState(auto_exif))
         .manage(DatabaseState(db))
         .manage(commands::BackgroundDbState(background_db))
         .manage(ExifState(exif))
@@ -137,6 +140,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_app_info,
+            commands::auto_categories,
             commands::ai_status,
             commands::ai_start,
             commands::ai_stop,

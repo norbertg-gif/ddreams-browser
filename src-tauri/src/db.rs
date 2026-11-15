@@ -466,6 +466,13 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         where_sql.push_str(" AND a.id=m.asset_id");
     }
     match filter.kind.as_str() {
+        "auto" => {
+            let pair=filter.value.as_deref().and_then(|v|v.split_once('\t'));
+            if let Some((field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(field,value))) {
+                where_sql.push_str(&format!(" AND a.id IN (SELECT asset_id FROM auto_exif.exif_index WHERE {field}=?)"));
+                match field { "iso"|"focal"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture"|"exposure" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
+            } else { where_sql.push_str(" AND 0"); }
+        }
         "folder" => {
             if let Some(ids) = filter.ids.as_ref().filter(|ids| !ids.is_empty()) {
                 where_sql.push_str(&format!(" AND a.folder_id IN ({})", vec!["?"; ids.len()].join(",")));
@@ -662,6 +669,13 @@ pub fn asset_ids_page(
         where_sql.push_str(" AND a.id=m.asset_id");
     }
     match filter.kind.as_str() {
+        "auto" => {
+            let pair=filter.value.as_deref().and_then(|v|v.split_once('\t'));
+            if let Some((field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(field,value))) {
+                where_sql.push_str(&format!(" AND a.id IN (SELECT asset_id FROM auto_exif.exif_index WHERE {field}=?)"));
+                match field { "iso"|"focal"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture"|"exposure" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
+            } else { where_sql.push_str(" AND 0"); }
+        }
         "folder" => {
             if let Some(ids) = filter.ids.as_ref().filter(|ids| !ids.is_empty()) {
                 where_sql.push_str(&format!(" AND a.folder_id IN ({})", vec!["?"; ids.len()].join(",")));
@@ -1109,6 +1123,14 @@ mod feature_tests {
         assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
+    #[test]
+    fn auto_category_view_filters_and_pages_catalog() {
+        let db=test_db();
+        { let c=db.lock().unwrap(); c.execute_batch("ATTACH DATABASE ':memory:' AS auto_exif; CREATE TABLE auto_exif.exif_index(asset_id INTEGER PRIMARY KEY,camera TEXT); INSERT INTO assets(id,name,ext,ext_lower,is_listed,path) VALUES(1,'one.jpg','jpg','jpg',1,'one'),(2,'two.jpg','jpg','jpg',1,'two'),(3,'three.jpg','jpg','jpg',1,'three'); INSERT INTO auto_exif.exif_index VALUES(1,'Canon'),(2,'Nikon'),(3,'Canon');").unwrap(); }
+        let formats=FormatTable::load_selected(None);let mut filter=test_filter("auto","camera\tCanon");filter.limit=1;
+        let page=assets_page(&db,&filter,&formats).unwrap();assert_eq!(page.total,2);assert_eq!(page.items.len(),1);
+        assert_eq!(asset_ids_page(&db,&filter,&formats,0,100).unwrap().len(),2);
+    }
     #[test] fn special_items_use_listed_photos_and_relationships(){
         let db=test_db();db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,size,tagged,rating) VALUES(1,'a.jpg','jpg','jpg',1,10,1,4),(2,'b.doc','doc','doc',1,20,0,5),(3,'gone.jpg','jpg','jpg',0,30,1,3),(4,'d.png','png','png',1,40,0,NULL);INSERT INTO asset_categories VALUES(1,9),(2,9);INSERT INTO asset_keywords VALUES(1,8);").unwrap();
         for (kind,count) in [("all_photos",2),("uncategorized",1),("unkeyworded",1),("tagged",1)] { assert_eq!(assets_page(&db,&test_filter("special",kind),&FormatTable::parse(include_str!("../formats.json")).unwrap()).unwrap().total,count,"{kind}"); }

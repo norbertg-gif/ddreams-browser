@@ -21,6 +21,9 @@ use tauri::Emitter;
 use rusqlite::OptionalExtension;
 
 pub struct DatabaseState(pub Db);
+pub struct AutoExifState(pub Arc<crate::exif_index::ExifIndex>);
+#[tauri::command(async)]
+pub fn auto_categories(state: State<'_, AutoExifState>) -> Result<(Vec<crate::exif_index::Group>, crate::exif_index::Progress), String> { state.0.snapshot() }
 /// Second, read-only connection for side-panel data (counts, trees, folder previews, calendar).
 /// WAL lets it read while the main connection serves the folder listing, so background loading
 /// never makes the grid wait for the catalogue lock.
