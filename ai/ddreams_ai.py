@@ -458,7 +458,6 @@ class AIService:
                  embedder_factory: Callable[[str | os.PathLike[str]], Any] | None = None,
                  decoder: Callable[[dict[str, Any]], Any] = decode_photo,
                  output: Callable[[dict[str, Any]], None] | None = None,
-                 seed_colors: str | os.PathLike[str] | None = None,
                  face_detector: Any = None, face_encoder: Any = None):
         self.db_path = str(db_path)
         self.model_dir = str(model_dir)
@@ -511,7 +510,7 @@ class AIService:
         if color_meta:
             self.color_thresholds = json.loads(color_meta)
         else:
-            self.color_thresholds = self._seed_color_thresholds(seed_colors)
+            self.color_thresholds = learn_thresholds({})
             self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('color_thresholds',?)", (json.dumps(self.color_thresholds, ensure_ascii=False),))
         self.db.commit()
         self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
@@ -545,29 +544,6 @@ class AIService:
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
         self._face_worker: threading.Thread | None = None
-
-    def _seed_color_thresholds(self, seed_dir: str | os.PathLike[str] | None) -> dict[str, dict[str, float | int]]:
-        previous = {}
-        root = Path(seed_dir) if seed_dir else None
-        if root:
-            try:
-                data = json.loads((root / "color_thresholds.json").read_text(encoding="utf-8"))
-                previous = {color: data[color] for color in COLOR_PALETTE if isinstance(data.get(color), dict)}
-            except (OSError, ValueError, TypeError):
-                previous = {}
-        if previous:
-            return {color: {"default": COLOR_DEFAULTS[color], "threshold": float(previous.get(color, {}).get("threshold", COLOR_DEFAULTS[color])),
-                            "examples": int(previous.get(color, {}).get("examples", 0)), "positive": int(previous.get(color, {}).get("positive", 0)),
-                            "negative": int(previous.get(color, {}).get("negative", 0))} for color in COLOR_PALETTE}
-        if root:
-            try:
-                corrections = json.loads((root / "color_corrections.json").read_text(encoding="utf-8"))
-                samples = {color: [(float(row.get("shares", {}).get(color, 0)), color in row.get("colors", []))
-                                   for row in corrections.values() if isinstance(row, dict)] for color in COLOR_PALETTE}
-                return learn_thresholds(samples)
-            except (OSError, ValueError, TypeError, AttributeError):
-                pass
-        return learn_thresholds({})
 
     def _emit(self, obj: dict[str, Any]) -> None:
         try:
@@ -2305,7 +2281,6 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DDreams local SigLIP2 JSON-lines server")
     parser.add_argument("--model", required=True, help="Lokálny priečinok modelu")
     parser.add_argument("--db", required=True, help="Cesta k databáze ai.sqlite")
-    parser.add_argument("--seed-colors", help="Priečinok learned s fotofarbnými korekciami")
     args = parser.parse_args(argv)
     os.environ["HF_HUB_OFFLINE"] = "1"
     try:
@@ -2315,7 +2290,7 @@ def _main(argv: list[str] | None = None) -> int:
     except (AttributeError, OSError):
         pass
     try:
-        AIService(args.db, args.model, seed_colors=args.seed_colors).serve()
+        AIService(args.db, args.model).serve()
         return 0
     except Exception as exc:
         _stderr(f"Fatálna chyba servera: {exc}")

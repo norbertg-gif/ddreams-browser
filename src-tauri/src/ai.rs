@@ -96,7 +96,6 @@ impl AiService {
 
     fn has_colors_table(&self)->bool{self.0.db.lock().ok().and_then(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).ok()).unwrap_or(false)}
 
-    pub fn photosort_corrections_path(&self) -> Option<PathBuf> { self.0.paths.ai_seed_colors.as_ref().map(|path|path.join("color_corrections.json")) }
 
     pub fn learn_colors_debounced(&self) {
         let generation=self.0.color_learn_generation.fetch_add(1,Ordering::Relaxed)+1;
@@ -134,7 +133,6 @@ impl AiService {
         }
         let mut command = Command::new(python);
         command.arg("-I").arg(&self.0.paths.ai_script).arg("--model").arg(&self.0.paths.ai_model).arg("--db").arg(&self.0.paths.ai_db);
-        if let Some(seed) = &self.0.paths.ai_seed_colors { command.arg("--seed-colors").arg(seed); }
         command
             .env("PYTHONIOENCODING", "utf-8").env("HF_HUB_OFFLINE", "1")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());

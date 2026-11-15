@@ -182,8 +182,6 @@ pub fn run() {
             commands::get_color_counts,
             commands::get_asset_quality,
             commands::get_quality_counts,
-            commands::import_photosort_colors,
-            commands::get_photosort_color_import_status,
             commands::get_recent_changes,
             commands::undo_last_change,
             commands::get_file_operation_conflicts,

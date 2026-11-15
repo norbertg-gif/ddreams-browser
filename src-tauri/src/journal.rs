@@ -236,21 +236,6 @@ impl CatalogWriter {
         Ok(count)
     }
 
-    pub fn import_asset_colors(&self, rows: &[(i64,String,bool)], summary: &str) -> Result<usize,String> {
-        self.require_write()?;
-        let mut change=ChangeBuilder{action:"import_photosort_colors".into(),summary:summary.into(),items:Vec::new()};
-        let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
-        self.rules.guard(&conn,&rows.iter().map(|row|row.0).collect::<Vec<_>>(),&[])?;
-        for (id,color,state) in rows {
-            let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
-            if !listed {continue;}
-            let old:Option<i64>=conn.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-            let new_value=Value::from(if *state {1} else {0});let old_value=old.map(Value::from).unwrap_or(Value::Null);
-            if old_value!=new_value {change.record("asset_color_overrides",&format!("{id}:{color}"),"__exists__",old_value,new_value);}
-        }
-        drop(conn);let count=change.items.len();if count>0{self.commit_change(change)?;}Ok(count)
-    }
-
     pub fn commit_change(&self, change: ChangeBuilder) -> Result<i64, String> {
         self.require_write()?;
         if change.items.is_empty() { return Err("A change must contain at least one item".into()); }

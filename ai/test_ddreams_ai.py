@@ -477,37 +477,6 @@ class ServerTests(unittest.TestCase):
         floor_cutoff = text_probability_cutoff(0.015)
         self.assertEqual([p for p in probs if p >= floor_cutoff], [0.39, 0.16, 0.074, 0.015, 0.006])
 
-    def test_color_algorithm_matches_photosort_synthetic(self):
-        import sys
-        photosort = Path(r"G:\Programovanie\photosort")
-        if not (photosort / "photosort/colors.py").exists(): self.skipTest("photosort source missing")
-        sys.path.insert(0, str(photosort))
-        from photosort.colors import dominant_colors as reference
-        for rgb in ((220, 20, 30), (130, 130, 130), (255, 255, 255), (0, 0, 0)):
-            image = Image.new("RGB", (12, 10), rgb)
-            expected, shares = reference(image, return_shares=True)
-            ours = palette_counts(image)
-            self.assertEqual(expected, dominant_colors(ours))
-            self.assertEqual(set(shares), set(ours))
-            for key in shares: self.assertAlmostEqual(shares[key], ours[key], places=7)
-
-    def test_learned_thresholds_match_photosort_corrections(self):
-        import sys
-        root = Path(r"G:\Programovanie\photosort")
-        corrections_path = root / "learned/color_corrections.json"
-        if not corrections_path.exists(): self.skipTest("photosort learned corrections missing")
-        sys.path.insert(0, str(root))
-        from photosort.colors import learn_color_thresholds as reference
-        corrections = json.loads(corrections_path.read_text(encoding="utf-8"))
-        samples = {color: [(float(row.get("shares", {}).get(color, 0)), color in row.get("colors", []))
-                           for row in corrections.values() if isinstance(row, dict)] for color in COLOR_PALETTE}
-        expected = reference(corrections, path=self.root / "reference.json")
-        actual = learn_thresholds(samples)
-        self.assertEqual(set(expected), set(actual))
-        for color in expected:
-            self.assertAlmostEqual(expected[color]["threshold"], actual[color]["threshold"], places=12)
-            self.assertEqual(expected[color]["examples"], actual[color]["examples"])
-
     def test_unknown_command_and_bad_arguments(self):
         with self.assertRaisesRegex(RequestError, "Neznámy príkaz"):
             self.service.execute({"cmd": "not-a-command"})

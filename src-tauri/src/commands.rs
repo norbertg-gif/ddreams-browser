@@ -284,13 +284,6 @@ pub struct AssetColorState { pub value:String,pub name:String,pub hex:String,pub
 #[derive(Serialize,Clone)]
 #[serde(rename_all="camelCase")]
 pub struct AssetColors { pub asset_id:i64,pub computed:bool,pub colors:Vec<AssetColorState> }
-#[derive(Serialize,Clone)]
-#[serde(rename_all="camelCase")]
-pub struct ColorImportResult { pub done:bool,pub matched:usize,pub ambiguous:usize,pub missing:usize }
-
-#[tauri::command(async)]
-pub fn get_photosort_color_import_status(db:State<'_,DatabaseState>)->bool{db.0.lock().ok().and_then(|conn|conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).ok()).unwrap_or(false)}
-
 #[tauri::command(async)]
 pub fn set_asset_colors(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,color:String,state:Option<bool>)->Result<usize,String>{let count=writer.0.set_asset_colors(&asset_ids,&color,state,"Oprava farby")?;if count>0{ai.0.learn_colors_debounced();}Ok(count)}
 
@@ -383,15 +376,6 @@ pub fn get_quality_counts(db:State<'_,BackgroundDbState>,ai:State<'_,AiState>)->
         }
     }
     Ok(["blur","over","under"].into_iter().map(|value|db::ValueCount{value:value.into(),count:*counts.get(value).unwrap_or(&0)}).collect())
-}
-
-#[tauri::command(async)]
-pub fn import_photosort_colors(db:State<'_,DatabaseState>,ai:State<'_,AiState>,writer:State<'_,CatalogWriterState>)->Result<ColorImportResult,String>{
-    let Some(path)=ai.0.photosort_corrections_path() else{return Err("Photosort learned prieÄinok nie je dostupnÃ½".into())};let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let done:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key='photosort_colors_imported')",[],|r|r.get(0)).unwrap_or(false);if done{return Ok(ColorImportResult{done:true,matched:0,ambiguous:0,missing:0});}
-    let input=std::fs::read_to_string(&path).map_err(|e|format!("Nepodarilo sa naÄÃ­taÅ¥ opravy Photosortu: {e}"))?;let corrections:serde_json::Map<String,Value>=serde_json::from_str(&input).map_err(|e|e.to_string())?;let rows=conn.prepare("SELECT id,name FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(conn);
-    let mut imported=Vec::new();let(mut matched,mut ambiguous,mut missing)=(0,0,0);
-    for(name,record)in corrections{match crate::colors::unique_name_match(&name,&rows){Ok(Some(id))=>{matched+=1;let colors=record.get("colors").and_then(Value::as_array).map(|v|v.iter().filter_map(Value::as_str).collect::<std::collections::HashSet<_>>()).unwrap_or_default();for c in crate::colors::PALETTE{imported.push((id,c.value.to_string(),colors.contains(c.value)));}},Ok(None)=>missing+=1,Err(())=>ambiguous+=1}}
-    writer.0.import_asset_colors(&imported,"Import farieb z photosortu")?;let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;conn.execute("INSERT OR REPLACE INTO ddreams_meta(key,value) VALUES('photosort_colors_imported','1')",[]).map_err(|e|e.to_string())?;drop(conn);ai.0.learn_colors_debounced();Ok(ColorImportResult{done:true,matched,ambiguous,missing})
 }
 
 #[tauri::command(async)]

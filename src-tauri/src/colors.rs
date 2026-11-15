@@ -19,12 +19,6 @@ pub fn effective_colors(auto: &[String], overrides: &[(String,i64)]) -> Vec<Stri
     result
 }
 
-pub fn unique_name_match(name:&str,candidates:&[(i64,String)])->Result<Option<i64>,()>{
-    let key=std::path::Path::new(name).file_name().and_then(|v|v.to_str()).unwrap_or(name).to_lowercase();
-    let mut found=candidates.iter().filter(|(_,candidate)|candidate.to_lowercase()==key).map(|(id,_)|*id);
-    let first=found.next();if found.next().is_some(){Err(())}else{Ok(first)}
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -33,12 +27,5 @@ mod tests {
         let auto=vec!["červená".to_string(),"zelená".to_string()];
         assert_eq!(effective_colors(&auto,&[("zelená".into(),0),("modrá".into(),1)]),vec!["červená","modrá"]);
         assert_eq!(effective_colors(&auto,&[]),auto);
-    }
-    #[test]
-    fn photosort_import_only_accepts_unique_case_insensitive_names(){
-        let rows=vec![(1,"Flower.JPG".into()),(2,"Other.jpg".into()),(3,"flower.jpg".into())];
-        assert_eq!(unique_name_match("other.JPG",&rows),Ok(Some(2)));
-        assert_eq!(unique_name_match("missing.jpg",&rows),Ok(None));
-        assert_eq!(unique_name_match("FLOWER.jpg",&rows),Err(()));
     }
 }
