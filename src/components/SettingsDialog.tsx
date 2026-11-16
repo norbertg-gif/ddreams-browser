@@ -9,6 +9,8 @@ type Props = {
   showOtherFiles: boolean;
   onShowOtherFiles: (value: boolean) => void;
   aiEnabled: boolean;
+  aiLoadModelAtStart: boolean;
+  onAiLoadModelAtStart: (value: boolean) => void;
   aiAvailable: boolean;
   aiStatusText: string;
   onToggleAi: () => void;
@@ -21,7 +23,7 @@ type MissingSource={path:string;assets:number;offline:boolean;missing:boolean};
 type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
 
 /** Application settings. Sections grow as features arrive. */
-export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
+export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiLoadModelAtStart, onAiLoadModelAtStart, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
@@ -127,6 +129,8 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
         <h3>AI</h3>
         {aiAvailable ? <>
           <label className="settings-check"><input type="checkbox" checked={aiEnabled} onChange={onToggleAi} /> Zapnúť AI (hľadanie obsahom, návrhy, farby, duplicity)</label>
+          <label className="settings-check"><input type="checkbox" checked={aiLoadModelAtStart} onChange={event => onAiLoadModelAtStart(event.target.checked)} /> Načítať AI model pri štarte</label>
+          <p className="settings-help">Zmena sa prejaví pri ďalšom zapnutí AI.</p>
           <p className="settings-help">{aiStatusText}. Vypnutím sa uvoľní pamäť grafickej karty.</p>
         </> : <p className="settings-help">AI modul nie je nainštalovaný.</p>}
       </section>

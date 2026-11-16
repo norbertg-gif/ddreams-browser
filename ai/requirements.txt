@@ -8,3 +8,8 @@ safetensors==0.8.0
 numpy==2.5.4
 pillow==13.0.0
 rawpy==0.27.1
+# tokenizer of the SigLIP2 text encoder (open_clip HFTokenizer)
+transformers==5.22.1
+tokenizers==0.23.3
+sentencepiece==0.2.2
+protobuf==7.36.2

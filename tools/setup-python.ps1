@@ -15,6 +15,6 @@ if (-not (Test-Path -LiteralPath $Python -PathType Leaf)) {
 }
 & $Python -m pip install --disable-pip-version-check -r (Join-Path $RepoRoot 'ai\requirements.txt')
 if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
-& $Python -c "import torch, open_clip, rawpy, PIL, numpy; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
+& $Python -c "import torch, open_clip, rawpy, PIL, numpy, transformers, sentencepiece; print('torch', torch.__version__, 'cuda', torch.cuda.is_available())"
 if ($LASTEXITCODE -ne 0) { throw 'import check failed' }
 Write-Output "Python environment ready: $Target"

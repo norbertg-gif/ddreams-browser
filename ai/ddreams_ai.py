@@ -453,12 +453,64 @@ class SiglipEmbedder:
             return {"results": result, "searched": len(self._ids)}
 
 
+class VectorIndex:
+    """Contiguous float16 vectors; snapshots keep their backing allocation alive."""
+    def __init__(self, ids: list[int], vectors: np.ndarray):
+        values = np.asarray(vectors, dtype=np.float16)
+        self.dimension = values.shape[1]
+        self.count = len(ids)
+        self.capacity = max(self.count, 1)
+        self.matrix = np.empty((self.capacity, self.dimension), dtype=np.float16)
+        self.matrix[:self.count] = values
+        self.ids = list(map(int, ids))
+        self.positions = {aid: i for i, aid in enumerate(self.ids)}
+
+    def snapshot(self):
+        return self.ids, self.matrix[:self.count], self.positions
+
+    def upsert(self, ids: list[int], vectors: np.ndarray) -> None:
+        missing = sum(int(aid) not in self.positions for aid in ids)
+        required = self.count + missing
+        if required > self.capacity:
+            self.capacity = max(required, self.capacity * 2)
+            matrix = np.empty((self.capacity, self.dimension), dtype=np.float16)
+            matrix[:self.count] = self.matrix[:self.count]
+            self.matrix = matrix
+        elif any(int(aid) in self.positions for aid in ids):
+            # Existing snapshots may be read by another query.
+            self.matrix = self.matrix.copy()
+        # Copy the ID structures so existing snapshots retain their mapping.
+        self.ids = self.ids.copy()
+        self.positions = self.positions.copy()
+        for aid, vector in zip(ids, vectors):
+            aid = int(aid)
+            pos = self.positions.get(aid)
+            if pos is None:
+                pos = self.count
+                self.count += 1
+                self.positions[aid] = pos
+                self.ids.append(aid)
+            self.matrix[pos] = vector
+
+    def remove(self, ids: set[int]) -> None:
+        keep = [i for i, aid in enumerate(self.ids) if aid not in ids]
+        if len(keep) == self.count:
+            return
+        self.ids = [self.ids[i] for i in keep]
+        self.count = len(keep)
+        self.capacity = max(self.count, 1)
+        matrix = np.empty((self.capacity, self.dimension), dtype=np.float16)
+        matrix[:self.count] = self.matrix[keep]
+        self.matrix = matrix
+        self.positions = {aid: i for i, aid in enumerate(self.ids)}
+
+
 class AIService:
     def __init__(self, db_path: str | os.PathLike[str], model_dir: str | os.PathLike[str], *,
                  embedder_factory: Callable[[str | os.PathLike[str]], Any] | None = None,
                  decoder: Callable[[dict[str, Any]], Any] = decode_photo,
                  output: Callable[[dict[str, Any]], None] | None = None,
-                 face_detector: Any = None, face_encoder: Any = None):
+                 face_detector: Any = None, face_encoder: Any = None, lazy_model: bool = False):
         self.db_path = str(db_path)
         self.model_dir = str(model_dir)
         self.model_name = MODEL_NAME
@@ -496,6 +548,7 @@ class AIService:
             CREATE TABLE IF NOT EXISTS cluster_ignored(id INTEGER PRIMARY KEY, vector BLOB NOT NULL, created REAL NOT NULL);
             CREATE TABLE IF NOT EXISTS map_points(asset_id INTEGER PRIMARY KEY, x REAL NOT NULL, y REAL NOT NULL, cluster INTEGER NOT NULL);
             CREATE TABLE IF NOT EXISTS map_clusters(id INTEGER PRIMARY KEY, x REAL NOT NULL, y REAL NOT NULL, r REAL NOT NULL, count INTEGER NOT NULL, name TEXT);
+            CREATE TABLE IF NOT EXISTS text_vectors(model TEXT NOT NULL, text TEXT NOT NULL, vector BLOB NOT NULL, PRIMARY KEY(model,text));
 
         """)
         self.db_lock = threading.RLock()
@@ -516,6 +569,11 @@ class AIService:
         self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
         self._condition = threading.Condition()
         self._model_ready = threading.Event()
+        self._lazy_model = lazy_model
+        self._model_started = False
+        self._vectors: VectorIndex | None = None
+        self._similar_logits: tuple[float, float] | None = None
+        self._similar_logits_checked = False
         self._model_error: str | None = None
         self._embedder: Any = None
         self._stop = False
@@ -541,6 +599,7 @@ class AIService:
         self._parents: dict[str, dict[int, int | None]] = {"category": {}, "keyword": {}}
         self._cluster_text_vectors: dict[str, np.ndarray] | None = None
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
+        self._vector_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-vector")
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
         self._face_worker: threading.Thread | None = None
@@ -552,13 +611,23 @@ class AIService:
             _stderr("Nepodarilo sa odoslať protokolovú správu")
 
     def start(self) -> None:
-        self._emit({"event": "status", **self.status()})
-        self._loader = threading.Thread(target=self._load_model, name="ai-model-loader", daemon=True)
         self._worker = threading.Thread(target=self._index_loop, name="ai-indexer", daemon=True)
         self._face_worker = threading.Thread(target=self._face_scan_loop, name="ai-face-scan", daemon=True)
-        self._loader.start()
+        if not self._lazy_model:
+            self._start_model()
+        else:
+            self._emit({"event": "status", **self.status()})
         self._worker.start()
         self._face_worker.start()
+
+    def _start_model(self) -> None:
+        with self._condition:
+            if self._model_started or self._stop:
+                return
+            self._model_started = True
+            self._loader = threading.Thread(target=self._load_model, name="ai-model-loader", daemon=True)
+            self._loader.start()
+        self._emit({"event": "status", **self.status()})
 
     def _load_model(self) -> None:
         started = time.perf_counter()
@@ -567,16 +636,11 @@ class AIService:
             embedder = self.embedder_factory(self.model_dir)
             self._device = str(getattr(embedder, "device", self._device))
             with self.db_lock:
-                rows = self.db.execute("SELECT asset_id,vector FROM embeddings WHERE model=? AND dim=? ORDER BY asset_id", (self.model_name, DIMENSION)).fetchall()
-            ids = [int(row[0]) for row in rows]
-            vectors = np.empty((len(rows), DIMENSION), dtype=np.float16)
-            for index, row in enumerate(rows):
-                vectors[index] = np.frombuffer(row[1], dtype=np.float16)
-            embedder.replace_index(ids, vectors)
-            del rows, vectors
+                index = self._ensure_vector_index()
+                ids, matrix, _ = index.snapshot()
+                embedder.replace_index(ids, matrix)
+                self._embedder = embedder
             gc.collect()
-            self._embedder = embedder
-            self.indexed_count = len(ids)
             self._model_ready.set()
             self._model_load_s = round(time.perf_counter() - started, 3)
             ready_status = self.status()
@@ -607,12 +671,12 @@ class AIService:
     def status(self) -> dict[str, Any]:
         with self._condition:
             if self._model_error:
-                state = "error"
+                state = "ready" if self._lazy_model else "error"
             elif self._paused:
                 state = "paused"
-            elif not self._model_ready.is_set():
+            elif self._model_started and not self._model_ready.is_set() and not self._lazy_model:
                 state = "loading"
-            elif self._active or self._queue or self._quality_queue:
+            elif self._model_ready.is_set() and (self._active or self._queue or self._quality_queue):
                 state = "indexing"
             else:
                 state = "ready"
@@ -628,7 +692,9 @@ class AIService:
                         faces["scanned"] = int(self.faces_db.execute("SELECT count(*) FROM face_scan").fetchone()[0])
                 except sqlite3.Error:
                     pass
-            return {"state": state, "indexed": self.indexed_count, "queued": queued, "done": self._done,
+            model_state = "error" if self._model_error else "ready" if self._model_ready.is_set() else "loading" if self._model_started else "unloaded"
+            waiting = len({item["asset_id"] for item in self._queue + self._quality_queue} | {item["asset_id"] for item in self._face_scan_queue} | self._face_active_ids)
+            return {"state": state, "model_state": model_state, "waiting": waiting, "indexed": self.indexed_count, "queued": queued, "done": self._done,
                     "failed": self._failed, "offline": self._offline, "rate_per_s": round(rate, 3),
                     "eta_s": round(eta, 1) if eta is not None else None, "last_error": self._last_error, "faces": faces}
 
@@ -713,6 +779,10 @@ class AIService:
             self.db.commit()
         if removed and self._embedder is not None:
             self._embedder.remove_index(list(current - ids))
+        if removed:
+            with self.db_lock:
+                if self._vectors is not None:
+                    self._vectors.remove(current - ids)
         if prune and self.faces_db is not None:
             with self.faces_lock:
                 known_faces = {int(row[0]) for row in self.faces_db.execute("SELECT asset_id FROM face_scan UNION SELECT DISTINCT asset_id FROM faces")}
@@ -765,6 +835,7 @@ class AIService:
                 self._started_at = time.monotonic() if queued else None
                 self._last_error = None
             self._condition.notify_all()
+        self._emit({"event": "status", **self.status()})
         return {"queued": len(queued), "up_to_date": upto, "failed_before": failed_before, "pruned": removed}
 
     def _forget_command(self, request: dict[str, Any]) -> dict[str, Any]:
@@ -787,6 +858,9 @@ class AIService:
             self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
         if known and self._embedder is not None:
             self._embedder.remove_index(list(known))
+        with self.db_lock:
+            if self._vectors is not None:
+                self._vectors.remove(forget)
         if self.faces_db is not None:
             with self.faces_lock:
                 for start in range(0, len(asset_ids), 500):
@@ -811,6 +885,48 @@ class AIService:
             self._total = max(0, self._total - (before - len(self._queue)) - (before_quality - len(self._quality_queue)))
             self._condition.notify_all()
         return {"forgotten": len(known)}
+
+    def _light_sync(self, request: dict[str, Any]) -> dict[str, Any]:
+        asset_ids = request.get("asset_ids")
+        if not isinstance(asset_ids, list) or not asset_ids or any(isinstance(a, bool) or not isinstance(a, int) or a <= 0 for a in asset_ids):
+            raise RequestError("asset_ids musí byť neprázdny zoznam kladných ID")
+        listed = set(asset_ids)
+        with self.db_lock:
+            embedded = {int(r[0]) for r in self.db.execute("SELECT asset_id FROM embeddings WHERE model=? AND dim=?", (self.model_name, DIMENSION))}
+            failures = {int(r[0]) for r in self.db.execute("SELECT asset_id FROM failures")}
+            colors = {int(r[0]) for r in self.db.execute("SELECT asset_id FROM colors WHERE version=?", (COLOR_VERSION,))}
+            quality = {int(r[0]) for r in self.db.execute("SELECT asset_id FROM quality WHERE version=?", (QUALITY_VERSION,))}
+            known = set()
+            for table in ("embeddings", "failures", "colors", "quality"):
+                known.update(int(r[0]) for r in self.db.execute(f"SELECT asset_id FROM {table}"))
+        scanned = set()
+        if self.faces_db is not None:
+            with self.faces_lock:
+                scanned = {int(r[0]) for r in self.faces_db.execute("SELECT asset_id FROM face_scan WHERE version=?", (FACE_VERSION,))}
+        vanished = known - listed
+        if vanished:
+            vanished_ids = list(vanished)
+            with self.db_lock:
+                for start in range(0, len(vanished_ids), 500):
+                    chunk = vanished_ids[start:start + 500]
+                    marks = ",".join("?" for _ in chunk)
+                    for table in ("embeddings", "failures", "colors", "quality"):
+                        self.db.execute(f"DELETE FROM {table} WHERE asset_id IN ({marks})", chunk)
+                self.db.commit()
+                self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
+            if self._embedder is not None:
+                self._embedder.remove_index(list(vanished))
+            with self.db_lock:
+                if self._vectors is not None:
+                    self._vectors.remove(vanished)
+            with self._condition:
+                self._queue = [item for item in self._queue if item["asset_id"] not in vanished]
+                self._quality_queue = [item for item in self._quality_queue if item["asset_id"] not in vanished]
+                self._face_scan_queue = deque(item for item in self._face_scan_queue if item["asset_id"] not in vanished)
+        needs_vectors = listed - embedded - failures
+        needs_metadata = listed - (colors & quality)
+        needs_faces = listed - scanned if self.faces_db is not None else set()
+        return {"asset_ids": sorted(needs_vectors | needs_metadata | needs_faces), "pruned": len(vanished)}
 
     def _index_loop(self) -> None:
         _set_background_priority()
@@ -887,7 +1003,7 @@ class AIService:
         _set_background_priority()
         while True:
             with self._condition:
-                while not self._stop and (self._paused or not self._face_scan_queue):
+                while not self._stop and (self._paused or not self._model_ready.is_set() or self._model_error or not self._face_scan_queue):
                     self._condition.wait(timeout=0.5)
                 if self._stop:
                     return
@@ -923,6 +1039,23 @@ class AIService:
                 if emit_progress: self._emit({"event": "status", **self.status()})
             except Exception as exc:
                 _stderr(f"Sken tvárí pre {item['asset_id']} zlyhal: {exc}")
+                # Do not mark a missing or changed file: it must be retried when available.
+                try:
+                    if isinstance(exc, FileNotFoundError) or getattr(exc, "winerror", None) in {21, 53, 67, 1167}:
+                        continue
+                    stat = os.stat(item["path"])
+                    if stat.st_size == item["size"] and stat.st_mtime_ns == item["mtime_ns"] and self.faces_db is not None:
+                        with self.faces_lock:
+                            self.faces_db.rollback()
+                            self.faces_db.execute("""INSERT INTO face_scan(asset_id,size,mtime_ns,version,faces) VALUES(?,?,?,?,?)
+                                ON CONFLICT(asset_id) DO UPDATE SET size=excluded.size,mtime_ns=excluded.mtime_ns,version=excluded.version,faces=0
+                                WHERE face_scan.size IS NOT excluded.size OR face_scan.mtime_ns IS NOT excluded.mtime_ns OR face_scan.version IS NOT excluded.version""",
+                                                  (item["asset_id"], item["size"], item["mtime_ns"], FACE_VERSION, 0))
+                            self.faces_db.commit()
+                except OSError:
+                    pass
+                except sqlite3.Error as error:
+                    _stderr(f"Záznam neúspešného skenu sa nepodaril: {error}")
             finally:
                 with self._condition:
                     self._face_active_ids.discard(item["asset_id"])
@@ -1366,6 +1499,8 @@ class AIService:
                 new_indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
                 if success:
                     self._embedder.upsert_index([item["asset_id"] for item, _ in success], np.stack([vec for _, vec in success]))
+                    if self._vectors is not None:
+                        self._vectors.upsert([item["asset_id"] for item, _ in success], np.stack([vec for _, vec in success]))
         for image in decoded:
             close = getattr(image, "close", None)
             if close:
@@ -1455,17 +1590,42 @@ class AIService:
             self._parents[kind] = parents
         return {"assets": len(labels), "assignments": sum(map(len, labels.values())), "labels": len(parents)}
 
+    def _ensure_vector_index(self) -> VectorIndex:
+        if self._vectors is None:
+            rows = self.db.execute("SELECT asset_id,vector FROM embeddings WHERE model=? AND dim=? ORDER BY asset_id", (self.model_name, DIMENSION)).fetchall()
+            values = np.empty((len(rows), DIMENSION), dtype=np.float16)
+            for i, (_, blob) in enumerate(rows): values[i] = np.frombuffer(blob, dtype=np.float16)
+            self._vectors = VectorIndex([int(aid) for aid, _ in rows], values)
+        return self._vectors
+
     def _index_snapshot(self) -> tuple[list[int], Any, dict[int, int]]:
-        embedder = self._wait_model()
-        with getattr(embedder, "_lock", self._lock):
-            if not hasattr(embedder, "_ids"):
-                matrix = {int(a): np.asarray(v, dtype=np.float32) for a, v in embedder.vectors.items()}
-                ids = list(matrix)
-            else:
-                ids = [int(x) for x in embedder._ids]
-                matrix = embedder._matrix
-            positions = {aid: i for i, aid in enumerate(ids)}
-        return ids, matrix, positions
+        with self.db_lock:
+            index = self._ensure_vector_index()
+            embedder = self._embedder
+            if embedder is not None and str(getattr(embedder, "device", "")).startswith("cuda") and hasattr(embedder, "torch"):
+                with embedder._lock:
+                    ids = [int(aid) for aid in embedder._ids]
+                    return ids, embedder._matrix, {aid: i for i, aid in enumerate(ids)}
+            return index.snapshot()
+
+    def _similar_probability(self, score: float) -> float | None:
+        if not self._similar_logits_checked:
+            with self._lock:
+                if not self._similar_logits_checked:
+                    try:
+                        from safetensors import safe_open
+                        with safe_open(str(Path(self.model_dir) / "open_clip_model.fp16.safetensors"), framework="numpy") as weights:
+                            scale = float(np.exp(np.float32(weights.get_tensor("logit_scale").item())))
+                            bias = float(weights.get_tensor("logit_bias").item())
+                        self._similar_logits = (scale, bias)
+                    except Exception:
+                        pass
+                    self._similar_logits_checked = True
+        if self._similar_logits is None:
+            return None
+        scale, bias = self._similar_logits
+        value = np.float32(scale) * np.float32(score) + np.float32(bias)
+        return float(1.0 / (1.0 + np.exp(-np.clip(value, -80, 80))))
 
     @staticmethod
     def _ancestors(label_id: int, parents: dict[int, int | None]) -> set[int]:
@@ -1482,11 +1642,9 @@ class AIService:
         ids, matrix, positions = index
         if query_id not in positions or not candidates:
             return []
-        if isinstance(matrix, dict):
-            query = matrix.get(query_id)
-            if query is None:
-                return []
-            sims = np.asarray([float(np.dot(query, matrix[aid])) for aid in candidates], dtype=np.float32)
+        if isinstance(matrix, np.ndarray):
+            query = matrix[positions[query_id]].astype(np.float32)
+            sims = (matrix[[positions[aid] for aid in candidates]].astype(np.float32) @ query).astype(np.float16).astype(np.float32)
             try:
                 sims[candidates.index(query_id)] = -np.inf
             except ValueError:
@@ -1579,11 +1737,11 @@ class AIService:
         ids, matrix, positions = index
         targets = [aid for aid in targets if aid in indexed]
         if candidates:
-            if isinstance(matrix, dict):
-                candidate_matrix = np.stack([matrix[aid] for aid in candidates])
+            if isinstance(matrix, np.ndarray):
+                candidate_matrix = matrix[[positions[aid] for aid in candidates]].astype(np.float32)
                 for start in range(0, len(targets), SUGGEST_BATCH_CHUNK):
                     block = targets[start:start + SUGGEST_BATCH_CHUNK]
-                    scores = np.stack([matrix[aid] for aid in block]) @ candidate_matrix.T
+                    scores = (matrix[[positions[aid] for aid in block]].astype(np.float32) @ candidate_matrix.T).astype(np.float16).astype(np.float32)
                     self._collect_batch_groups(block, candidates, scores, labels, parents, float(minimum), groups)
             else:
                 torch = self._embedder.torch
@@ -1607,23 +1765,26 @@ class AIService:
         return values / np.maximum(norms, 1e-12)
 
     def _cluster_names(self) -> dict[str, np.ndarray] | None:
-        if self._cluster_text_vectors is not None:
-            return self._cluster_text_vectors
         try:
-            embedder = self._wait_model()
+            with self.db_lock:
+                vectors = {text: np.frombuffer(blob, dtype=np.float16).astype(np.float32) for text, blob in
+                           self.db.execute("SELECT text,vector FROM text_vectors WHERE model=?", (self.model_name,))}
+            embedder = self._embedder
             get_text_vector = getattr(embedder, "_text_vector", None)
-            if get_text_vector is None:
-                return None
-            vectors = {}
             for word in CLUSTER_VOCABULARY:
-                value = get_text_vector(f"a photo of {word}")
+                text = f"a photo of {word}"
+                if text in vectors or get_text_vector is None: continue
+                value = get_text_vector(text)
                 if hasattr(value, "float"):
                     value = value.float().cpu().numpy()
-                vectors[word] = np.asarray(value, dtype=np.float32).reshape(-1)
-            with self._lock:
-                if self._cluster_text_vectors is None:
-                    self._cluster_text_vectors = vectors
-                return self._cluster_text_vectors
+                value = np.asarray(value, dtype=np.float16).reshape(-1)
+                with self.db_lock:
+                    self.db.execute("INSERT OR REPLACE INTO text_vectors(model,text,vector) VALUES(?,?,?)", (self.model_name, text, value.tobytes()))
+                    self.db.commit()
+                vectors[text] = value.astype(np.float32)
+            if any(f"a photo of {word}" not in vectors for word in CLUSTER_VOCABULARY):
+                return None
+            return {word: vectors[f"a photo of {word}"] for word in CLUSTER_VOCABULARY}
         except Exception:
             return None
 
@@ -1727,8 +1888,9 @@ class AIService:
             return {"points": 0, "clusters": 0, "seconds": time.monotonic()-started}
         k = max(8, min(600, int(round(1.5 * np.sqrt(n)))))
         if n < k: k = n
-        if isinstance(matrix, dict):
-            vectors = self._normalise_rows(np.stack([matrix[aid] for aid in ids]))
+        if isinstance(matrix, np.ndarray):
+            ordered = [positions[aid] for aid in ids]
+            vectors = self._normalise_rows(matrix if ordered == list(range(n)) else matrix[ordered])
             centers = vectors[np.linspace(0, n-1, k, dtype=np.int64)].copy()
             for _ in range(MAP_ITERATIONS):
                 assignment = np.argmax(vectors @ centers.T, axis=1)
@@ -1800,8 +1962,9 @@ class AIService:
         n = len(targets)
         k = max(2, min(256, int(round(np.sqrt(n / 2.0)))))
         core_clusters = []
-        if isinstance(matrix, dict):
-            vectors = self._normalise_rows(np.stack([matrix[aid] for aid in targets]))
+        if isinstance(matrix, np.ndarray):
+            target_positions = [positions[aid] for aid in targets]
+            vectors = self._normalise_rows(matrix if target_positions == list(range(len(ids))) else matrix[target_positions])
             centroids = vectors[np.linspace(0, n - 1, k, dtype=np.int64)].copy()
             for _ in range(CLUSTER_ITERATIONS):
                 assignments = np.argmax(vectors @ centroids.T, axis=1)
@@ -1870,9 +2033,9 @@ class AIService:
         core_clusters.sort(key=lambda item: (-len(item[1]), min(targets[int(i)] for i in item[1])))
         name_vectors = self._cluster_names()
         candidate_ids = sorted(category_labels)
-        candidate_matrix = (np.stack([matrix[aid] for aid in candidate_ids]).astype(np.float32) if isinstance(matrix, dict) and candidate_ids
+        candidate_matrix = (matrix[[positions[aid] for aid in candidate_ids]].astype(np.float32) if isinstance(matrix, np.ndarray) and candidate_ids
                             else None)
-        if not isinstance(matrix, dict) and candidate_ids:
+        if not isinstance(matrix, np.ndarray) and candidate_ids:
             torch = self._embedder.torch
             candidate_pos = torch.as_tensor([positions[aid] for aid in candidate_ids], device=matrix.device)
             with torch.inference_mode():
@@ -1917,8 +2080,8 @@ class AIService:
         if not isinstance(asset_ids, list) or not asset_ids or any(isinstance(a, bool) or not isinstance(a, int) or a <= 0 for a in asset_ids):
             raise RequestError("asset_ids musí byť zoznam kladných ID")
         _, matrix, positions = self._index_snapshot()
-        vectors = [matrix[aid] for aid in dict.fromkeys(asset_ids) if aid in positions] if isinstance(matrix, dict) else None
-        if not isinstance(matrix, dict):
+        vectors = matrix[[positions[aid] for aid in dict.fromkeys(asset_ids) if aid in positions]] if isinstance(matrix, np.ndarray) else None
+        if not isinstance(matrix, np.ndarray):
             torch = self._embedder.torch
             valid = [aid for aid in dict.fromkeys(asset_ids) if aid in positions]
             if valid:
@@ -1944,8 +2107,8 @@ class AIService:
 
     def _similarity_scores(self, index: tuple[list[int], Any, dict[int, int]], rows: list[int], cols: list[int]) -> np.ndarray:
         ids, matrix, positions = index
-        if isinstance(matrix, dict):
-            return np.stack([matrix[ids[a]] for a in rows]) @ np.stack([matrix[ids[b]] for b in cols]).T
+        if isinstance(matrix, np.ndarray):
+            return (matrix[rows].astype(np.float32) @ matrix[cols].astype(np.float32).T).astype(np.float16)
         torch = self._embedder.torch
         ri = torch.as_tensor(rows, device=matrix.device)
         ci = torch.as_tensor(cols, device=matrix.device)
@@ -1968,13 +2131,44 @@ class AIService:
         block_size = 2048
         # Only pairs above the threshold leave the GPU; a per-element Python loop over the
         # full score rows took ~9 s for 8k photos and would grow quadratically.
-        if isinstance(matrix, dict):
-            sub = np.stack([matrix[a] for a in selected]).astype(np.float32) if selected else np.empty((0, DIMENSION), dtype=np.float32)
+        if isinstance(matrix, np.ndarray):
+            sub = matrix if selected == ids else matrix[positions_in_matrix]
+            all_rows, all_cols, all_scores = [], [], []
             for start in range(0, len(selected), block_size):
-                score = sub[start:start + block_size] @ sub.T
-                rows, cols = np.nonzero(score >= threshold)
-                for r, c in zip(rows.tolist(), cols.tolist()):
-                    if start + r != c: neighbors[start + r].append((c, float(score[r, c])))
+                left = sub[start:start + block_size].astype(np.float32)
+                for col_start in range(0, len(selected), 8192):
+                    right = sub[col_start:col_start + 8192].astype(np.float32)
+                    score = left @ right.T
+                    rows, cols = np.nonzero(score >= threshold - 0.001)
+                    values = score[rows, cols].astype(np.float16)
+                    rows, cols = rows + start, cols + col_start
+                    keep = (rows != cols) & (values >= threshold)
+                    all_rows.append(rows[keep]); all_cols.append(cols[keep]); all_scores.append(values[keep])
+            rows = np.concatenate(all_rows) if all_rows else np.empty(0, dtype=np.int64)
+            cols = np.concatenate(all_cols) if all_cols else np.empty(0, dtype=np.int64)
+            scores = np.concatenate(all_scores) if all_scores else np.empty(0, dtype=np.float16)
+            if len(rows):
+                row_order = np.argsort(rows, kind="stable")
+                rows, cols, scores = rows[row_order], cols[row_order], scores[row_order]
+            counts = np.bincount(rows, minlength=len(selected))
+            offsets = np.concatenate(([0], np.cumsum(counts)))
+            order = sorted(range(len(selected)), key=lambda i: (-int(counts[i]), selected[i]))
+            assigned = np.zeros(len(selected), dtype=bool)
+            groups = []
+            for seed in order:
+                if assigned[seed]: continue
+                start, end = int(offsets[seed]), int(offsets[seed + 1])
+                members = cols[start:end]
+                keep = ~assigned[members]
+                members = members[keep]
+                if not len(members): continue
+                sims = scores[start:end][keep]
+                assigned[seed] = True
+                assigned[members] = True
+                groups.append({"asset_ids": [selected[seed], *(selected[int(other)] for other in members)],
+                               "min_sim": float(sims.min()), "max_sim": float(sims.max())})
+            groups.sort(key=lambda g: (-len(g["asset_ids"]), -g["max_sim"], g["asset_ids"][0]))
+            return {"groups": groups}
         elif selected:
             torch = self._embedder.torch
             with torch.inference_mode():
@@ -2031,9 +2225,9 @@ class AIService:
         similarities = np.empty(len(pair_positions), dtype=np.float32)
         if pair_positions:
             left_pos, right_pos = np.asarray(pair_positions, dtype=np.int64).T
-            if isinstance(matrix, dict):
-                left_vectors = np.stack([matrix[left] for left, _ in pair_ids]).astype(np.float32, copy=False)
-                right_vectors = np.stack([matrix[right] for _, right in pair_ids]).astype(np.float32, copy=False)
+            if isinstance(matrix, np.ndarray):
+                left_vectors = matrix[left_pos].astype(np.float32)
+                right_vectors = matrix[right_pos].astype(np.float32)
                 similarities = np.sum(left_vectors * right_vectors, axis=1, dtype=np.float32)
             else:
                 torch = self._embedder.torch
@@ -2083,9 +2277,9 @@ class AIService:
             # Deterministic coarse buckets keep the exact nearest-neighbour work bounded.
             centers = indexed[::max(1, len(indexed) // 64)][:64]
             center_pos = [positions[a] for a in centers]
-            if isinstance(matrix, dict):
-                center_matrix = np.stack([matrix[a] for a in centers])
-                bucket = np.argmax(np.stack([matrix[a] for a in indexed]) @ center_matrix.T, axis=1)
+            if isinstance(matrix, np.ndarray):
+                center_matrix = matrix[center_pos].astype(np.float32)
+                bucket = np.argmax((matrix[[positions[a] for a in indexed]].astype(np.float32) @ center_matrix.T).astype(np.float16), axis=1)
             else:
                 torch = self._embedder.torch
                 q = torch.as_tensor([positions[a] for a in indexed], device=matrix.device)
@@ -2095,8 +2289,9 @@ class AIService:
             clusters = [cluster for cluster in clusters if cluster]
         def chain(values: list[int]) -> list[int]:
             if len(values) < 3: return values[:]
-            if isinstance(matrix, dict):
-                similarities = np.stack([matrix[a] for a in values]) @ np.stack([matrix[a] for a in values]).T
+            if isinstance(matrix, np.ndarray):
+                data = matrix[[positions[a] for a in values]].astype(np.float32)
+                similarities = (data @ data.T).astype(np.float16)
             else:
                 torch = self._embedder.torch
                 positions_tensor = torch.as_tensor([positions[a] for a in values], device=matrix.device)
@@ -2111,8 +2306,9 @@ class AIService:
         ordered_clusters = [chain(cluster) for cluster in clusters]
         if len(ordered_clusters) > 1:
             endpoints = [group[0] for group in ordered_clusters]
-            if isinstance(matrix, dict):
-                cluster_scores = np.stack([matrix[a] for a in endpoints]) @ np.stack([matrix[a] for a in endpoints]).T
+            if isinstance(matrix, np.ndarray):
+                data = matrix[[positions[a] for a in endpoints]].astype(np.float32)
+                cluster_scores = (data @ data.T).astype(np.float16)
             else:
                 torch = self._embedder.torch
                 endpoint_pos = torch.as_tensor([positions[a] for a in endpoints], device=matrix.device)
@@ -2150,8 +2346,13 @@ class AIService:
                     "state": self.status()["state"], "indexed": self.indexed_count}
         if cmd == "status":
             return self.status()
+        if cmd == "load_model":
+            self._start_model()
+            return self.status()
         if cmd == "index":
             return self._index_command(request)
+        if cmd == "light_sync":
+            return self._light_sync(request)
         if cmd == "forget":
             return self._forget_command(request)
         if cmd in {"faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
@@ -2193,13 +2394,37 @@ class AIService:
             if not isinstance(query, str) or not query.strip():
                 raise RequestError("query musí byť neprázdny text")
             limit = self._limit(request.get("limit", 200))
-            return self._wait_model().search_text(query.strip(), limit)
+            self._start_model()
+            embedder = self._wait_model()
+            return embedder.search_text(query.strip(), limit)
         if cmd == "similar":
             aid = request.get("asset_id")
             if isinstance(aid, bool) or not isinstance(aid, int) or aid <= 0:
                 raise RequestError("asset_id musí byť kladné celé číslo")
             limit = self._limit(request.get("limit", 200))
-            return self._wait_model().similar(aid, limit)
+            ids, matrix, positions = self._index_snapshot()
+            if aid not in positions: raise RequestError("Fotka ešte nie je zaindexovaná")
+            if not isinstance(matrix, np.ndarray):
+                return self._embedder.similar(aid, limit)
+            query_vector = matrix[positions[aid]].astype(np.float32)
+            chunks = np.array_split(matrix, 2)
+            futures = [self._vector_pool.submit(np.einsum, "ij,j->i", chunk, query_vector,
+                                                dtype=np.float32, optimize=False) for chunk in chunks]
+            values = np.concatenate([future.result() for future in futures])
+            values = values.astype(np.float16).astype(np.float32)
+            values[positions[aid]] = -2
+            take = min(limit, max(0, len(ids) - 1))
+            chosen = np.argpartition(-values, take - 1)[:take] if take else np.empty(0, dtype=np.int64)
+            chosen = sorted(chosen, key=lambda i: (-values[i], ids[i]))
+            results = []
+            for i in chosen:
+                other, score = ids[int(i)], float(values[i])
+                if score < SIMILARITY_COSINE_FLOOR: continue
+                result = {"asset_id": other, "score": score}
+                probability = self._similar_probability(score)
+                if probability is not None: result["prob"] = probability
+                results.append(result)
+            return {"results": results, "searched": len(ids)}
         if cmd == "shutdown":
             return {"shutting_down": True}
         raise RequestError(f"Neznámy príkaz: {cmd}")
@@ -2257,6 +2482,7 @@ class AIService:
 
     def stop(self) -> None:
         self._query_pool.shutdown(wait=True)
+        self._vector_pool.shutdown(wait=True)
         with self._condition:
             self._stop = True
             self._condition.notify_all()
@@ -2281,6 +2507,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="DDreams local SigLIP2 JSON-lines server")
     parser.add_argument("--model", required=True, help="Lokálny priečinok modelu")
     parser.add_argument("--db", required=True, help="Cesta k databáze ai.sqlite")
+    parser.add_argument("--lazy-model", action="store_true")
     args = parser.parse_args(argv)
     os.environ["HF_HUB_OFFLINE"] = "1"
     try:
@@ -2290,7 +2517,7 @@ def _main(argv: list[str] | None = None) -> int:
     except (AttributeError, OSError):
         pass
     try:
-        AIService(args.db, args.model).serve()
+        AIService(args.db, args.model, lazy_model=args.lazy_model).serve()
         return 0
     except Exception as exc:
         _stderr(f"Fatálna chyba servera: {exc}")

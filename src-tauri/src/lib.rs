@@ -143,6 +143,7 @@ pub fn run() {
             commands::auto_categories,
             commands::ai_status,
             commands::ai_start,
+            commands::ai_load_model,
             commands::ai_stop,
             commands::ai_pause,
             commands::ai_resume,

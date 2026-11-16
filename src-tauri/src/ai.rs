@@ -14,6 +14,8 @@ pub struct AiStatus {
     pub available: bool,
     pub reason: Option<String>,
     pub state: String,
+    pub model_state: String,
+    pub waiting: u64,
     pub indexed: u64,
     pub queued: u64,
     pub done: u64,
@@ -31,7 +33,7 @@ pub struct AiSearchResult { pub ids: Vec<i64>, pub searched: u64 }
 
 impl AiStatus {
     fn unavailable(reason: String) -> Self {
-        Self { available: false, reason: Some(reason), state: "off".into(), indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None }
+        Self { available: false, reason: Some(reason), state: "off".into(), model_state: "unloaded".into(), waiting: 0, indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None }
     }
 }
 
@@ -68,7 +70,7 @@ impl AiService {
     pub fn new(paths: Paths, db: Db, formats: Arc<FormatTable>) -> Self {
         let reason = availability_reason(&paths);
         let status = reason.map(AiStatus::unavailable).unwrap_or(AiStatus {
-            available: true, reason: None, state: "off".into(), indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None,
+            available: true, reason: None, state: "off".into(), model_state: "unloaded".into(), waiting: 0, indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None,
         });
         Self(Arc::new(AiInner {
             paths, db, formats, app: Mutex::new(None), process: Mutex::new(ProcessState { child: None, writer: None }),
@@ -117,7 +119,7 @@ impl AiService {
 
     pub fn set_app(&self, app: tauri::AppHandle) { *self.0.app.lock().unwrap() = Some(app); }
 
-    pub fn start(&self) -> Result<AiStatus, String> {
+    pub fn start(&self, lazy_model: bool) -> Result<AiStatus, String> {
         if !self.status().available { return Ok(self.status()); }
         let mut process = self.0.process.lock().map_err(|e| e.to_string())?;
         if let Some(child) = process.child.as_mut() {
@@ -133,6 +135,7 @@ impl AiService {
         }
         let mut command = Command::new(python);
         command.arg("-I").arg(&self.0.paths.ai_script).arg("--model").arg(&self.0.paths.ai_model).arg("--db").arg(&self.0.paths.ai_db);
+        if lazy_model { command.arg("--lazy-model"); }
         command
             .env("PYTHONIOENCODING", "utf-8").env("HF_HUB_OFFLINE", "1")
             .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -157,6 +160,8 @@ impl AiService {
         {
             let mut status = self.0.status.lock().unwrap();
             status.state = "loading".into();
+            status.model_state = if lazy_model { "unloaded" } else { "loading" }.into();
+            status.waiting = 0;
             status.last_error = None;
             status.total = 0;
             status.done = 0;
@@ -194,12 +199,15 @@ impl AiService {
         if let Some(reader) = self.0.stderr_reader.lock().unwrap().take() { let _ = reader.join(); }
         let mut status = self.0.status.lock().unwrap();
         if status.state != "error" { status.state = "off".into(); }
+        status.model_state = "unloaded".into();
+        status.waiting = 0;
         self.emit(&status);
         Ok(status.clone())
     }
 
     pub fn pause(&self) -> Result<AiStatus, String> { self.command_status("pause") }
     pub fn resume(&self) -> Result<AiStatus, String> { self.command_status("resume") }
+    pub fn load_model(&self) -> Result<AiStatus, String> { self.command_status("load_model") }
 
     fn command_status(&self, cmd: &str) -> Result<AiStatus, String> {
         self.request(cmd, json!({}), Duration::from_secs(60))?;
@@ -217,7 +225,7 @@ impl AiService {
     }
 
     pub fn search_text(&self, query: String, limit: Option<u32>) -> Result<AiSearchResult, String> {
-        let result = self.request("search_text", json!({ "query": query, "limit": limit.unwrap_or(200).clamp(1, 1000) }), Duration::from_secs(30))?;
+        let result = self.request("search_text", json!({ "query": query, "limit": limit.unwrap_or(200).clamp(1, 1000) }), Duration::from_secs(300))?;
         result_page(result)
     }
 
@@ -405,7 +413,7 @@ impl AiService {
                     let _=self.ensure_colors_attached();
                     let service = self.clone();
                     let _ = thread::Builder::new().name("ai-auto-index".into()).spawn(move || {
-                        if let Err(error) = service.index_catalog() { service.set_error(error); }
+                        if let Err(error) = service.sync_catalog_light() { service.set_error(error); }
                     });
                 }
             }
@@ -432,6 +440,8 @@ impl AiService {
     fn update_status(&self, message: &Value) {
         let mut status = self.0.status.lock().unwrap();
         if let Some(state) = message.get("state").and_then(Value::as_str) { status.state = state.into(); }
+        if let Some(state) = message.get("model_state").and_then(Value::as_str) { status.model_state = state.into(); }
+        if let Some(value) = message.get("waiting").and_then(Value::as_u64) { status.waiting = value; }
         if let Some(value) = message.get("indexed").and_then(Value::as_u64) { status.indexed = value; }
         if let Some(value) = message.get("queued").and_then(Value::as_u64) { status.queued = value; }
         if let Some(value) = message.get("done").and_then(Value::as_u64) { status.done = value; }
@@ -452,6 +462,39 @@ impl AiService {
         status.state = "error".into();
         status.last_error = Some(message);
         self.emit(&status);
+    }
+
+    fn sync_catalog_light(&self) -> Result<(), String> {
+        self.sync_labels("category")?;
+        self.sync_labels("keyword")?;
+        let extensions = self.0.formats.extensions(&["image", "raw"]);
+        if extensions.is_empty() { return Err("Nie sú nakonfigurované formáty fotografií".into()); }
+        let sql = format!("SELECT id,path FROM assets WHERE is_listed=1 AND id>0 AND ext_lower IN ({})", extensions.iter().map(|ext| format!("'{ext}'")).collect::<Vec<_>>().join(","));
+        let rows = {
+            let conn = self.0.db.lock().map_err(|e| e.to_string())?;
+            let mut statement = conn.prepare(&sql).map_err(|e| e.to_string())?;
+            let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)))
+                .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+            rows
+        };
+        let ids = sync_catalog_ids(&rows)?;
+        let result = self.request("light_sync", json!({"asset_ids": ids}), Duration::from_secs(120))?;
+        let total = rows.len();
+        let missing = result.get("asset_ids").and_then(Value::as_array).ok_or("AI server nevrátil zoznam chýbajúcich fotografií")?
+            .iter().filter_map(Value::as_i64).collect::<std::collections::HashSet<_>>();
+        let items = rows.into_iter().filter(|(id, _)| missing.contains(id)).filter_map(|(asset_id, path)| {
+            let path = path.filter(|value| !value.trim().is_empty())?;
+            let meta = fs::metadata(&path).ok()?;
+            let mtime_ns = meta.modified().ok()?.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos().min(i64::MAX as u128) as i64;
+            Some(json!({"asset_id":asset_id,"path":path,"size":meta.len().min(i64::MAX as u64),"mtime_ns":mtime_ns}))
+        }).collect::<Vec<_>>();
+        if !items.is_empty() {
+            self.request("index", json!({"items":items,"append":true}), Duration::from_secs(120))?;
+        }
+        let mut status = self.0.status.lock().unwrap();
+        status.total = total as u64;
+        self.emit(&status);
+        Ok(())
     }
 
     fn index_catalog(&self) -> Result<(), String> {
@@ -516,6 +559,11 @@ fn result_page(result: Value) -> Result<AiSearchResult, String> {
     Ok(AiSearchResult { ids, searched })
 }
 
+fn sync_catalog_ids(rows: &[(i64, Option<String>)]) -> Result<Vec<i64>, String> {
+    if rows.is_empty() { return Err("Katalóg neobsahuje fotografie; synchronizácia AI bola zrušená".into()); }
+    Ok(rows.iter().map(|(id, _)| *id).collect())
+}
+
 fn valid_label_kind(kind:&str)->Result<&str,String>{match kind{"category"=>Ok("category"),"keyword"=>Ok("keyword"),_=>Err("Neplatný typ štítku".into())}}
 fn filter_unrejected_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{candidates.iter().copied().filter(|id|!rejected.contains(id)).collect()}
 fn filter_suggest_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected)}
@@ -563,6 +611,11 @@ fn availability_reason(paths: &Paths) -> Option<String> {
 #[cfg(test)]
 mod suggestion_tests {
     use super::*;
+    #[test]
+    fn light_sync_rejects_empty_snapshot_and_keeps_ids_without_paths() {
+        assert!(sync_catalog_ids(&[]).is_err());
+        assert_eq!(sync_catalog_ids(&[(7, None), (9, Some("offline".into()))]).unwrap(), vec![7, 9]);
+    }
 
     #[test]
     fn suggest_rejections_filter_only_rejected_assets(){

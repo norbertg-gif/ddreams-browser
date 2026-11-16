@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFilter
 
-from ddreams_ai import AIService, COLOR_PALETTE, DIMENSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+from ddreams_ai import AIService, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
 from faces_schema import ensure_faces_schema
 from import_acdsee_faces import import_acdsee_faces
 
@@ -21,6 +21,8 @@ class FakePhoto:
     def __str__(self): return self.name
     def convert(self, mode): return Image.new(mode, (16, 16), "white")
 
+def set_vectors(service, vectors):
+    service._vectors = VectorIndex(list(vectors), np.stack(list(vectors.values())))
 
 class QualityTests(unittest.TestCase):
     def test_sharp_checkerboard_scores_above_blurred_copy(self):
@@ -78,6 +80,7 @@ class FakeEmbedder:
 
     def __init__(self, model_dir):
         self.vectors = {}
+        self.replace_calls = 0
 
     @staticmethod
     def vector(label):
@@ -94,6 +97,7 @@ class FakeEmbedder:
         return np.stack([self.vector(str(image)) for image in images])
 
     def replace_index(self, ids, vectors):
+        self.replace_calls += 1
         self.vectors = {int(a): v.copy() for a, v in zip(ids, vectors)}
 
     def upsert_index(self, ids, vectors):
@@ -139,7 +143,7 @@ class MapTests(unittest.TestCase):
             for offset in range(4):
                 v=np.zeros(DIMENSION,dtype=np.float32);v[cluster]=1;v[10+cluster*4+offset]=0.04
                 vectors[cluster*10+offset+1]=v/np.linalg.norm(v)
-        self.service._embedder.replace_index(list(vectors),list(vectors.values()))
+        set_vectors(self.service, vectors)
 
     def tearDown(self):self.service.stop();self.temp.cleanup()
 
@@ -156,6 +160,147 @@ class MapTests(unittest.TestCase):
         points=AIService._map_tsne(np.eye(3,dtype=np.float32))
         self.assertEqual(points.shape,(3,2));self.assertTrue(np.isfinite(points).all())
 
+class LazyModelTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.calls = []
+        def factory(path):
+            self.calls.append(path)
+            return FakeEmbedder(path)
+        self.service = AIService(Path(self.temp.name) / "ai.sqlite", "fake", embedder_factory=factory, lazy_model=True)
+        vectors = np.zeros((3, DIMENSION), dtype=np.float16)
+        vectors[0, 0] = vectors[1, 0] = vectors[2, 1] = 1
+        with self.service.db_lock:
+            self.service.db.executemany("INSERT INTO embeddings VALUES(?,?,?,?,?,?)",
+                [(i + 1, self.service.model_name, 1, 1, DIMENSION, vector.tobytes()) for i, vector in enumerate(vectors)])
+            self.service.db.commit()
+        self.service.start()
+
+    def tearDown(self):
+        self.service.stop()
+        self.temp.cleanup()
+
+    def test_vectors_work_before_and_after_explicit_load(self):
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.service.status()["model_state"], "unloaded")
+        before = self.service.execute({"cmd": "similar", "asset_id": 1})
+        groups = self.service.execute({"cmd": "duplicate_groups", "threshold": 0.9})
+        self.assertEqual([row["asset_id"] for row in before["results"]], [2])
+        self.service.execute({"cmd": "load_model"})
+        self.assertTrue(self.service._model_ready.wait(5))
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(before, self.service.execute({"cmd": "similar", "asset_id": 1}))
+        self.assertEqual(groups, self.service.execute({"cmd": "duplicate_groups", "threshold": 0.9}))
+
+    def test_text_search_loads_model(self):
+        self.assertEqual(self.calls, [])
+        self.service.execute({"cmd": "search_text", "query": "east"})
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(self.service._embedder.replace_calls, 1)
+        self.service.execute({"cmd": "search_text", "query": "west"})
+        self.assertEqual(self.service._embedder.replace_calls, 1)
+
+    def test_matrix_growth_updates_and_removal(self):
+        index = VectorIndex([1, 2], np.array([[1, 0], [0, 1]], dtype=np.float16))
+        old_ids, old_matrix, old_positions = index.snapshot()
+        index.upsert([3], np.array([[1, 1]], dtype=np.float16))
+        self.assertEqual(old_ids, [1, 2])
+        self.assertEqual(old_positions, {1: 0, 2: 1})
+        self.assertEqual(old_matrix.tolist(), [[1, 0], [0, 1]])
+        capacity = index.capacity
+        index.upsert([4], np.array([[0, 0]], dtype=np.float16))
+        self.assertEqual(index.capacity, capacity)
+        index.upsert([2], np.array([[2, 2]], dtype=np.float16))
+        index.remove({1, 3})
+        ids, matrix, positions = index.snapshot()
+        self.assertEqual(ids, [2, 4])
+        self.assertEqual(matrix.tolist(), [[2, 2], [0, 0]])
+        self.assertEqual(positions, {2: 0, 4: 1})
+
+    def test_snapshots_share_contiguous_matrix(self):
+        first = self.service._index_snapshot()
+        second = self.service._index_snapshot()
+        self.assertEqual(first[1].dtype, np.float16)
+        self.assertTrue(first[1].flags.c_contiguous)
+        self.assertTrue(np.shares_memory(first[1], second[1]))
+
+    def test_duplicates_match_float16_reference_at_threshold(self):
+        rng = np.random.default_rng(123)
+        values = rng.normal(size=(20, 32)).astype(np.float32)
+        values /= np.linalg.norm(values, axis=1, keepdims=True)
+        values[1] = values[0] * .93 + values[1] * .3675595
+        self.service._vectors = VectorIndex(list(range(1, 21)), values)
+        ids, matrix, _ = self.service._index_snapshot()
+        scores = (matrix.astype(np.float32) @ matrix.astype(np.float32).T).astype(np.float16)
+        for threshold in (.93, .985):
+            neighbors = [[(j, float(scores[i, j])) for j in range(len(ids)) if i != j and scores[i, j] >= np.float16(threshold)] for i in range(len(ids))]
+            order = sorted(range(len(ids)), key=lambda i: (-len(neighbors[i]), ids[i]))
+            assigned, expected = set(), []
+            for seed in order:
+                if seed in assigned: continue
+                members = [(other, score) for other, score in neighbors[seed] if other not in assigned]
+                if not members: continue
+                assigned.add(seed); assigned.update(other for other, _ in members)
+                expected.append({"asset_ids": [ids[seed], *(ids[other] for other, _ in members)],
+                                 "min_sim": min(score for _, score in members), "max_sim": max(score for _, score in members)})
+            expected.sort(key=lambda group: (-len(group["asset_ids"]), -group["max_sim"], group["asset_ids"][0]))
+            self.assertEqual(self.service.execute({"cmd": "duplicate_groups", "threshold": threshold})["groups"], expected)
+
+    def test_similarity_probability_reads_only_checkpoint_scalars(self):
+        from safetensors.numpy import save_file
+        path = Path(self.temp.name) / "open_clip_model.fp16.safetensors"
+        save_file({"logit_scale": np.array([0.0], dtype=np.float16), "logit_bias": np.array([0.0], dtype=np.float16)}, str(path))
+        self.service.model_dir = self.temp.name
+        result = self.service.execute({"cmd": "similar", "asset_id": 1})
+        self.assertAlmostEqual(result["results"][0]["prob"], 1 / (1 + np.exp(-1)), places=6)
+        self.assertEqual(self.calls, [])
+
+    def test_other_vector_commands_use_only_stored_data(self):
+        self.service.execute({"cmd": "set_labels", "kind": "category", "pairs": [[1, 7]], "parents": {"7": None}})
+        self.assertIn("2", self.service.execute({"cmd": "suggest", "kind": "category", "asset_ids": [2]})["results"])
+        self.service.execute({"cmd": "suggest_batch", "kind": "category", "asset_ids": "unlabeled"})
+        self.assertEqual(self.service.execute({"cmd": "order_by_similarity", "asset_ids": [1, 2, 3]})["asset_ids"][0], 1)
+        self.assertEqual(self.service.execute({"cmd": "series", "items": [{"asset_id": 1, "t": 1}, {"asset_id": 2, "t": 2}], "max_gap": 10, "min_sim": .9})["groups"][0]["ids"], [1, 2])
+        self.assertEqual(self.service.execute({"cmd": "map_build"})["points"], 3)
+        self.service.execute({"cmd": "clusters", "min_size": 2, "min_sim": .7})
+        self.assertEqual(self.calls, [])
+
+    def test_queued_items_wait_without_loading_and_stop_cleanly(self):
+        path = Path(self.temp.name) / "queued.jpg"
+        path.write_bytes(b"photo")
+        stat = path.stat()
+        self.service.execute({"cmd": "index", "append": True, "items": [
+            {"asset_id": 9, "path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}]})
+        self.assertEqual(self.calls, [])
+        self.assertGreaterEqual(self.service.status()["waiting"], 1)
+        self.assertEqual(self.service.status()["model_state"], "unloaded")
+
+    def test_stored_text_names_do_not_load_model(self):
+        text = "a photo of krajina"
+        vector = np.zeros(DIMENSION, dtype=np.float16)
+        vector[0] = 1
+        with self.service.db_lock:
+            self.service.db.execute("INSERT INTO text_vectors VALUES(?,?,?)", (self.service.model_name, text, vector.tobytes()))
+            self.service.db.commit()
+        self.assertIsNone(self.service._cluster_names())
+        with self.service.db_lock:
+            self.service.db.executemany("INSERT OR IGNORE INTO text_vectors VALUES(?,?,?)",
+                [(self.service.model_name, f"a photo of {word}", vector.tobytes()) for word in CLUSTER_VOCABULARY])
+            self.service.db.commit()
+        self.assertIn("krajina", self.service._cluster_names())
+        self.assertEqual(self.calls, [])
+
+    def test_model_computed_names_are_persisted(self):
+        self.service.execute({"cmd": "load_model"})
+        self.assertTrue(self.service._model_ready.wait(5))
+        self.service._embedder._text_vector = lambda text: np.ones(DIMENSION, dtype=np.float32)
+        self.assertIn("krajina", self.service._cluster_names())
+        row = self.service.db.execute("SELECT vector FROM text_vectors WHERE model=? AND text=?",
+                                      (self.service.model_name, "a photo of krajina")).fetchone()
+        self.assertEqual(len(row[0]), DIMENSION * 2)
+        self.service._embedder = None
+        self.assertIn("krajina", self.service._cluster_names())
+
 
 class FaceTests(unittest.TestCase):
     def setUp(self):
@@ -169,6 +314,69 @@ class FaceTests(unittest.TestCase):
 
     def _person(self, name="Jana"):
         return self.service.execute({"cmd": "faces_person_create", "name": name})["id"]
+
+    def test_failed_face_scan_is_remembered_and_changed_file_is_requeued(self):
+        path = self.root / "broken.jpg"
+        path.write_bytes(b"broken")
+        stat = path.stat()
+        item = {"asset_id": 17, "path": str(path), "size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+        def fail(_item):
+            raise ValueError("bad image")
+        self.service.decoder = fail
+        self.service.start()
+        self.assertTrue(self.service._model_ready.wait(5))
+        self.service.execute({"cmd": "index", "items": [item], "append": True})
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with self.service.faces_lock:
+                row = self.service.faces_db.execute("SELECT size,mtime_ns,version FROM face_scan WHERE asset_id=17").fetchone()
+            if row:
+                break
+            time.sleep(0.02)
+        self.assertEqual(row, (stat.st_size, stat.st_mtime_ns, FACE_VERSION))
+        with self.service.db_lock:
+            self.service.db.execute("INSERT OR REPLACE INTO failures(asset_id,size,mtime_ns,error,at) VALUES(?,?,?,?,?)",
+                                    (item["asset_id"], item["size"], item["mtime_ns"], "test", time.time()))
+            self.service.db.execute("INSERT OR REPLACE INTO colors VALUES(?,?,?,?,?,?)", (17, item["size"], item["mtime_ns"], "{}", "[]", COLOR_VERSION))
+            self.service.db.execute("INSERT OR REPLACE INTO quality VALUES(?,?,?,?,?,?,?,?)", (17, item["size"], item["mtime_ns"], 0, 0, 0, 0, QUALITY_VERSION))
+            self.service.db.commit()
+        self.assertNotIn(17, self.service.execute({"cmd": "light_sync", "asset_ids": [17]})["asset_ids"])
+        self.service.execute({"cmd": "index", "items": [item], "append": True})
+        with self.service._condition:
+            self.assertFalse(any(entry["asset_id"] == 17 for entry in self.service._face_scan_queue))
+        path.write_bytes(b"changed!")
+        changed = path.stat()
+        with self.service._condition:
+            self.service._paused = True
+        self.service.execute({"cmd": "index", "items": [{**item, "size": changed.st_size, "mtime_ns": changed.st_mtime_ns}], "append": True})
+        with self.service._condition:
+            self.assertTrue(any(entry["asset_id"] == 17 for entry in self.service._face_scan_queue))
+
+    def test_light_sync_finds_missing_prunes_and_rejects_empty(self):
+        vector = np.zeros(DIMENSION, dtype=np.float16).tobytes()
+        with self.service.db_lock:
+            for aid in [1, 2, 3, 4]:
+                self.service.db.execute("INSERT INTO embeddings VALUES(?,?,?,?,?,?)", (aid, self.service.model_name, 1, 2, DIMENSION, vector))
+                self.service.db.execute("INSERT INTO colors VALUES(?,?,?,?,?,?)", (aid, 1, 2, "{}", "[]", COLOR_VERSION))
+                self.service.db.execute("INSERT INTO quality VALUES(?,?,?,?,?,?,?,?)", (aid, 1, 2, 0, 0, 0, 0, QUALITY_VERSION))
+            self.service.db.execute("DELETE FROM quality WHERE asset_id=2")
+            self.service.db.commit()
+        with self.service.faces_lock:
+            self.service.faces_db.executemany("INSERT INTO face_scan VALUES(?,?,?,?,?)", [(aid, 1, 2, FACE_VERSION, 0) for aid in [1, 2, 3, 4]])
+            face_id = self.service.faces_db.execute("INSERT INTO faces(asset_id,source,state) VALUES(4,'ai','confirmed')").lastrowid
+            self.service.faces_db.execute("INSERT INTO face_thumbs(face_id,jpeg) VALUES(?,?)", (face_id, b"jpeg"))
+            self.service.faces_db.execute("INSERT INTO face_rejected(face_id,person_id) VALUES(?,?)", (face_id, 7))
+            self.service.faces_db.commit()
+        result = self.service.execute({"cmd": "light_sync", "asset_ids": [1, 2, 3, 5]})
+        self.assertEqual(result, {"asset_ids": [2, 5], "pruned": 1})
+        self.assertIsNone(self.service.db.execute("SELECT 1 FROM embeddings WHERE asset_id=4").fetchone())
+        self.assertIsNotNone(self.service.faces_db.execute("SELECT 1 FROM face_scan WHERE asset_id=4").fetchone())
+        self.assertIsNotNone(self.service.faces_db.execute("SELECT 1 FROM faces WHERE asset_id=4").fetchone())
+        self.assertIsNotNone(self.service.faces_db.execute("SELECT 1 FROM face_thumbs WHERE face_id=?", (face_id,)).fetchone())
+        self.assertIsNotNone(self.service.faces_db.execute("SELECT 1 FROM face_rejected WHERE face_id=?", (face_id,)).fetchone())
+        with self.assertRaises(RequestError):
+            self.service.execute({"cmd": "light_sync", "asset_ids": []})
+        self.assertIsNotNone(self.service.db.execute("SELECT 1 FROM embeddings WHERE asset_id=1").fetchone())
 
     def test_asset_assign_uses_single_eligible_face_or_inserts_photo_row(self):
         person = self._person()
@@ -386,7 +594,7 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.service.db.execute("SELECT count(*) FROM quality WHERE asset_id=?", (item["asset_id"],)).fetchone()[0], 1)
 
     def series(self, timed_ids, vectors, sharp=None, max_gap=10, min_sim=0.9):
-        self.service._embedder.vectors.update(vectors)
+        set_vectors(self.service, vectors)
         for asset_id, value in (sharp or {}).items():
             self.service.db.execute("INSERT OR REPLACE INTO quality(asset_id,sharp) VALUES(?,?)", (asset_id, value))
         self.service.db.commit()
@@ -421,7 +629,7 @@ class ServerTests(unittest.TestCase):
         for aid in range(1, east + 1): vectors[aid] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         for aid in range(east + 1, east + west + 1): vectors[aid] = np.array([0.0, 1.0, 0.0], dtype=np.float32)
         for aid in range(east + west + 1, east + west + noise + 1): vectors[aid] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
-        self.service._embedder.vectors.update(vectors)
+        set_vectors(self.service, vectors)
         return vectors
 
     def test_clusters_separate_blobs_and_exclude_labeled_assets(self):
@@ -602,13 +810,14 @@ class ServerTests(unittest.TestCase):
     def test_label_suggestions_exclude_self_existing_and_ancestors(self):
         items = [self.make_file(f"knn-{name}.jpg") for name in ("query", "n1", "n2", "n3", "unlabeled")]
         self.index(items); self.wait_idle()
-        vectors = self.service._embedder.vectors
+        vectors = {}
         ids = [item["asset_id"] for item in items]
         vectors[ids[0]] = np.array([1.0, 0.0] + [0.0] * (DIMENSION - 2), dtype=np.float32)
         vectors[ids[1]] = np.array([0.9, (1 - 0.9 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
         vectors[ids[2]] = np.array([0.8, 0.6] + [0.0] * (DIMENSION - 2), dtype=np.float32)
         vectors[ids[3]] = np.array([0.7, (1 - 0.7 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
         vectors[ids[4]] = np.array([0.95, (1 - 0.95 ** 2) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        set_vectors(self.service, vectors)
         set_result = self.service.execute({"cmd": "set_labels", "kind": "category",
             "pairs": [[ids[0], 30], [ids[1], 20], [ids[1], 40], [ids[2], 50], [ids[3], 30], [ids[3], 40]],
             "parents": {"30": 20, "20": 10, "10": None, "40": None, "50": None}})
@@ -617,7 +826,8 @@ class ServerTests(unittest.TestCase):
         rows = result["results"][str(ids[0])]
         self.assertNotIn(ids[0], result["results"])
         self.assertEqual([40, 50], [row["label_id"] for row in rows])
-        self.assertAlmostEqual(2.0 / 3.0, rows[0]["score"], places=5)
+        quantized = np.asarray([0.9, 0.8, 0.7], dtype=np.float16).astype(np.float32)
+        self.assertAlmostEqual(float((quantized[0] + quantized[2]) / quantized.sum()), rows[0]["score"], places=5)
         self.assertEqual(2, rows[0]["support"])
         self.assertNotIn(30, [row["label_id"] for row in rows])
         self.assertNotIn(20, [row["label_id"] for row in rows])
@@ -627,9 +837,10 @@ class ServerTests(unittest.TestCase):
         items = [self.make_file(f"batch-{name}.jpg") for name in ("a", "b", "c", "d")]
         self.index(items); self.wait_idle()
         ids = [item["asset_id"] for item in items]
-        vectors = self.service._embedder.vectors
+        vectors = {}
         for aid, x in zip(ids, (1.0, 0.95, 0.9, 0.85)):
             vectors[aid] = np.array([x, (1 - x * x) ** 0.5] + [0.0] * (DIMENSION - 2), dtype=np.float32)
+        set_vectors(self.service, vectors)
         self.service.execute({"cmd": "set_labels", "kind": "keyword", "pairs": [[ids[0], 7], [ids[1], 7]], "parents": {"7": None}})
         groups = self.service.execute({"cmd": "suggest_batch", "kind": "keyword", "asset_ids": "unlabeled", "min_score": 0.3})["groups"]
         self.assertEqual([ids[2], ids[3]], groups[0]["asset_ids"])
@@ -644,7 +855,7 @@ class ServerTests(unittest.TestCase):
         vectors[2, :2] = [.65, .75]
         vectors[3, :2] = [.9, -.4358899]
         vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
-        self.service._embedder.replace_index([101, 102, 103, 104], vectors)
+        set_vectors(self.service, dict(zip([101, 102, 103, 104], vectors)))
         groups = self.service.execute({"cmd": "duplicate_groups", "threshold": .85})["groups"]
         self.assertEqual(groups[0]["asset_ids"], [101, 102, 104])
         self.assertTrue(all(len(group["asset_ids"]) >= 2 for group in groups))
@@ -656,7 +867,7 @@ class ServerTests(unittest.TestCase):
         vectors[1, :2] = [.99, .141067]
         vectors[2, 1] = 1
         vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
-        self.service._embedder.replace_index([201, 202, 203], vectors)
+        set_vectors(self.service, dict(zip([201, 202, 203], vectors)))
         result = self.service.execute({"cmd": "order_by_similarity", "asset_ids": [201, 999, 203, 202]})["asset_ids"]
         self.assertEqual(result[-1], 999)
         self.assertLessEqual(abs(result.index(201) - result.index(202)), 1)

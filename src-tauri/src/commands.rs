@@ -87,7 +87,9 @@ pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'
 #[tauri::command(async)]
 pub fn ai_status(state: State<'_, AiState>) -> AiStatus { state.0.status() }
 #[tauri::command(async)]
-pub fn ai_start(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.start() }
+pub fn ai_start(state: State<'_, AiState>, lazy_model: Option<bool>) -> Result<AiStatus, String> { state.0.start(lazy_model.unwrap_or(false)) }
+#[tauri::command(async)]
+pub fn ai_load_model(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.load_model() }
 #[tauri::command(async)]
 pub fn ai_stop(state: State<'_, AiState>) -> Result<AiStatus, String> { state.0.stop() }
 #[tauri::command(async)]
