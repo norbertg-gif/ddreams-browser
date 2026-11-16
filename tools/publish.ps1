@@ -94,4 +94,13 @@ if ($copyExifTool) {
     Write-Output "ExifTool is current: $InstallExifTool"
 }
 
+# A copy once left a file full of zero bytes; verify what was published.
+foreach ($pair in @(
+    @($ReleaseExe, $InstallExe),
+    @($SourceAiScript, $InstallAiScript),
+    @((Join-Path $RepoRoot 'ai\faces_schema.py'), (Join-Path $InstallAiDir 'faces_schema.py')),
+    @($SourceRawScript, (Join-Path $InstallRawDir 'ddreams_raw.py'))
+)) {
+    if ((Get-FileHash -LiteralPath $pair[0]).Hash -ne (Get-FileHash -LiteralPath $pair[1]).Hash) { throw "Published file differs from its source: $($pair[1])" }
+}
 Write-Output "Portable installation ready: $InstallRoot"
