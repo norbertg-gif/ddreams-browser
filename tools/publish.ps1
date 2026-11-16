@@ -1,6 +1,6 @@
 param(
     [string]$Catalog,
-    [string]$ExifToolSource = 'G:\Programovanie\photosort\tools\exiftool'
+    [string]$ExifToolSource = (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\exiftool')
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,9 +64,13 @@ New-Item -ItemType Directory -Path $InstallRawDir -Force | Out-Null
 Copy-Item -LiteralPath $SourceRawScript -Destination (Join-Path $InstallRawDir 'ddreams_raw.py') -Force
 Write-Output "Copied RAW plugin: $(Join-Path $InstallRawDir 'ddreams_raw.py')"
 $AiConfig = Join-Path $InstallAiDir 'ai.json'
-if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf)) {
-    [IO.File]::WriteAllText($AiConfig, '{"python": "G:\\Programovanie\\photosort\\.venv\\Scripts\\python.exe"}', [Text.UTF8Encoding]::new($false))
-    Write-Output "Created AI config: $AiConfig"
+# The Python environment is created by tools\setup-python.ps1. An ai.json that still points
+# outside the installation at the old shared environment is switched over.
+$InstallPython = Join-Path $ModulesDir 'python\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $InstallPython -PathType Leaf)) { throw "Python environment not found: $InstallPython. Run tools\setup-python.ps1 first." }
+if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf) -or (Get-Content -LiteralPath $AiConfig -Raw) -match 'photosort') {
+    [IO.File]::WriteAllText($AiConfig, (@{ python = $InstallPython } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+    Write-Output "Wrote AI config: $AiConfig"
 }
 
 $SourceSupport = Join-Path $ExifToolSource 'exiftool_files'

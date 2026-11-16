@@ -28,3 +28,4 @@ dist-ssr
 *.pdf
 *@1x.png
 __pycache__/
+tools/exiftool/

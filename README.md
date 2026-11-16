@@ -11,7 +11,7 @@ V koreňovom priečinku projektu spustite `npm run tauri dev`. Katalóg `.local/
 Importer používa iba štandardnú knižnicu Pythonu:
 
 ```powershell
-G:\Programovanie\photosort\.venv\Scripts\python.exe tools\import_acdsee\import_acdsee.py --source G:\ddreams-work\acdsee-copy --out .local\catalog.sqlite
+python tools\import_acdsee\import_acdsee.py --source G:\ddreams-work\acdsee-copy --out .local\catalog.sqlite
 ```
 
 ## Formáty a zdroje náhľadov

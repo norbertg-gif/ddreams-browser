@@ -107,7 +107,7 @@ mod tests{
         let mut statement=connection.prepare("SELECT path FROM assets WHERE is_listed=1 AND path IS NOT NULL ORDER BY id").unwrap();
         let paths=statement.query_map([],|row|row.get::<_,String>(0)).unwrap().filter_map(Result::ok).filter(|path|Path::new(path).is_file()).take(30).map(PathBuf::from).collect::<Vec<_>>();
         assert_eq!(paths.len(),30,"need 30 online files in the local catalog");
-        let executable=std::env::var_os("DDREAMS_EXIFTOOL").map(PathBuf::from).unwrap_or_else(||PathBuf::from(r"G:\Programovanie\photosort\tools\exiftool\exiftool.exe"));
+        let executable=std::env::var_os("DDREAMS_EXIFTOOL").map(PathBuf::from).unwrap_or_else(||PathBuf::from(r"G:\Programovanie\ddreams-browser\tools\exiftool\exiftool.exe"));
         let exif=crate::exiftool::ExifTool::new(executable);
         let fields=vec!["iso","aperture","shutter","focalLength","lens","camera","dateTaken"].into_iter().map(str::to_owned).collect::<Vec<_>>();
         let tags=tags_for(&fields);

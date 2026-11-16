@@ -82,7 +82,7 @@ pub struct RemoveCatalogInfo{pub assets:usize,pub folders:usize,pub offline:bool
 #[tauri::command(async)]
 pub fn remove_folder_from_catalog_info(db:State<'_,BackgroundDbState>,folder_path:String)->Result<RemoveCatalogInfo,String>{let path=folder_path.trim().trim_end_matches(['\\','/']);let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let normal=crate::journal::normalize_fs_path(path);let prefix=format!("{}\\",normal);let asset_paths={let mut stmt=conn.prepare("SELECT path FROM assets WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let assets=asset_paths.iter().filter(|p|{let p=crate::journal::normalize_fs_path(p);p==normal||p.starts_with(&prefix)}).count();let all={let mut stmt=conn.prepare("SELECT path FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let prefix=format!("{}\\",path.replace('/',"\\").trim_end_matches('\\'));let folders=all.iter().filter(|p|p.eq_ignore_ascii_case(path)||p.to_lowercase().starts_with(&prefix.to_lowercase())).count();drop(conn);let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(path,&mut cache);Ok(RemoveCatalogInfo{assets,folders,offline,missing})}
 #[tauri::command(async)]
-pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,app:State<'_,AppInfoState>,listing:State<'_,ListingState>,folder_path:String)->Result<crate::journal::RemoveCatalogResult,String>{let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(&folder_path,&mut cache);if !offline&&!missing{return Err("PrieÄinok existuje na disku â€“ z katalÃ³gu ho vyraÄ cez vylÃºÄenie".into())}if app.0.readonly{return Err("KatalÃ³g je iba na ÄÃ­tanie".into())}crate::backup::backup_now(Path::new(&app.0.catalog),Path::new(&app.0.backups))?;let result=writer.0.remove_folder_from_catalog(&folder_path)?;for chunk in result.asset_ids.chunks(1000){ai.0.forget(chunk.to_vec())}let _=listing.0.invalidate_path(&folder_path);Ok(result)}
+pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,app:State<'_,AppInfoState>,listing:State<'_,ListingState>,folder_path:String)->Result<crate::journal::RemoveCatalogResult,String>{let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(&folder_path,&mut cache);if !offline&&!missing{return Err("Priečinok existuje na disku – z katalógu ho vyraď cez vylúčenie".into())}if app.0.readonly{return Err("Katalóg je iba na čítanie".into())}crate::backup::backup_now(Path::new(&app.0.catalog),Path::new(&app.0.backups))?;let result=writer.0.remove_folder_from_catalog(&folder_path)?;for chunk in result.asset_ids.chunks(1000){ai.0.forget(chunk.to_vec())}let _=listing.0.invalidate_path(&folder_path);Ok(result)}
 
 #[tauri::command(async)]
 pub fn ai_status(state: State<'_, AiState>) -> AiStatus { state.0.status() }
@@ -255,13 +255,13 @@ pub fn ai_faces_clusters(ai:State<'_,AiState>,db:State<'_,DatabaseState>,min_siz
 #[tauri::command(async)]
 pub fn ai_faces_for_assets(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>)->Result<Vec<AiFaceAsset>,String>{if asset_ids.len()>500{return Err("Najviac 500 asset ID naraz".into())}let ids=asset_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_for_assets(&ids)?;let raw=v["faces"].as_array().cloned().unwrap_or_default();let asset_ids=raw.iter().filter_map(|f|f["asset_id"].as_i64()).collect::<Vec<_>>();let listed=filter_listed_ids(&db.0,&asset_ids,false)?.into_iter().collect::<std::collections::HashSet<_>>();Ok(raw.into_iter().filter_map(|f|{let asset_id=f["asset_id"].as_i64()?;if !listed.contains(&asset_id){return None}Some(AiFaceAsset{face_id:f["face_id"].as_i64()?,asset_id,x:f["x"].as_f64(),y:f["y"].as_f64(),w:f["w"].as_f64(),h:f["h"].as_f64(),person_id:f["person_id"].as_i64(),name:f["name"].as_str().map(str::to_owned),state:f["state"].as_str()?.to_owned(),score:f["score"].as_f64()})}).collect())}
 #[tauri::command(async)]
-pub fn ai_faces_set(ai:State<'_,AiState>,face_ids:Vec<i64>,action:String,person_id:Option<i64>)->Result<usize,String>{if face_ids.len()>500{return Err("Najviac 500 tvÃ¡rÃ­ naraz".into())}let ids=face_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_set(&ids,&action,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
+pub fn ai_faces_set(ai:State<'_,AiState>,face_ids:Vec<i64>,action:String,person_id:Option<i64>)->Result<usize,String>{if face_ids.len()>500{return Err("Najviac 500 tvárí naraz".into())}let ids=face_ids.into_iter().filter(|id|*id>0).collect::<Vec<_>>();let v=ai.0.faces_set(&ids,&action,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
 #[tauri::command(async)]
 pub fn ai_faces_asset_assign(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>,person_id:i64)->Result<usize,String>{if asset_ids.len()>2000{return Err("Najviac 2000 fotiek naraz".into())}let ids=filter_listed_ids(&db.0,&asset_ids,false)?;let v=ai.0.faces_asset_assign(&ids,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
 #[tauri::command(async)]
 pub fn ai_faces_asset_remove(ai:State<'_,AiState>,db:State<'_,DatabaseState>,asset_ids:Vec<i64>,person_id:i64)->Result<usize,String>{if asset_ids.len()>2000{return Err("Najviac 2000 fotiek naraz".into())}let ids=filter_listed_ids(&db.0,&asset_ids,false)?;let v=ai.0.faces_asset_remove(&ids,person_id)?;Ok(v["changed"].as_u64().unwrap_or(0) as usize)}
 #[tauri::command(async)]
-pub fn ai_faces_person_create(ai:State<'_,AiState>,name:String)->Result<i64,String>{let v=ai.0.faces_person_create(&name)?;v["id"].as_i64().ok_or_else(||"AI nevrÃ¡tilo ID osoby".into())}
+pub fn ai_faces_person_create(ai:State<'_,AiState>,name:String)->Result<i64,String>{let v=ai.0.faces_person_create(&name)?;v["id"].as_i64().ok_or_else(||"AI nevrátilo ID osoby".into())}
 #[tauri::command(async)]
 pub fn ai_faces_person_rename(ai:State<'_,AiState>,person_id:i64,name:String)->Result<bool,String>{let v=ai.0.faces_person_rename(person_id,&name)?;Ok(v["ok"].as_bool().unwrap_or(false))}
 #[tauri::command(async)]
@@ -273,7 +273,7 @@ pub fn ai_cluster_ignore(state:State<'_,AiState>,asset_ids:Vec<i64>)->Result<usi
 #[tauri::command(async)]
 pub fn ai_cluster_ignore_reset(state:State<'_,AiState>)->Result<usize,String>{state.0.cluster_ignore_reset()}
 #[tauri::command(async)]
-pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("NeplatnÃ½ typ Å¡tÃ­tku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
+pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("Neplatný typ štítku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
 
 #[derive(Serialize,Clone)]
 #[serde(rename_all="camelCase")]
@@ -394,11 +394,11 @@ pub async fn undo_last_change(state: State<'_, FileManagerState>,ai:State<'_,AiS
 #[tauri::command(async)]
 pub fn get_file_operation_conflicts(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String)->Result<usize,String>{state.0.preview_conflicts(&asset_ids,&target_folder_path,None)}
 #[tauri::command]
-pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"PresÃºvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Presúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
-pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"KopÃ­rujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn copy_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.copy_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Kopírujem".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]
-pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"PremenÃºvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
+pub async fn rename_file(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_id:i64,new_base_name:String)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.rename_file(asset_id,&new_base_name,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Premenúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[derive(serde::Serialize)]
 #[serde(rename_all="camelCase")]
 pub struct FolderRenameResult{pub change_id:Option<i64>,pub summary:String,pub new_path:String}
@@ -605,8 +605,8 @@ pub fn get_asset_paths(db: State<'_, DatabaseState>, listing: State<'_, ListingS
 }
 #[tauri::command(async)]
 pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_id: i64, action: String) -> Result<(), String> {
-    let path = listing.0.asset(asset_id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,asset_id).ok().flatten().and_then(|m|m.asset.path)).ok_or("Cesta sÃºboru sa nenaÅ¡la")?;
-    if !Path::new(&path).exists() { return Err("SÃºbor je offline".into()); }
+    let path = listing.0.asset(asset_id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,asset_id).ok().flatten().and_then(|m|m.asset.path)).ok_or("Cesta súboru sa nenašla")?;
+    if !Path::new(&path).exists() { return Err("Súbor je offline".into()); }
     let mut command=std::process::Command::new("explorer.exe");
     match action.as_str() {
         "open" => { command.arg(&path); }
@@ -614,7 +614,7 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
             use std::os::windows::process::CommandExt;
             let escaped=path.replace('"',"\"\"");command.raw_arg(format!("/select,\"{escaped}\""));
         }
-        _ => return Err("NeznÃ¡ma akcia".into()),
+        _ => return Err("Neznáma akcia".into()),
     }
     command.spawn().map(|_|()).map_err(|e|e.to_string())
 }
@@ -673,15 +673,15 @@ mod editor_tests {
 #[tauri::command(async)]
 pub fn open_in_editor(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, exe: String, multi: bool) -> Result<usize, String> {
     let exe = exe.trim();
-    if !Path::new(exe).is_file() { return Err(format!("Program sa nenaÅ¡iel: {exe}")); }
+    if !Path::new(exe).is_file() { return Err(format!("Program sa nenašiel: {exe}")); }
     let paths: Vec<String> = asset_ids.into_iter()
         .filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path)))
         .filter(|p| Path::new(p).is_file()).collect();
-    if paths.is_empty() { return Err("Å½iadny z vybranÃ½ch sÃºborov nie je dostupnÃ½".into()); }
+    if paths.is_empty() { return Err("Žiadny z vybraných súborov nie je dostupný".into()); }
     if multi {
         std::process::Command::new(exe).args(&paths).spawn().map_err(|e| e.to_string())?;
     } else {
-        if paths.len() > 20 { return Err("Tento program berie sÃºbory po jednom â€“ vyber najviac 20 sÃºborov".into()); }
+        if paths.len() > 20 { return Err("Tento program berie súbory po jednom – vyber najviac 20 súborov".into()); }
         for path in &paths { std::process::Command::new(exe).arg(path).spawn().map_err(|e| e.to_string())?; }
     }
     Ok(paths.len())
@@ -845,11 +845,11 @@ fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
     add("Caption", a.caption.clone()); add("Notes", a.notes.clone()); add("Author", a.author.clone());
     add("Rating", Some(a.rating.filter(|v| *v > 0).map(|v| v.to_string()).unwrap_or_else(|| "0".into())));
     add("Label", Some(a.label.clone().unwrap_or_else(|| "-".into())));
-    add("Tagged", Some(if a.tagged.unwrap_or(0) != 0 { "Ãno" } else { "Nie" }.into()));
+    add("Tagged", Some(if a.tagged.unwrap_or(0) != 0 { "Áno" } else { "Nie" }.into()));
     add("Categories", (!data.categories.is_empty()).then(||data.categories.join(", ")));
     add("Keywords", (!data.keywords.is_empty()).then(||data.keywords.join(", ")));
     add("Date taken", a.exif_date.clone());
-    add("Dimensions", match (a.width,a.height) {(Some(w),Some(h))=>Some(format!("{w} Ã— {h}")),_=>None});
+    add("Dimensions", match (a.width,a.height) {(Some(w),Some(h))=>Some(format!("{w} × {h}")),_=>None});
     add("Bits per pixel", a.bpp.map(|v| v.to_string()));
     add("File modified", a.file_modified.clone());
     tags

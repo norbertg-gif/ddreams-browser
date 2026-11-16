@@ -1,9 +1,9 @@
 use serde::Serialize;
 use std::{collections::HashMap, env, ffi::OsString, path::{Path, PathBuf}};
 
-const DEV_EXIFTOOL: &str = r"G:\Programovanie\photosort\tools\exiftool\exiftool.exe";
+const DEV_EXIFTOOL: &str = r"G:\Programovanie\ddreams-browser\tools\exiftool\exiftool.exe";
 const DEV_CACHE: &str = r"G:\ddreams-work\thumb-cache";
-const DEV_AI_PYTHON: &str = r"G:\Programovanie\photosort\.venv\Scripts\python.exe";
+const DEV_AI_PYTHON: &str = r"G:\DDreams\modules\python\Scripts\python.exe";
 const DEV_AI_MODEL: &str = r"G:\DDreams\modules\ai\model";
 
 #[derive(Clone, Debug)]

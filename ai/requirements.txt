@@ -1,0 +1,10 @@
+# Python runtime of the DDreams AI server and RAW plugin (see tools/setup-python.ps1).
+# onnxruntime-gpu for faces lives separately in modules\ai\pylibs.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.14.1+cu126
+torchvision==0.29.1+cu126
+open_clip_torch==3.3.0
+safetensors==0.8.0
+numpy==2.5.4
+pillow==13.0.0
+rawpy==0.27.1
