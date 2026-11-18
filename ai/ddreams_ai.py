@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from collections import deque
+from contextlib import closing
 import ctypes
 import gc
 import hashlib
@@ -29,6 +30,17 @@ DIMENSION = 1024
 SCHEMA_VERSION = "1"
 COLOR_VERSION = 1
 QUALITY_VERSION = 1
+RAW_DECODER_VERSION = 1
+RAW_EXTENSIONS = frozenset({
+    "3fr", "arq", "arw", "bay", "cap", "cr2", "cr3", "crw", "cs1", "dcr", "dcs",
+    "dng", "drf", "eip", "erf", "fff", "gpr", "iiq", "k25", "kdc", "mdc", "mef",
+    "mos", "mrw", "nef", "nrw", "orf", "ori", "pef", "ptx", "pxn", "r3d", "raf",
+    "raw", "rw2", "rwl", "rwz", "sr2", "srf", "srw", "x3f",
+})
+RAW_RETRY_ERRORS = frozenset({
+    "LibRawNoThumbnailError", "LibRawUnsupportedThumbnailError", "UnidentifiedImageError",
+})
+RAW_MIN_EMBEDDED_PX = 800
 FACE_VERSION = 1
 FACE_IMAGE_MAX = 2048
 FACE_MIN_SIDE = 28
@@ -217,6 +229,46 @@ def process_memory() -> dict[str, int] | None:
         return None
 
 
+def _decode_raw(path: str, decode_side: int):
+    from PIL import Image, ImageOps
+    import rawpy
+
+    # Files with a RAW suffix can contain ordinary images. Preserve errors such as
+    # LibRawTooBigError so the indexing worker can record them.
+    try:
+        raw_file = rawpy.imread(path)
+    except rawpy.LibRawFileUnsupportedError:
+        return None
+
+    min_preview = min(decode_side, RAW_MIN_EMBEDDED_PX)
+    with raw_file as raw:
+        try:
+            thumb = raw.extract_thumb()
+        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+            thumb = None
+
+        image = None
+        if thumb is not None and thumb.format == rawpy.ThumbFormat.JPEG:
+            try:
+                with Image.open(io.BytesIO(thumb.data)) as preview:
+                    if max(preview.size) >= min_preview:
+                        preview.draft("RGB", (decode_side, decode_side))
+                        image = ImageOps.exif_transpose(preview).convert("RGB")
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError):
+                pass
+        elif thumb is not None and thumb.format == rawpy.ThumbFormat.BITMAP:
+            pixels = thumb.data
+            if pixels.ndim == 3 and pixels.shape[2] == 3 and max(pixels.shape[:2]) >= min_preview:
+                image = Image.fromarray(pixels, "RGB")
+            del pixels
+        # Release the preview data before allocating the developed image.
+        del thumb
+        if image is None:
+            image = Image.fromarray(raw.postprocess(half_size=True, use_camera_wb=True, output_bps=8))
+    image.thumbnail((decode_side, decode_side), Image.Resampling.BICUBIC)
+    return image
+
+
 def decode_photo(item: dict[str, Any], max_side: int = 512):
     """Decode a photo to an oriented RGB PIL image suitable for model input."""
     from PIL import Image, ImageOps
@@ -224,29 +276,18 @@ def decode_photo(item: dict[str, Any], max_side: int = 512):
     path = item["path"]
     ext = Path(path).suffix.lower().lstrip(".")
     decode_side = max(1024, max_side)
-    if ext in {"arw", "dng", "cr2", "nef"}:
-        import rawpy
+    if ext in RAW_EXTENSIONS:
+        image = _decode_raw(path, decode_side)
+        if image is not None:
+            return _finish_decoded(image, max_side)
 
-        with rawpy.imread(path) as raw:
-            thumb = raw.extract_thumb()
-        if thumb.format == rawpy.ThumbFormat.JPEG:
-            image = Image.open(io.BytesIO(thumb.data))
-            image.load()
-            image = image.convert("RGB")
-        elif thumb.format == rawpy.ThumbFormat.BITMAP:
-            image = Image.fromarray(np.asarray(thumb.data).reshape(thumb.height, thumb.width, 3), "RGB")
-        else:
-            raise ValueError(f"RAW preview format nepodporovaný: {thumb.format}")
-        return _finish_decoded(ImageOps.exif_transpose(image).convert("RGB"), max_side)
-
-    image = Image.open(path)
-    if ext in {"jpg", "jpeg", "png"}:
-        image.draft("RGB", (decode_side, decode_side))
-    if ext in {"tif", "tiff"}:
-        image.thumbnail((decode_side, decode_side), Image.Resampling.BICUBIC)
-    image = ImageOps.exif_transpose(image)
-    image.load()
-    return _finish_decoded(image.convert("RGB"), max_side)
+    with Image.open(path) as source:
+        if ext in {"jpg", "jpeg", "png"} or (ext in RAW_EXTENSIONS and source.format in {"JPEG", "PNG"}):
+            source.draft("RGB", (decode_side, decode_side))
+        if ext in {"tif", "tiff"} or (ext in RAW_EXTENSIONS and source.format == "TIFF"):
+            source.thumbnail((decode_side, decode_side), Image.Resampling.BICUBIC)
+        image = ImageOps.exif_transpose(source).convert("RGB")
+    return _finish_decoded(image, max_side)
 
 
 def _finish_decoded(image: Any, max_side: int = 512):
@@ -553,6 +594,7 @@ class AIService:
         """)
         self.db_lock = threading.RLock()
         self._lock = threading.RLock()
+        self._retry_raw_decode_failures()
         meta = dict(self.db.execute("SELECT key,value FROM meta").fetchall())
         if meta.get("model") != self.model_name or meta.get("schema_version") != SCHEMA_VERSION:
             self.db.execute("DELETE FROM embeddings")
@@ -603,6 +645,46 @@ class AIService:
         self._loader: threading.Thread | None = None
         self._worker: threading.Thread | None = None
         self._face_worker: threading.Thread | None = None
+
+    def _retry_raw_decode_failures(self) -> None:
+        if self.faces_db is None:
+            return
+        # Startup only, before either worker starts. Retain the AI failure rows
+        # until the face transaction commits, so an interrupted migration can resume.
+        with self.db:
+            self.db.execute("BEGIN IMMEDIATE")
+            marker = self.db.execute("SELECT value FROM meta WHERE key='raw_decoder_version'").fetchone()
+            if marker is not None and int(marker[0]) >= RAW_DECODER_VERSION:
+                return
+
+            retry_ids, other_ids = [], []
+            for asset_id, error in self.db.execute("SELECT asset_id,error FROM failures"):
+                kind = error.partition(":")[0]
+                if kind == "LibRawTooBigError":
+                    continue
+                (retry_ids if kind in RAW_RETRY_ERRORS else other_ids).append(asset_id)
+
+            # The app puts ai.sqlite beside the catalogue and inherits DDREAMS_CATALOG
+            # when an alternate catalogue filename is configured.
+            catalog = Path(os.environ.get("DDREAMS_CATALOG") or Path(self.db_path).with_name("catalog.sqlite"))
+            if other_ids and catalog.is_file():
+                with closing(sqlite3.connect(catalog.resolve().as_uri() + "?mode=ro", uri=True)) as conn:
+                    for start in range(0, len(other_ids), 500):
+                        chunk = other_ids[start:start + 500]
+                        marks = ",".join("?" for _ in chunk)
+                        for asset_id, path in conn.execute(f"SELECT id,path FROM assets WHERE id IN ({marks})", chunk):
+                            if path and Path(path).suffix.lower().lstrip(".") in RAW_EXTENSIONS:
+                                retry_ids.append(asset_id)
+
+            with self.faces_db:
+                self.faces_db.executemany(
+                    """DELETE FROM face_scan WHERE asset_id=?
+                       AND NOT EXISTS (SELECT 1 FROM faces WHERE faces.asset_id=face_scan.asset_id)""",
+                    ((asset_id,) for asset_id in retry_ids),
+                )
+            self.db.executemany("DELETE FROM failures WHERE asset_id=?", ((asset_id,) for asset_id in retry_ids))
+            self.db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('raw_decoder_version',?)",
+                            (str(RAW_DECODER_VERSION),))
 
     def _emit(self, obj: dict[str, Any]) -> None:
         try:

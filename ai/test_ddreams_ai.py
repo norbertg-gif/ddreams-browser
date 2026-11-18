@@ -7,11 +7,14 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 from PIL import Image, ImageFilter
 
 from ddreams_ai import AIService, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+from ddreams_ai import RAW_DECODER_VERSION, RAW_EXTENSIONS, decode_photo
 from faces_schema import ensure_faces_schema
 from import_acdsee_faces import import_acdsee_faces
 
@@ -23,6 +26,74 @@ class FakePhoto:
 
 def set_vectors(service, vectors):
     service._vectors = VectorIndex(list(vectors), np.stack(list(vectors.values())))
+
+class RawDecodeTests(unittest.TestCase):
+    def test_all_catalogue_raw_extensions_are_recognized(self):
+        formats_path = Path(__file__).resolve().parents[1] / "src-tauri" / "formats.json"
+        formats = json.loads(formats_path.read_text(encoding="utf-8"))["formats"]
+        self.assertEqual({entry["ext"] for entry in formats if entry["group"] == "raw"}, RAW_EXTENSIONS)
+
+    def test_missing_unsupported_and_unusable_raw_previews_develop_at_half_size(self):
+        import rawpy
+
+        thumb_small = io.BytesIO()
+        Image.new("RGB", (100, 80)).save(thumb_small, format="JPEG")
+        cases = (
+            rawpy.LibRawNoThumbnailError(),
+            rawpy.LibRawUnsupportedThumbnailError(),
+            SimpleNamespace(format=rawpy.ThumbFormat.JPEG, data=b"broken jpeg"),
+            SimpleNamespace(format=rawpy.ThumbFormat.JPEG, data=thumb_small.getvalue()),
+        )
+        for case in cases:
+            with self.subTest(preview=type(case).__name__):
+                raw = MagicMock()
+                raw.__enter__.return_value = raw
+                if isinstance(case, Exception):
+                    raw.extract_thumb.side_effect = case
+                else:
+                    raw.extract_thumb.return_value = case
+                raw.postprocess.return_value = np.full((300, 600, 3), 140, dtype=np.uint8)
+                with patch("rawpy.imread", return_value=raw) as read:
+                    image = decode_photo({"path": "bez-náhľadu.DNG"}, max_side=256)
+                read.assert_called_once_with("bez-náhľadu.DNG")
+                raw.postprocess.assert_called_once_with(half_size=True, use_camera_wb=True, output_bps=8)
+                raw.__exit__.assert_called_once()
+                self.assertEqual((image.mode, image.size), ("RGB", (256, 128)))
+                self.assertIn("ddreams_quality", image.info)
+
+    def test_large_embedded_jpeg_avoids_developing_the_raw(self):
+        import rawpy
+
+        thumb = io.BytesIO()
+        Image.new("RGB", (1000, 800)).save(thumb, format="JPEG")
+        raw = MagicMock()
+        raw.__enter__.return_value = raw
+        raw.extract_thumb.return_value = SimpleNamespace(format=rawpy.ThumbFormat.JPEG, data=thumb.getvalue())
+        with patch("rawpy.imread", return_value=raw):
+            image = decode_photo({"path": "preview.cr3"})
+        raw.postprocess.assert_not_called()
+        raw.__exit__.assert_called_once()
+        self.assertEqual(image.size, (512, 410))
+
+    def test_ordinary_jpeg_with_raw_suffix_uses_pillow(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "obrázok.raw"
+            Image.new("RGB", (64, 40), "red").save(path, format="JPEG")
+            image = decode_photo({"path": str(path)})
+        self.assertEqual((image.mode, image.size), ("RGB", (64, 40)))
+        self.assertGreater(image.getpixel((0, 0))[0], 240)
+
+    def test_too_big_is_propagated_and_closes_raw(self):
+        import rawpy
+
+        raw = MagicMock()
+        raw.__enter__.return_value = raw
+        raw.extract_thumb.side_effect = rawpy.LibRawNoThumbnailError()
+        raw.postprocess.side_effect = rawpy.LibRawTooBigError()
+        with patch("rawpy.imread", return_value=raw), self.assertRaises(rawpy.LibRawTooBigError):
+            decode_photo({"path": "large.dng"})
+        raw.__exit__.assert_called_once()
+
 
 class QualityTests(unittest.TestCase):
     def test_sharp_checkerboard_scores_above_blurred_copy(self):
@@ -300,6 +371,80 @@ class LazyModelTests(unittest.TestCase):
         self.assertEqual(len(row[0]), DIMENSION * 2)
         self.service._embedder = None
         self.assertIn("krajina", self.service._cluster_names())
+
+
+class RawDecoderRetryTests(unittest.TestCase):
+    def test_startup_retries_only_targeted_assets_once_and_preserves_faces(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "ai.sqlite"
+            catalog_path = root / "custom.sqlite"
+            catalog = sqlite3.connect(catalog_path)
+            with catalog:
+                catalog.execute("CREATE TABLE assets(id INTEGER PRIMARY KEY, path TEXT)")
+                catalog.executemany("INSERT INTO assets VALUES(?,?)", [
+                    (1, "first.dng"), (2, "misnamed.raw"), (3, "thumb.dng"), (4, "camera.RAF"),
+                    (5, "other.jpg"), (6, "protected.dng"), (7, "large.dng"), (8, "unchanged.dng"),
+                ])
+            catalog.close()
+            with patch.dict(os.environ, {"DDREAMS_CATALOG": str(catalog_path)}):
+                service = AIService(db, "fake", embedder_factory=FakeEmbedder)
+                try:
+                    with service.db:
+                        service.db.execute("UPDATE meta SET value='0' WHERE key='raw_decoder_version'")
+                        service.db.executemany("INSERT INTO failures VALUES(?,10,20,?,0)", [
+                            (1, "LibRawNoThumbnailError: No thumbnail in file"),
+                            (2, "UnidentifiedImageError: invalid preview"),
+                            (3, "LibRawUnsupportedThumbnailError: unsupported thumbnail"),
+                            (4, "LibRawDataError: corrupted data"),
+                            (5, "ValueError: unrelated"),
+                            (6, "LibRawNoThumbnailError: No thumbnail in file"),
+                            (7, "LibRawTooBigError: too big"),
+                            (9, "LibRawNoThumbnailError: no path in catalogue"),
+                        ])
+                    with service.faces_db:
+                        service.faces_db.executemany("INSERT INTO face_scan VALUES(?,10,20,?,0)",
+                                                     [(i, FACE_VERSION) for i in range(1, 10)])
+                        service.faces_db.execute("INSERT INTO persons(id,name) VALUES(11,'Ľudmila')")
+                        service.faces_db.execute("""INSERT INTO faces(id,asset_id,source,person_id,state)
+                                                   VALUES(16,6,'ai',11,'confirmed')""")
+                        service.faces_db.execute("INSERT INTO face_thumbs VALUES(16,X'0102')")
+                        service.faces_db.execute("INSERT INTO face_rejected VALUES(16,11)")
+                finally:
+                    service.stop()
+
+                reopened = AIService(db, "fake", embedder_factory=FakeEmbedder)
+                try:
+                    self.assertEqual(reopened.db.execute("SELECT asset_id FROM failures ORDER BY asset_id").fetchall(), [(5,), (7,)])
+                    self.assertEqual(reopened.faces_db.execute("SELECT asset_id FROM face_scan ORDER BY asset_id").fetchall(),
+                                     [(5,), (6,), (7,), (8,)])
+                    self.assertEqual(reopened.faces_db.execute("SELECT id,asset_id,person_id,state FROM faces").fetchall(),
+                                     [(16, 6, 11, "confirmed")])
+                    self.assertEqual(reopened.faces_db.execute("SELECT id,name FROM persons").fetchall(), [(11, "Ľudmila")])
+                    self.assertEqual(reopened.faces_db.execute("SELECT * FROM face_thumbs").fetchall(), [(16, b"\x01\x02")])
+                    self.assertEqual(reopened.faces_db.execute("SELECT * FROM face_rejected").fetchall(), [(16, 11)])
+                    self.assertEqual(reopened.db.execute("SELECT value FROM meta WHERE key='raw_decoder_version'").fetchone(),
+                                     (str(RAW_DECODER_VERSION),))
+                    items = [{"asset_id": i, "path": str(root / f"{i}.dng"), "size": 10, "mtime_ns": 20}
+                             for i in (1, 6, 7)]
+                    result = reopened.execute({"cmd": "index", "items": items, "append": True})
+                    self.assertEqual((result["queued"], result["failed_before"]), (2, 1))
+                    self.assertEqual([item["asset_id"] for item in reopened._face_scan_queue], [1])
+                    with reopened.db:
+                        reopened.db.execute("INSERT INTO failures VALUES(1,10,20,'LibRawNoThumbnailError: again',0)")
+                    with reopened.faces_db:
+                        reopened.faces_db.execute("INSERT INTO face_scan VALUES(1,10,20,?,0)", (FACE_VERSION,))
+                finally:
+                    reopened.stop()
+
+                repeated = AIService(db, "fake", embedder_factory=FakeEmbedder)
+                try:
+                    self.assertEqual(repeated.db.execute("SELECT asset_id FROM failures ORDER BY asset_id").fetchall(),
+                                     [(1,), (5,), (7,)])
+                    self.assertEqual(repeated.faces_db.execute("SELECT asset_id FROM face_scan ORDER BY asset_id").fetchall(),
+                                     [(1,), (5,), (6,), (7,), (8,)])
+                finally:
+                    repeated.stop()
 
 
 class FaceTests(unittest.TestCase):
