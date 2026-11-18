@@ -22,7 +22,7 @@ pub enum Miss { Failed }
 pub trait PreviewSource: Send + Sync {
     fn name(&self) -> &'static str;
     fn supports(&self, group: Option<&str>) -> bool;
-    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss>;
+    fn preview(&self, request: &PreviewRequest, group: Option<&str>) -> Result<DynamicImage, Miss>;
 }
 
 pub struct PreviewChain { sources: Vec<Arc<dyn PreviewSource>> }
@@ -42,7 +42,7 @@ impl PreviewChain {
     pub fn preview(&self, request: &PreviewRequest, group: Option<&str>) -> Result<Preview, ThumbnailError> {
         for source in &self.sources {
             if !source.supports(group) { continue; }
-            if let Ok(image) = source.preview(request) { return Ok(Preview { image, source: source.name() }); }
+            if let Ok(image) = source.preview(request, group) { return Ok(Preview { image, source: source.name() }); }
         }
         Err(ThumbnailError::Unsupported)
     }
@@ -52,20 +52,20 @@ struct NativeSource;
 impl PreviewSource for NativeSource {
     fn name(&self) -> &'static str { "Native" }
     fn supports(&self, group: Option<&str>) -> bool { group == Some("image") }
-    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> { decode_file(&request.path).map_err(|_| Miss::Failed) }
+    fn preview(&self, request: &PreviewRequest, _: Option<&str>) -> Result<DynamicImage, Miss> { decode_file(&request.path).map_err(|_| Miss::Failed) }
 }
 struct ExifToolSource { exif: Arc<ExifTool> }
 impl PreviewSource for ExifToolSource {
     fn name(&self) -> &'static str { "ExifTool" }
     fn supports(&self, group: Option<&str>) -> bool { matches!(group, Some("image" | "raw")) }
-    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> {
+    fn preview(&self, request: &PreviewRequest, _: Option<&str>) -> Result<DynamicImage, Miss> {
         let (bytes, orientation) = self.exif.largest_preview_with_orientation(&request.path).map_err(|_| Miss::Failed)?;
         decode_memory(&bytes, orientation).map_err(|_| Miss::Failed)
     }
 }
 
-/// External RAW plugin (raw/ddreams_raw.py, LibRaw via rawpy) for RAW files without a usable embedded
-/// preview, e.g. phone DNGs or DxO/Topaz linear DNGs. One long-lived process, started on first use,
+/// External Python plugin for RAW development and images the native decoder cannot read.
+/// One long-lived process, started on first use,
 /// JSON lines over stdin/stdout, requests answered concurrently and matched by id.
 #[derive(Clone, Debug)]
 pub struct RawPluginConfig { pub python: PathBuf, pub script: PathBuf }
@@ -103,7 +103,7 @@ impl LibRawSource {
         }).map_err(|e| e.to_string())?;
         Ok(RawProcess { child, stdin, pending })
     }
-    fn render(&self, path: &Path, size: u32) -> Result<Vec<u8>, String> {
+    fn render(&self, path: &Path, size: u32, group: Option<&str>) -> Result<Vec<u8>, String> {
         use std::io::Write;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (reply, response) = std::sync::mpsc::sync_channel(1);
@@ -112,7 +112,7 @@ impl LibRawSource {
             if process.as_mut().map(|p| !matches!(p.child.try_wait(), Ok(None))).unwrap_or(true) { *process = Some(self.spawn()?); }
             let running = process.as_mut().ok_or("RAW plugin unavailable")?;
             running.pending.lock().map_err(|_| "RAW plugin lock poisoned")?.insert(id, reply);
-            let line = serde_json::json!({ "id": id, "path": path.to_string_lossy(), "size": size }).to_string() + "\n";
+            let line = serde_json::json!({ "id": id, "path": path.to_string_lossy(), "size": size, "group": group }).to_string() + "\n";
             if let Err(error) = running.stdin.write_all(line.as_bytes()).and_then(|_| running.stdin.flush()) {
                 let _ = running.child.kill(); *process = None; return Err(error.to_string());
             }
@@ -129,10 +129,10 @@ impl Drop for LibRawSource {
     fn drop(&mut self) { if let Ok(mut process) = self.process.lock() { if let Some(mut p) = process.take() { let _ = p.child.kill(); } } }
 }
 impl PreviewSource for LibRawSource {
-    fn name(&self) -> &'static str { "LibRaw" }
-    fn supports(&self, group: Option<&str>) -> bool { group == Some("raw") }
-    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> {
-        let bytes = self.render(&request.path, request.size).map_err(|_| Miss::Failed)?;
+    fn name(&self) -> &'static str { "LibRaw/Pillow" }
+    fn supports(&self, group: Option<&str>) -> bool { matches!(group, Some("raw" | "image")) }
+    fn preview(&self, request: &PreviewRequest, group: Option<&str>) -> Result<DynamicImage, Miss> {
+        let bytes = self.render(&request.path, request.size, group).map_err(|_| Miss::Failed)?;
         decode_memory(&bytes, None).map_err(|_| Miss::Failed)
     }
 }
@@ -161,7 +161,7 @@ impl Default for WindowsShellSource { fn default() -> Self { Self::new() } }
 impl PreviewSource for WindowsShellSource {
     fn name(&self) -> &'static str { "WindowsShell" }
     fn supports(&self, _group: Option<&str>) -> bool { true }
-    fn preview(&self, request: &PreviewRequest) -> Result<DynamicImage, Miss> {
+    fn preview(&self, request: &PreviewRequest, _: Option<&str>) -> Result<DynamicImage, Miss> {
         let (reply, response) = std::sync::mpsc::sync_channel(1);
         let generation = {
             let worker = self.worker.lock().map_err(|_| Miss::Failed)?;
@@ -262,7 +262,7 @@ impl ThumbService {
         let key=cache_key(&path,target,modified,meta.len());let store=if size==0 {1}else{0};let directory=self.cache.join(if store==1{"viewer"}else{"thumbs"});
         let cache_file=directory.join(format!("{key}.jpg"));let miss_file=directory.join(format!("{key}.miss"));let source_file=directory.join(format!("{key}.source"));
         if let Ok(bytes)=std::fs::read(&cache_file){if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}touch_if_stale(&cache_file);let source=std::fs::read_to_string(source_file).unwrap_or_else(|_|"Cache".into());return Ok(CacheLookup::Hit(RenderedPreview{bytes,source}))}
-        if miss_file.is_file(){return Err(ThumbnailError::Unsupported)}
+        if miss_file.is_file() && miss_marker_matches(&miss_file,&self.chain.signature()){return Err(ThumbnailError::Unsupported)}
         Ok(CacheLookup::NeedsRender(RenderJob{path:file.to_path_buf(),ext,target,store,directory,cache_file,miss_file,source_file}))
     }
     pub fn render(&self,id:i64,size:u32,epoch:u64)->Result<RenderedPreview,ThumbnailError>{
@@ -271,7 +271,7 @@ impl ThumbService {
     fn generate(&self,job:RenderJob,epoch:u64)->Result<RenderedPreview,ThumbnailError>{
         let RenderJob{path,ext,target,store,directory,cache_file,miss_file,source_file}=job;
         let request=PreviewRequest{path,size:target};
-        let preview=match self.chain.preview(&request,self.formats.group(&ext)){Ok(v)=>v,Err(ThumbnailError::Unsupported)=>{std::fs::create_dir_all(&directory).map_err(|_|ThumbnailError::Unavailable)?;let _=std::fs::write(&miss_file,b"");return Err(ThumbnailError::Unsupported)},Err(e)=>return Err(e)};
+        let preview=match self.chain.preview(&request,self.formats.group(&ext)){Ok(v)=>v,Err(ThumbnailError::Unsupported)=>{std::fs::create_dir_all(&directory).map_err(|_|ThumbnailError::Unavailable)?;let _=std::fs::write(&miss_file,self.chain.signature());return Err(ThumbnailError::Unsupported)},Err(e)=>return Err(e)};
         let image=if preview.image.width()<=target&&preview.image.height()<=target{preview.image}else{preview.image.thumbnail(target,target)};
         let bytes=encode_jpeg(image).map_err(|_|ThumbnailError::Decode)?;
         if epoch<self.epoch.load(Ordering::Relaxed){return Err(ThumbnailError::Stale)}
@@ -301,7 +301,7 @@ pub fn evict_cache(dir:&Path,limit:u64)->std::io::Result<()> {
 pub fn reset_misses_if_chain_changed(cache:&Path,signature:&str)->std::io::Result<bool> {
     let marker=cache.join("preview-chain.txt");
     if std::fs::read_to_string(&marker).map(|s|s.trim()==signature).unwrap_or(false){return Ok(false)}
-    for dir in ["thumbs","viewer"]{let Ok(entries)=std::fs::read_dir(cache.join(dir)) else{continue};for entry in entries.flatten(){if entry.path().extension().is_some_and(|e|e=="miss"){let _=std::fs::remove_file(entry.path());}}}
+    for dir in ["thumbs","viewer"]{let Ok(entries)=std::fs::read_dir(cache.join(dir)) else{continue};for entry in entries.flatten(){let path=entry.path();if path.extension().is_some_and(|e|e=="miss") && !miss_marker_matches(&path,signature){let _=std::fs::remove_file(path);}}}
     std::fs::create_dir_all(cache)?;std::fs::write(marker,signature)?;Ok(true)
 }
 pub fn cleanup_legacy_cache(root:&Path)->std::io::Result<()> {for entry in std::fs::read_dir(root)?{let entry=entry?;if !entry.file_type()?.is_file(){continue}let name=entry.file_name().to_string_lossy().into_owned();if legacy_name(&name){let _=std::fs::remove_file(entry.path());}}Ok(())}
@@ -311,8 +311,7 @@ fn legacy_name(s:&str)->bool{let Some((stem,tail))=s.split_once('.')else{return 
 pub fn cache_key(path:&str,size:u32,modified:u128,length:u64)->String {
     Sha256::digest(format!("thumb-v5-buckets|{path}|{size}|{modified}|{length}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect()
 }
-#[cfg(test)]
-pub fn miss_marker_exists(path:&Path)->bool { path.is_file() }
+fn miss_marker_matches(path:&Path,signature:&str)->bool { std::fs::read_to_string(path).is_ok_and(|value| value==signature) }
 
 fn decode_file(path:&Path)->image::ImageResult<DynamicImage>{
     let file=std::fs::File::open(path)?; let reader=ImageReader::new(BufReader::new(file)).with_guessed_format()?;
@@ -343,7 +342,7 @@ mod tests {
     impl PreviewSource for Fake {
         fn name(&self)->&'static str{self.name}
         fn supports(&self,group:Option<&str>)->bool{group==Some(self.group)}
-        fn preview(&self,_:&PreviewRequest)->Result<DynamicImage,Miss>{self.calls.fetch_add(1,Ordering::Relaxed);if self.succeed{Ok(DynamicImage::ImageRgb8(image::RgbImage::new(2,2)))}else{Err(Miss::Failed)}}
+        fn preview(&self,_:&PreviewRequest,_:Option<&str>)->Result<DynamicImage,Miss>{self.calls.fetch_add(1,Ordering::Relaxed);if self.succeed{Ok(DynamicImage::ImageRgb8(image::RgbImage::new(2,2)))}else{Err(Miss::Failed)}}
     }
     #[test] fn chain_preserves_order_and_falls_through(){let first=Arc::new(Fake::new("first","image",false));let second=Arc::new(Fake::new("second","image",true));let chain=PreviewChain::with_sources(vec![first.clone(),second.clone()]);let p=chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("image")).unwrap();assert_eq!(p.source,"second");assert_eq!(first.calls.load(Ordering::Relaxed),1);assert_eq!(second.calls.load(Ordering::Relaxed),1);}
     #[test] fn chain_skips_sources_for_other_groups(){let native=Arc::new(Fake::new("native","image",true));let shell=Arc::new(Fake::new("shell","other",true));let chain=PreviewChain::with_sources(vec![native.clone(),shell.clone()]);assert_eq!(chain.preview(&PreviewRequest{path:PathBuf::new(),size:90},Some("other")).unwrap().source,"shell");assert_eq!(native.calls.load(Ordering::Relaxed),0);}
@@ -363,20 +362,33 @@ mod tests {
         match service.lookup(1,180,1).unwrap(){CacheLookup::Hit(data)=>assert_eq!(data.bytes,b"cached"),CacheLookup::NeedsRender(_)=>panic!("cache miss")};
         assert_eq!(fake.calls.load(Ordering::Relaxed),0); let _=std::fs::remove_dir_all(dir);
     }
-    #[test] fn cache_miss_marker_round_trip(){let path=std::env::temp_dir().join(format!("ddreams-{}.miss",std::process::id()));let _=std::fs::remove_file(&path);assert!(!miss_marker_exists(&path));std::fs::write(&path,b"").unwrap();assert!(miss_marker_exists(&path));let _=std::fs::remove_file(path);}
     #[test] fn cache_key_is_versioned_and_size_specific(){assert_ne!(cache_key("a.jpg",cache_bucket(180),1,2),cache_key("a.jpg",cache_bucket(2048),1,2));}
     #[test] fn bucket_mapping_is_fixed(){assert_eq!([cache_bucket(0),cache_bucket(48),cache_bucket(160),cache_bucket(161),cache_bucket(320),cache_bucket(321),cache_bucket(1200)],[2048,160,160,320,320,480,480]);}
     #[test] fn eviction_removes_oldest_groups_to_eighty_percent(){let dir=temp_dir("evict");std::fs::create_dir_all(&dir).unwrap();let keys=["a".repeat(64),"b".repeat(64),"c".repeat(64)];for (key,age) in keys.iter().zip([300,200,100]){std::fs::write(dir.join(format!("{key}.jpg")),vec![0;10]).unwrap();std::fs::write(dir.join(format!("{key}.source")),b"x").unwrap();let time=std::time::SystemTime::now()-std::time::Duration::from_secs(age);std::fs::OpenOptions::new().write(true).open(dir.join(format!("{key}.jpg"))).unwrap().set_modified(time).unwrap();}evict_cache(&dir,25).unwrap();assert!(!dir.join(format!("{}.jpg",keys[0])).exists());assert!(!dir.join(format!("{}.source",keys[0])).exists());assert!(dir.join(format!("{}.jpg",keys[1])).exists());assert!(dir.join(format!("{}.jpg",keys[2])).exists());let _=std::fs::remove_dir_all(dir);}
     #[test] fn legacy_cleanup_only_removes_known_flat_cache_names(){let dir=temp_dir("legacy");std::fs::create_dir_all(dir.join("tile-exif")).unwrap();std::fs::write(dir.join(format!("{}.jpg","a".repeat(64))),b"").unwrap();std::fs::write(dir.join(format!("{}.12.3.tmp","b".repeat(64))),b"").unwrap();std::fs::write(dir.join("notes.txt"),b"").unwrap();cleanup_legacy_cache(&dir).unwrap();assert!(!dir.join(format!("{}.jpg","a".repeat(64))).exists());assert!(!dir.join(format!("{}.12.3.tmp","b".repeat(64))).exists());assert!(dir.join("notes.txt").exists());assert!(dir.join("tile-exif").is_dir());let _=std::fs::remove_dir_all(dir);}
     #[test] fn changed_preview_chain_drops_stale_miss_markers_once(){
-        let dir=temp_dir("misses");std::fs::create_dir_all(dir.join("thumbs")).unwrap();std::fs::create_dir_all(dir.join("viewer")).unwrap();
-        let miss=dir.join("thumbs").join(format!("{}.miss","a".repeat(64)));let jpg=dir.join("thumbs").join(format!("{}.jpg","b".repeat(64)));
-        std::fs::write(&miss,b"").unwrap();std::fs::write(&jpg,b"x").unwrap();
-        assert!(reset_misses_if_chain_changed(&dir,"Native,ExifTool,LibRaw,WindowsShell").unwrap());
-        assert!(!miss.exists());assert!(jpg.exists());
-        std::fs::write(&miss,b"").unwrap();
-        assert!(!reset_misses_if_chain_changed(&dir,"Native,ExifTool,LibRaw,WindowsShell").unwrap(),"same chain: markers stay");
-        assert!(miss.exists());let _=std::fs::remove_dir_all(dir);
+        let dir=temp_dir("misses");
+        for bucket in ["thumbs","viewer"] {std::fs::create_dir_all(dir.join(bucket)).unwrap();}
+        let old="Native,ExifTool,LibRaw,WindowsShell";
+        let plugin=Arc::new(LibRawSource::new(RawPluginConfig{python:PathBuf::new(),script:PathBuf::new()}));
+        assert!(plugin.supports(Some("image")) && plugin.supports(Some("raw")) && !plugin.supports(Some("video")));
+        let chain=PreviewChain::with_sources(vec![Arc::new(NativeSource),Arc::new(Fake::new("ExifTool","image",false)),plugin,Arc::new(Fake::new("WindowsShell","image",false))]);
+        let signature=chain.signature();
+        assert_ne!(old,signature);
+        std::fs::write(dir.join("preview-chain.txt"),old).unwrap();
+        let thumb=dir.join("thumbs").join(format!("{}.miss","a".repeat(64)));
+        let viewer=dir.join("viewer").join(format!("{}.miss","a".repeat(64)));
+        let jpg=dir.join("thumbs").join(format!("{}.jpg","b".repeat(64)));
+        std::fs::write(&thumb,b"").unwrap();
+        std::fs::write(&viewer,old).unwrap();
+        std::fs::write(&jpg,b"x").unwrap();
+        assert!(!miss_marker_matches(&thumb,&signature) && !miss_marker_matches(&viewer,&signature));
+        assert!(reset_misses_if_chain_changed(&dir,&signature).unwrap());
+        assert!(!thumb.exists() && !viewer.exists() && jpg.exists());
+        std::fs::write(&viewer,&signature).unwrap();
+        assert!(!reset_misses_if_chain_changed(&dir,&signature).unwrap());
+        assert!(miss_marker_matches(&viewer,&signature));
+        let _=std::fs::remove_dir_all(dir);
     }
     fn temp_dir(label:&str)->PathBuf{std::env::temp_dir().join(format!("ddreams-{label}-{}-{}",std::process::id(),TEMP_TEST_ID.fetch_add(1,Ordering::Relaxed)))}
     static TEMP_TEST_ID:AtomicUsize=AtomicUsize::new(0);

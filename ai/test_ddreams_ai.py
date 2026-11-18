@@ -1,3 +1,4 @@
+import builtins
 import io
 import json
 import os
@@ -14,7 +15,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ddreams_ai import AIService, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
-from ddreams_ai import RAW_DECODER_VERSION, RAW_EXTENSIONS, decode_photo
+from ddreams_ai import DECODER_VERSION, RAW_EXTENSIONS, decode_photo
 from faces_schema import ensure_faces_schema
 from import_acdsee_faces import import_acdsee_faces
 
@@ -83,6 +84,17 @@ class RawDecodeTests(unittest.TestCase):
         self.assertEqual((image.mode, image.size), ("RGB", (64, 40)))
         self.assertGreater(image.getpixel((0, 0))[0], 240)
 
+    def test_heic_decodes_through_the_registered_opener(self):
+        import pillow_heif
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "fotka.heic"
+            pillow_heif.from_pillow(Image.new("RGB", (64, 48), "red")).save(path)
+            with decode_photo({"path": str(path)}) as image:
+                self.assertEqual((image.mode, image.size), ("RGB", (64, 48)))
+                self.assertGreater(image.getpixel((0, 0))[0], 235)
+                self.assertIn("ddreams_quality", image.info)
+
     def test_too_big_is_propagated_and_closes_raw(self):
         import rawpy
 
@@ -150,8 +162,7 @@ class FakeEmbedder:
     device = "cpu"
 
     def __init__(self, model_dir):
-        self.vectors = {}
-        self.replace_calls = 0
+        pass
 
     @staticmethod
     def vector(label):
@@ -167,28 +178,13 @@ class FakeEmbedder:
     def encode_images(self, images):
         return np.stack([self.vector(str(image)) for image in images])
 
-    def replace_index(self, ids, vectors):
-        self.replace_calls += 1
-        self.vectors = {int(a): v.copy() for a, v in zip(ids, vectors)}
-
-    def upsert_index(self, ids, vectors):
-        self.vectors.update({int(a): v.copy() for a, v in zip(ids, vectors)})
-
-    def remove_index(self, ids):
-        for aid in ids:
-            self.vectors.pop(int(aid), None)
-
-    def search_text(self, query, limit):
+    def search_text(self, query, limit, index):
+        ids, vectors, _ = index
         target = self.vector(query)
-        scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in self.vectors.items()), key=lambda pair: (-pair[1], pair[0]))
-        return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01} for aid, score in scores[:limit] if score >= 0.2], "searched": len(self.vectors)}
-
-    def similar(self, asset_id, limit):
-        if asset_id not in self.vectors:
-            raise RequestError("Fotka ešte nie je zaindexovaná")
-        target = self.vectors[asset_id]
-        scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in self.vectors.items() if aid != asset_id), key=lambda pair: (-pair[1], pair[0]))
-        return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01} for aid, score in scores[:limit] if score >= 0.6], "searched": len(self.vectors)}
+        scores = sorted(((aid, float(np.dot(vector, target))) for aid, vector in zip(ids, vectors)),
+                        key=lambda pair: (-pair[1], pair[0]))
+        return {"results": [{"asset_id": aid, "score": score, "prob": 0.9 if score > 0 else 0.01}
+                            for aid, score in scores[:limit] if score >= 0.2], "searched": len(ids)}
 
 
 class ServerTests(unittest.TestCase):
@@ -251,6 +247,63 @@ class LazyModelTests(unittest.TestCase):
         self.service.stop()
         self.temp.cleanup()
 
+    def test_lazy_start_does_not_import_torch(self):
+        original_import = builtins.__import__
+        def without_torch(name, *args, **kwargs):
+            if name == "torch":
+                self.fail("Torch was imported during lazy startup")
+            return original_import(name, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as tmp, patch("builtins.__import__", side_effect=without_torch):
+            service = AIService(Path(tmp) / "ai.sqlite", "fake", embedder_factory=self.fail, lazy_model=True)
+            try:
+                service.start()
+                self.assertEqual(service.status()["model_state"], "unloaded")
+                self.assertIsNone(service._cuda_torch)
+            finally:
+                service.stop()
+
+    def test_cuda_duplicate_groups_equal_numpy_and_reuse_device_index(self):
+        try:
+            import torch
+        except (ImportError, OSError, RuntimeError):
+            self.skipTest("Torch unavailable")
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA unavailable")
+        rng = np.random.default_rng(115)
+        values = rng.standard_normal((64, DIMENSION), dtype=np.float32)
+        values /= np.linalg.norm(values, axis=1, keepdims=True)
+        values[31] = values[1]
+        values[40] = values[2] * 0.97 + values[3] * 0.24
+        # This pair lands exactly between two half-precision scores.
+        values[62:] = 0
+        values[62, :2] = [1, 1 / 32]
+        values[63, :2] = [0.9296875, 1 / 128]
+        index = VectorIndex(list(range(1, 65)), values)
+        self.service._vectors = index
+        request = {"cmd": "duplicate_groups", "threshold": 0.93}
+        with patch.object(self.service, "_cuda_torch", False):
+            expected = self.service.execute(request)
+        self.assertEqual(self.service.execute(request), expected)
+        self.assertTrue(expected["groups"])
+        _, first, _ = self.service._index_snapshot(use_cuda=True)
+        self.assertTrue(first.is_cuda)
+        self.assertEqual(first.data_ptr(), self.service._index_snapshot(use_cuda=True)[1].data_ptr())
+        index.upsert([65], values[:1])
+        _, grown, _ = self.service._index_snapshot(use_cuda=True)
+        index.upsert([66], values[1:2])
+        self.assertEqual(grown.data_ptr(), self.service._index_snapshot(use_cuda=True)[1].data_ptr())
+        index.upsert([1], values[2:3])
+        self.assertTrue(torch.equal(first[0].cpu(), torch.tensor(values[0], dtype=torch.float16)))
+        index.remove({2, 65})
+        ids, device, _ = self.service._index_snapshot(use_cuda=True)
+        self.assertEqual(ids, index.snapshot()[0])
+        np.testing.assert_array_equal(device.cpu().numpy(), index.snapshot()[1])
+        with patch.object(self.service, "_cuda_torch", False):
+            expected = self.service.execute(request)
+        self.assertEqual(self.service.execute(request), expected)
+        self.assertEqual(self.calls, [])
+
     def test_vectors_work_before_and_after_explicit_load(self):
         self.assertEqual(self.calls, [])
         self.assertEqual(self.service.status()["model_state"], "unloaded")
@@ -267,9 +320,9 @@ class LazyModelTests(unittest.TestCase):
         self.assertEqual(self.calls, [])
         self.service.execute({"cmd": "search_text", "query": "east"})
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.service._embedder.replace_calls, 1)
+        before = self.service._index_snapshot()[1]
         self.service.execute({"cmd": "search_text", "query": "west"})
-        self.assertEqual(self.service._embedder.replace_calls, 1)
+        self.assertTrue(np.shares_memory(before, self.service._index_snapshot()[1]))
 
     def test_matrix_growth_updates_and_removal(self):
         index = VectorIndex([1, 2], np.array([[1, 0], [0, 1]], dtype=np.float16))
@@ -374,6 +427,36 @@ class LazyModelTests(unittest.TestCase):
 
 
 class RawDecoderRetryTests(unittest.TestCase):
+    def test_upgrade_from_raw_decoder_only_retries_new_image_formats(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"DDREAMS_CATALOG": ""}):
+            root = Path(tmp)
+            db = root / "ai.sqlite"
+            with sqlite3.connect(root / "catalog.sqlite") as catalog:
+                catalog.execute("CREATE TABLE assets(id INTEGER PRIMARY KEY, path TEXT)")
+                catalog.executemany("INSERT INTO assets VALUES(?,?)", [
+                    (i, f"photo.{ext}") for i, ext in enumerate(
+                        ("HEIC", "heif", "avif", "jp2", "j2k", "hif", "jpc", "dng", "jpg"), 1)
+                ])
+            catalog.close()
+            svc = AIService(db, "fake")
+            try:
+                with svc.db:
+                    svc.db.execute("UPDATE meta SET value='1' WHERE key='raw_decoder_version'")
+                    svc.db.executemany("INSERT INTO failures VALUES(?,10,20,'UnidentifiedImageError: decode',0)",
+                                       [(i,) for i in range(1, 10)])
+                with svc.faces_db:
+                    svc.faces_db.executemany("INSERT INTO face_scan VALUES(?,10,20,?,0)",
+                                             [(i, FACE_VERSION) for i in range(1, 10)])
+            finally:
+                svc.stop()
+            svc = AIService(db, "fake")
+            try:
+                for conn, table in [(svc.db, "failures"), (svc.faces_db, "face_scan")]:
+                    self.assertEqual(conn.execute(f"SELECT asset_id FROM {table} ORDER BY asset_id").fetchall(),
+                                     [(8,), (9,)])
+            finally:
+                svc.stop()
+
     def test_startup_retries_only_targeted_assets_once_and_preserves_faces(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -424,7 +507,7 @@ class RawDecoderRetryTests(unittest.TestCase):
                     self.assertEqual(reopened.faces_db.execute("SELECT * FROM face_thumbs").fetchall(), [(16, b"\x01\x02")])
                     self.assertEqual(reopened.faces_db.execute("SELECT * FROM face_rejected").fetchall(), [(16, 11)])
                     self.assertEqual(reopened.db.execute("SELECT value FROM meta WHERE key='raw_decoder_version'").fetchone(),
-                                     (str(RAW_DECODER_VERSION),))
+                                     (str(DECODER_VERSION),))
                     items = [{"asset_id": i, "path": str(root / f"{i}.dng"), "size": 10, "mtime_ns": 20}
                              for i in (1, 6, 7)]
                     result = reopened.execute({"cmd": "index", "items": items, "append": True})
@@ -817,8 +900,6 @@ class ServerTests(unittest.TestCase):
         queued = self.service._queue[0]
         self.assertTrue(queued["colors_only"])
         self.service._queue.clear()
-        embedder = self.service._embedder
-        embedder.vectors.clear()
         self.assertEqual(self.service.execute({"cmd": "search_text", "query": "unrelated", "limit": 5})["results"], [])
 
     def test_relative_text_cutoff_keeps_low_probability_true_matches(self):
@@ -898,7 +979,7 @@ class ServerTests(unittest.TestCase):
         finally:
             release.set()
         self.wait_idle()
-        self.assertEqual(set(self.service._embedder.vectors), {first["asset_id"], second["asset_id"]})
+        self.assertEqual(set(self.service._index_snapshot()[0]), {first["asset_id"], second["asset_id"]})
 
     def test_failures_cached_until_metadata_changes_and_offline_retry(self):
         bad = self.make_file("bad.jpg")
