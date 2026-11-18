@@ -12,3 +12,15 @@
 .category-context-menu hr{width:100%;border:0;border-top:1px solid #464646;margin:3px 0}
 .property-keyword-editor{display:flex;flex-direction:column;gap:5px;min-width:0}.property-keyword-chips{display:flex;flex-wrap:wrap;gap:3px}.property-keyword-chip{display:inline-flex;align-items:center;max-width:100%;gap:3px;padding:2px 5px;border:1px solid #4c4c4c;border-radius:10px;background:#2c2c2c;font-size:10px}.property-keyword-chip button{flex:none;padding:0 3px;line-height:14px}.keyword-autocomplete{position:relative;min-width:0}.keyword-autocomplete input{width:100%;box-sizing:border-box;padding:4px 6px;background:#1a1a1a;border:1px solid #464646;border-radius:3px;color:#e6e6e6;font-size:10px}.keyword-autocomplete-options{position:static;margin-top:3px;max-height:220px;overflow:auto;display:flex;flex-direction:column;padding:3px;border:1px solid #525252;border-radius:4px;background:#272727;box-shadow:0 5px 16px #0009}.keyword-autocomplete-options button{display:flex;flex-direction:column;align-items:flex-start;gap:2px;text-align:left;padding:5px;font-size:10px}.keyword-autocomplete-options small{font-size:9px;color:#a6a6a6}
 .property-color-chips{display:flex;flex-wrap:wrap;gap:3px;justify-content:flex-end}.property-color-chip{width:17px;height:17px;min-width:17px;padding:2px;border-radius:50%;background:transparent;border:1px dashed #a6a6a6}.property-color-chip.manual{border-style:solid}.property-color-chip i{display:block;width:100%;height:100%;border-radius:50%;border:1px solid #ffffff44;box-sizing:border-box}.property-color-chip.empty{opacity:.28}.property-color-chip.partial{box-shadow:0 0 0 1px #e6bd62}.color-properties{flex-wrap:wrap}.color-properties>b{flex:1}.color-not-computed{flex-basis:100%;font-size:10px;color:#b7b7b7;text-align:right}
+
+.category-icon{display:inline-flex;align-items:center;justify-content:center;flex:0 0 16px;width:16px}
+.category-assignment-mark{flex:none;margin-right:-2px}
+.catalog-assigned .category-assignment-mark{color:#8fd39c}
+.catalog-ancestor .category-assignment-mark{color:#82a9db}
+.category-icon-picker{min-width:0;margin:0;padding:0;border:0}
+.category-icon-picker legend{padding:0 0 5px;color:#b7b7b7;font-size:11px}
+.category-icon-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:4px;margin-bottom:6px}
+.category-icon-picker button{border:1px solid var(--line);border-radius:3px}
+.category-icon-grid button{display:grid;place-items:center;padding:6px 0;color:#d4aa67}
+.category-icon-picker button[aria-pressed="true"]{background:var(--select);border-color:var(--accent)}
+.category-icon-picker button:hover:not(:disabled){border-color:var(--accent)}

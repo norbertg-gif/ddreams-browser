@@ -37,6 +37,7 @@ pub fn run() {
     });
     if !paths.readonly {
         schema::migrate_catalog(&mut connection).unwrap_or_else(|e| panic!("Catalog migration failed at {}: {e}", paths.catalog.display()));
+        db::migrate_category_icons(&mut connection).unwrap_or_else(|e| panic!("Category icon migration failed at {}: {e}", paths.catalog.display()));
     }
     let db = Arc::new(Mutex::new(connection));
     // Falls back to the main connection if a second one cannot be opened.
@@ -203,6 +204,7 @@ pub fn run() {
             commands::get_keyword_selection_counts,
             commands::create_category,
             commands::rename_category,
+            commands::set_category_icon,
             commands::move_category,
             commands::get_category_delete_info,
             commands::delete_category,

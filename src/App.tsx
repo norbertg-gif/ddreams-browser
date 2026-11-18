@@ -227,8 +227,9 @@ export default function App() {
     if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");setToastUndo(false);window.setTimeout(()=>setToast(""),2200);return;}if(!ids.length)return;
     try{const result=await invoke<{changeId:number|null;summary:string;changedCount:number;remappedIds:{oldId:number;newId:number}[];keywordId:number|null;parentId:number|null;ancestorIds:number[]}>("create_and_assign_keyword",{assetIds:ids,parentId,name});const remap=new Map(result.remappedIds.map(item=>[item.oldId,item.newId]));if(result.changeId!=null)insertedByChange.current.set(result.changeId,result.remappedIds.filter(item=>item.oldId<0).map(item=>item.newId));setSelectedIds(previous=>new Set([...previous].map(id=>remap.get(id)??id)));const nextPrimary=primaryId==null?null:remap.get(primaryId)??primaryId;if(nextPrimary!=null){setPrimaryId(nextPrimary);setPrimaryAsset(previous=>previous?{...previous,id:nextPrimary}:previous);}if(result.keywordId!=null)keywordStructureChanged({changeId:result.changeId,summary:result.summary,keywordId:result.keywordId,parentId:result.parentId,ancestorIds:result.ancestorIds,deletedKeywordIds:[]},false);}catch(error){const message=String(error);setToast(message.toLowerCase().includes("read-only")||appInfo?.readonly?"Katalóg je iba na čítanie":message);setToastUndo(false);window.setTimeout(()=>setToast(""),3500);}
   },[appInfo,primaryId,keywordStructureChanged]);
-  const categoryStructureChanged=useCallback((result:CategoryMutation,deleted:boolean)=>{
-    void invoke("ai_sync_labels",{kind:"category"});setToast(result.summary);setToastUndo(result.changeId!=null);refreshAfterWrite();
+  const categoryStructureChanged=useCallback((result:CategoryMutation,deleted:boolean,iconOnly=false)=>{
+    if(!iconOnly)void invoke("ai_sync_labels",{kind:"category"});
+    setToast(result.summary);setToastUndo(result.changeId!=null);refreshAfterWrite();
     if(deleted&&view.kind==="category"&&((view.id!=null&&result.deletedCategoryIds.includes(view.id))||(view.rootId!=null&&result.deletedRootIds.includes(view.rootId))))navigate({kind:"special",value:"all_photos",title:"Všetky fotky"});
     window.setTimeout(()=>{setToast("");setToastUndo(false)},6000);
   },[refreshAfterWrite,view,navigate]);

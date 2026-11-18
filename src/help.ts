@@ -32,6 +32,7 @@ export const helpTopics: HelpTopic[] = [
   ] },
   { id: "categories", title: "Kategórie a kľúčové slová", keywords: ["priradenie", "strom", "podkategórie", "keyword"], blocks: [
     { type: "steps", items: ["Vyberte jednu alebo viac fotografií a v paneli Katalóg zapnite Štvorčeky.", "Kliknutím na štvorček pri kategórii alebo kľúčovom slove priraďte alebo odoberte položku výberu. Neúplné priradenie označuje pomlčka.", "Tlačidlom + alebo pravým klikom vytvorte kategóriu či kľúčové slovo. Kontextová ponuka ponúka aj premenovanie, presun a zmazanie."] },
+    { type: "paragraph", text: "Ikonu vyberiete pri vytvorení kategórie alebo cez Zmeniť ikonu… a voľbou Zdediť od nadradenej prevezmete ikonu najbližšej nadradenej kategórie s vlastnou ikonou." },
     { type: "paragraph", text: "V strome možno položky presúvať ťahaním. Voľba Vrátane podkategórií rozšíri zobrazenie aj o potomkov. Položku s priradenými súbormi alebo priradeniami v jej podstromoch nemožno zmazať, kým sa priradenia neodoberú." },
     { type: "paragraph", text: "V časti Upraviť vybrané fotky možno tiež odstrániť kategóriu, pridať alebo odobrať kľúčové slovo a zmeniť hodnotenie, štítok či označenie." }
   ] },

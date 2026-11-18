@@ -433,24 +433,25 @@ impl CatalogWriter {
         Ok(SetAssetCategoriesResult { change_id, summary, changed_count: changed.len(), remapped_ids })
     }
 
-    pub fn create_category(&self, parent_id: Option<i64>, name: &str) -> Result<CategoryMutationResult, String> {
+    pub fn create_category(&self, parent_id: Option<i64>, name: &str, icon_key: Option<&str>) -> Result<CategoryMutationResult, String> {
         self.require_write()?;
         let name=validated_category_name(name)?;
+        validate_category_icon(icon_key)?;
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let (category_id,summary,events,root_id)=if let Some(parent)=parent_id {
             let root_id:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Nadradená kategória neexistuje".to_string())?;
             ensure_unique_category_name(&tx,Some(parent),root_id,&name,None,None)?;
             let id=next_id(&tx,"categories")?;
-            tx.execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(?1,?2,?3,?4)",(id,parent,root_id,&name)).map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO categories(id,parent_id,root_id,name,icon_key) VALUES(?1,?2,?3,?4,?5)",(id,parent,root_id,&name,icon_key)).map_err(|e|e.to_string())?;
             let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"categories",id)?;
             let parent_path=category_path(&tx,parent)?;
             (id,format!("Nová kategória {parent_path} › {name}"),events,root_id)
         } else {
             ensure_unique_category_name(&tx,None,None,&name,None,None)?;
             let root_id=next_id(&tx,"category_roots")?;let id=next_id(&tx,"categories")?;
-            tx.execute("INSERT INTO category_roots(id,name) VALUES(?1,?2)",(root_id,&name)).map_err(|e|e.to_string())?;
-            tx.execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(?1,NULL,?2,?3)",(id,root_id,&name)).map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO category_roots(id,name,icon_key) VALUES(?1,?2,?3)",(root_id,&name,icon_key)).map_err(|e|e.to_string())?;
+            tx.execute("INSERT INTO categories(id,parent_id,root_id,name,icon_key) VALUES(?1,NULL,?2,?3,?4)",(id,root_id,&name,icon_key)).map_err(|e|e.to_string())?;
             let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"category_roots",root_id)?;push_insert_snapshot(&tx,&mut events,"categories",id)?;
             (id,format!("Nová kategória {name}"),events,Some(root_id))
         };
@@ -458,6 +459,33 @@ impl CatalogWriter {
         let change_id=record_stored_change(&tx,events,"create_category",&summary)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(CategoryMutationResult{change_id,summary,category_id:Some(category_id),parent_id,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
+    }
+
+    pub fn set_category_icon(&self, id: i64, is_root: bool, icon_key: Option<&str>) -> Result<CategoryMutationResult, String> {
+        self.require_write()?;
+        validate_category_icon(icon_key)?;
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let table = if is_root { "category_roots" } else { "categories" };
+        let name: String = tx.query_row(&format!("SELECT name FROM {table} WHERE id=?1"), [id], |row| row.get(0))
+            .optional().map_err(|e| e.to_string())?.ok_or("Kategória neexistuje")?;
+        let value = icon_key.map(|key| SqlValue::Text(key.into())).unwrap_or(SqlValue::Null);
+        let mut events = Vec::new();
+        record_column_update(&tx, &mut events, table, id, "icon_key", value.clone())?;
+        // A merged root is edited as one row. Keep its category icon when that category moves.
+        if is_root {
+            if let Some(paired) = crate::db::category_root_matches(&tx, id).map_err(|e| e.to_string())? {
+                record_column_update(&tx, &mut events, "categories", paired, "icon_key", value)?;
+            }
+        }
+        let summary = if events.is_empty() { format!("Ikona kategórie {name} je bez zmeny") }
+            else { format!("Zmenená ikona kategórie {name}") };
+        let change_id = record_stored_change(&tx, events, "set_category_icon", &summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(CategoryMutationResult {
+            change_id, summary, category_id: None, parent_id: None, root_id: None, ancestor_ids: Vec::new(),
+            deleted_category_ids: Vec::new(), deleted_root_ids: Vec::new(),
+        })
     }
 
     pub fn rename_category(&self,id:i64,name:&str)->Result<CategoryMutationResult,String>{
@@ -641,7 +669,7 @@ impl CatalogWriter {
             statement.query_map([change.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
                 .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
         };
-        let kinds=resync_kinds_for_tables(items.iter().map(|item|item.0.as_str()));
+        let kinds=resync_kinds_for_tables(items.iter().filter(|item| item.2 != "icon_key").map(|item|item.0.as_str()));
         let mut external_payload=None;
         for (table,key,column,old,new) in &items {
             validate_item(&table, &column)?;
@@ -674,8 +702,8 @@ fn validate_item(table: &str, column: &str) -> Result<(), String> {
         "folders" => matches!(column,"name"|"path"|"__snapshot__"),
         "folder_roots" => matches!(column,"path"|"__snapshot__"),
         "ddreams_folder_rules" => column == "path",
-        "categories" => matches!(column, "name" | "parent_id" | "root_id" | "__snapshot__"),
-        "category_roots" => matches!(column, "name" | "__snapshot__"),
+        "categories" => matches!(column, "name" | "parent_id" | "root_id" | "icon_key" | "__snapshot__"),
+        "category_roots" => matches!(column, "name" | "icon_key" | "__snapshot__"),
         "keywords" => matches!(column, "name" | "parent_id" | "__snapshot__"),
         "asset_categories" | "asset_keywords" | "asset_color_overrides" => column == "__exists__",
         "__file_ops" => column == "__payload__",
@@ -792,6 +820,15 @@ fn category_path(transaction: &Transaction<'_>, category_id: i64) -> Result<Stri
     Ok(names.join(" › "))
 }
 
+fn validate_category_icon(icon_key: Option<&str>) -> Result<(), String> {
+    match icon_key {
+        None | Some("album" | "people" | "places" | "various" | "event" | "travel" | "nature"
+            | "animal" | "home" | "building" | "car" | "food" | "sport" | "music" | "work"
+            | "school" | "star" | "heart" | "camera" | "folder") => Ok(()),
+        Some(_) => Err("Neznáma ikona kategórie".into()),
+    }
+}
+
 fn validated_category_name(value:&str)->Result<String,String>{let name=value.trim();if name.is_empty(){return Err("Názov kategórie nesmie byť prázdny".into());}if name.chars().count()>100{return Err("Názov kategórie môže mať najviac 100 znakov".into());}Ok(name.to_owned())}
 
 fn ensure_unique_category_name(tx:&Transaction<'_>,parent:Option<i64>,_root:Option<i64>,name:&str,exclude_category:Option<i64>,exclude_root:Option<i64>)->Result<(),String>{
@@ -821,7 +858,7 @@ fn record_column_update(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&s
 
 fn delete_row_snapshot(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),"__snapshot__")?;if matches!(old,SqlValue::Null){return Err(format!("Riadok {table} {id} neexistuje"));}apply_item(tx,table,&id.to_string(),"__snapshot__",&SqlValue::Null)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:"__snapshot__".into(),old_value:old,new_value:SqlValue::Null});Ok(())}
 
-fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let kinds=resync_kinds_for_tables(events.iter().map(|item|item.table_name.as_str()));let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;if !kinds.is_empty(){if let Some(callback)=JOURNAL_CHANGE_HOOK.get().and_then(|hook|hook.lock().ok()).and_then(|hook|hook.clone()){callback(&kinds);}}Ok(Some(change_id))}
+fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let kinds=resync_kinds_for_tables(events.iter().filter(|item| item.column_name != "icon_key").map(|item|item.table_name.as_str()));let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;if !kinds.is_empty(){if let Some(callback)=JOURNAL_CHANGE_HOOK.get().and_then(|hook|hook.lock().ok()).and_then(|hook|hook.clone()){callback(&kinds);}}Ok(Some(change_id))}
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
     transaction.execute(
@@ -1006,8 +1043,8 @@ fn snapshot_columns(table:&str)->Result<&'static [&'static str],String>{
         "assets"=>Ok(&["id","folder_id","name","ext","ext_lower","is_listed","size","width","height","bpp","caption","notes","author","rating","tagged","label","file_modified","exif_date","acdsee_date","md_dirty","is_orphan","path"]),
         "folders"=>Ok(&["id","parent_id","root_id","name","path"]),
         "folder_roots"=>Ok(&["id","name","path"]),
-        "categories"=>Ok(&["id","parent_id","root_id","name"]),
-        "category_roots"=>Ok(&["id","name"]),
+        "categories"=>Ok(&["id","parent_id","root_id","name","icon_key"]),
+        "category_roots"=>Ok(&["id","name","icon_key"]),
         "keywords"=>Ok(&["id","parent_id","name"]),
         _=>Err(format!("Unsupported snapshot table: {table}")),
     }
@@ -1018,7 +1055,12 @@ fn read_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str)->Result<S
     let sql=format!("SELECT {} FROM {table} WHERE id=?1",columns.join(","));
     let snapshot=transaction.query_row(&sql,[id],|row|{
         let mut values=Vec::with_capacity(columns.len());
-        for index in 0..columns.len(){values.push(encode_sql(&row.get::<_,SqlValue>(index)?).map_err(|_|rusqlite::Error::InvalidQuery)?);}
+        for (index, column) in columns.iter().enumerate() {
+            let value = row.get::<_, SqlValue>(index)?;
+            // Keep the old snapshot representation when a category has no explicit icon.
+            if *column == "icon_key" && value == SqlValue::Null { break; }
+            values.push(encode_sql(&value).map_err(|_| rusqlite::Error::InvalidQuery)?);
+        }
         Ok(values)
     }).optional().map_err(|e|e.to_string())?;
     match snapshot {None=>Ok(SqlValue::Null),Some(values)=>serde_json::to_string(&values).map(SqlValue::Text).map_err(|e|e.to_string())}
@@ -1029,7 +1071,12 @@ fn restore_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str,value:&
     if matches!(value,SqlValue::Null){transaction.execute(&format!("DELETE FROM {table} WHERE id=?1"),[id]).map_err(|e|e.to_string())?;return Ok(());}
     let SqlValue::Text(snapshot)=value else{return Err("Invalid row snapshot value".into())};
     let encoded:Vec<String>=serde_json::from_str(snapshot).map_err(|e|e.to_string())?;
-    if encoded.len()!=columns.len(){return Err("Invalid row snapshot width".into());}
+    let columns = if columns.last() == Some(&"icon_key") && encoded.len() + 1 == columns.len() {
+        &columns[..encoded.len()]
+    } else {
+        if encoded.len() != columns.len() { return Err("Invalid row snapshot width".into()); }
+        columns
+    };
     let values=encoded.iter().map(|item|decode_sql(item)).collect::<Result<Vec<_>,_>>()?;
     let sql=format!("INSERT OR REPLACE INTO {table}({}) VALUES({})",columns.join(","),vec!["?";columns.len()].join(","));
     transaction.execute(&sql,rusqlite::params_from_iter(values.iter())).map_err(|e|e.to_string())?;
@@ -1078,8 +1125,9 @@ mod tests {
     }
 
     fn write_fixture() -> Db {
-        let connection=Connection::open_in_memory().unwrap();
+        let mut connection=Connection::open_in_memory().unwrap();
         connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO meta VALUES('catalog_modified','0');CREATE TABLE ddreams_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);CREATE TABLE ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT);CREATE TABLE folder_roots(id INTEGER PRIMARY KEY,name TEXT,path TEXT);CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT,path TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);INSERT INTO category_roots VALUES(1,'Rodina');CREATE TABLE categories(id INTEGER PRIMARY KEY,name TEXT,parent_id INTEGER,root_id INTEGER);INSERT INTO categories VALUES(10,'Rodina',NULL,1),(11,'Deti',10,1);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty INTEGER,is_orphan INTEGER,path TEXT);CREATE INDEX idx_assets_path ON assets(path);INSERT INTO folder_roots VALUES(1,'F:','F:\\');INSERT INTO folders VALUES(1,NULL,1,'F:','F:\\');INSERT INTO folders VALUES(2,1,1,'Photos','F:\\Photos');INSERT INTO assets VALUES(1,2,'one.jpg','jpg','jpg',1,123.0,10,10,24,NULL,NULL,NULL,2,0,'Red','2020-01-01T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\one.jpg');INSERT INTO assets VALUES(2,2,'two.jpg','jpg','jpg',1,456.0,10,10,24,NULL,NULL,NULL,4,1,NULL,'2020-01-02T00:00:00Z',NULL,NULL,NULL,0,'F:\\Photos\\two.jpg');").unwrap();
+        crate::db::migrate_category_icons(&mut connection).unwrap();
         Arc::new(Mutex::new(connection))
     }
 
@@ -1301,10 +1349,10 @@ mod tests {
     #[test]
     fn create_top_level_and_subcategory_are_journaled_and_undoable() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
-        let top=writer.create_category(None,"Nové").unwrap();let top_id=top.category_id.unwrap();let root_id=top.root_id.unwrap();
+        let top=writer.create_category(None,"Nové",None).unwrap();let top_id=top.category_id.unwrap();let root_id=top.root_id.unwrap();
         assert_eq!(top.summary,"Nová kategória Nové");assert_eq!(db.lock().unwrap().query_row("SELECT name FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,String>(0)).unwrap(),"Nové");
         writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,i64>(0)).unwrap(),0);
-        let sub=writer.create_category(Some(10)," Vnúčatá ").unwrap();let sub_id=sub.category_id.unwrap();
+        let sub=writer.create_category(Some(10)," Vnúčatá ",None).unwrap();let sub_id=sub.category_id.unwrap();
         assert_eq!(sub.summary,"Nová kategória Rodina › Vnúčatá");assert_eq!(sub.root_id,Some(1));assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
         writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert!(top_id>0);
@@ -1313,11 +1361,11 @@ mod tests {
     #[test]
     fn category_names_are_trimmed_validated_and_unique_case_insensitively() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
-        assert!(writer.create_category(Some(10)," dEtI ").unwrap_err().contains("už kategória"));
-        assert!(writer.create_category(None,"rodina").is_err());
-        assert!(writer.create_category(Some(10),"  ").unwrap_err().contains("nesmie byť prázdny"));
-        assert!(writer.create_category(None,&"x".repeat(101)).unwrap_err().contains("100 znakov"));
-        let created=writer.create_category(Some(10),"  Nové meno  ").unwrap();
+        assert!(writer.create_category(Some(10)," dEtI ",None).unwrap_err().contains("už kategória"));
+        assert!(writer.create_category(None,"rodina",None).is_err());
+        assert!(writer.create_category(Some(10),"  ",None).unwrap_err().contains("nesmie byť prázdny"));
+        assert!(writer.create_category(None,&"x".repeat(101),None).unwrap_err().contains("100 znakov"));
+        let created=writer.create_category(Some(10),"  Nové meno  ",None).unwrap();
         assert_eq!(db.lock().unwrap().query_row("SELECT name FROM categories WHERE id=?1",[created.category_id.unwrap()],|r|r.get::<_,String>(0)).unwrap(),"Nové meno");
     }
 
@@ -1338,8 +1386,66 @@ mod tests {
     }
 
     #[test]
+    fn category_icons_undo_to_null_and_restore_the_explicit_key() {
+        let db = write_fixture();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let icon = |table: &str, id: i64| {
+            db.lock().unwrap().query_row(&format!("SELECT icon_key FROM {table} WHERE id=?1"), [id], |row| {
+                row.get::<_, Option<String>>(0)
+            }).unwrap()
+        };
+        assert!(writer.set_category_icon(11, false, Some("camera")).unwrap().change_id.is_some());
+        assert_eq!(icon("categories", 11).as_deref(), Some("camera"));
+        assert!(writer.set_category_icon(11, false, Some("camera")).unwrap().change_id.is_none());
+        writer.set_category_icon(11, false, None).unwrap();
+        assert_eq!(icon("categories", 11), None);
+        writer.undo_last().unwrap();
+        assert_eq!(icon("categories", 11).as_deref(), Some("camera"));
+        writer.undo_last().unwrap();
+        assert_eq!(icon("categories", 11), None);
+
+        writer.set_category_icon(1, true, Some("people")).unwrap();
+        assert_eq!(icon("category_roots", 1).as_deref(), Some("people"));
+        assert_eq!(icon("categories", 10).as_deref(), Some("people"));
+        writer.undo_last().unwrap();
+        assert_eq!(icon("category_roots", 1), None);
+        assert_eq!(icon("categories", 10), None);
+
+        db.lock().unwrap().execute("INSERT INTO category_roots(id,name) VALUES(2,'Miesta')", []).unwrap();
+        writer.set_category_icon(2, true, Some("places")).unwrap();
+        assert_eq!(icon("category_roots", 2).as_deref(), Some("places"));
+        writer.undo_last().unwrap();
+        assert_eq!(icon("category_roots", 2), None);
+
+        let readonly = CatalogWriter::new(db.clone(), false);
+        assert!(readonly.set_category_icon(11, false, Some("camera")).unwrap_err().contains("read-only"));
+        assert!(writer.set_category_icon(11, false, Some("unknown")).is_err());
+    }
+
+    #[test]
+    fn category_icon_survives_delete_undo_and_creation_can_be_undone() {
+        let db = write_fixture();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let created = writer.create_category(None, "Výlety", Some("travel")).unwrap();
+        let category_id = created.category_id.unwrap();
+        let root_id = created.root_id.unwrap();
+        let root_icon = || db.lock().unwrap().query_row(
+            "SELECT icon_key FROM category_roots WHERE id=?1", [root_id], |row| row.get::<_, String>(0),
+        );
+        assert_eq!(root_icon().unwrap(), "travel");
+        writer.delete_category(category_id).unwrap();
+        writer.undo_last().unwrap();
+        assert_eq!(root_icon().unwrap(), "travel");
+        assert_eq!(db.lock().unwrap().query_row(
+            "SELECT icon_key FROM categories WHERE id=?1", [category_id], |row| row.get::<_, String>(0),
+        ).unwrap(), "travel");
+        writer.undo_last().unwrap();
+        assert!(matches!(root_icon(), Err(rusqlite::Error::QueryReturnedNoRows)));
+    }
+
+    #[test]
     fn moving_top_level_under_another_category_removes_empty_root_and_undo_restores_tree() {
-        let db=write_fixture();db.lock().unwrap().execute_batch("INSERT INTO category_roots VALUES(2,'Priatelia');INSERT INTO categories(id,parent_id,root_id,name) VALUES(20,NULL,2,'Priatelia'),(21,20,2,'Blízki'),(12,11,1,'Mladí');").unwrap();let writer=CatalogWriter::new(db.clone(),true);
+        let db=write_fixture();db.lock().unwrap().execute_batch("INSERT INTO category_roots(id,name) VALUES(2,'Priatelia');INSERT INTO categories(id,parent_id,root_id,name) VALUES(20,NULL,2,'Priatelia'),(21,20,2,'Blízki'),(12,11,1,'Mladí');").unwrap();let writer=CatalogWriter::new(db.clone(),true);
         writer.move_category(10,Some(21)).unwrap();{let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"21:2");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),2);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);}
         writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=10",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=10",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");
     }
@@ -1368,7 +1474,7 @@ mod tests {
     #[test]
     fn readonly_writer_refuses_category_structure_changes() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),false);
-        assert!(writer.create_category(None,"Test").unwrap_err().contains("read-only"));assert!(writer.rename_category(10,"Test").unwrap_err().contains("read-only"));assert!(writer.move_category(11,None).unwrap_err().contains("read-only"));assert!(writer.delete_category(11).unwrap_err().contains("read-only"));
+        assert!(writer.create_category(None,"Test",None).unwrap_err().contains("read-only"));assert!(writer.rename_category(10,"Test").unwrap_err().contains("read-only"));assert!(writer.move_category(11,None).unwrap_err().contains("read-only"));assert!(writer.delete_category(11).unwrap_err().contains("read-only"));
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories",[],|r|r.get::<_,i64>(0)).unwrap(),2);
     }
 

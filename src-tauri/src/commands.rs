@@ -507,7 +507,12 @@ pub fn get_keyword_selection_counts(db:State<'_,DatabaseState>,listing:State<'_,
 }
 
 #[tauri::command(async)]
-pub fn create_category(state:State<'_,CatalogWriterState>,parent_id:Option<i64>,name:String)->Result<CategoryMutationResult,String>{state.0.create_category(parent_id,&name)}
+pub fn create_category(state:State<'_,CatalogWriterState>,parent_id:Option<i64>,name:String,icon_key:Option<String>)->Result<CategoryMutationResult,String>{state.0.create_category(parent_id,&name,icon_key.as_deref())}
+
+#[tauri::command(async)]
+pub fn set_category_icon(state: State<'_, CatalogWriterState>, id: i64, is_root: bool, icon_key: Option<String>) -> Result<CategoryMutationResult, String> {
+    state.0.set_category_icon(id, is_root, icon_key.as_deref())
+}
 #[tauri::command(async)]
 pub fn rename_category(state:State<'_,CatalogWriterState>,id:i64,name:String)->Result<CategoryMutationResult,String>{state.0.rename_category(id,&name)}
 #[tauri::command(async)]
