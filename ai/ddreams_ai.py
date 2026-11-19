@@ -5,11 +5,13 @@ from __future__ import annotations
 import concurrent.futures
 from collections import deque
 from contextlib import closing
+from datetime import date
 import ctypes
 import gc
 import hashlib
 import io
 import json
+import ntpath
 import os
 import sqlite3
 import sys
@@ -627,6 +629,12 @@ class AIService:
         self._model_started = False
         self._vectors: VectorIndex | None = None
         self._cuda_torch = None
+        self._folder_cuda_pending = False
+        self._folder_catalog_lock = threading.Lock()
+        self._folder_catalog = None
+        self._folder_catalog_path = None
+        self._folder_metadata_key = None
+        self._folder_metadata = {}
         self._similar_logits: tuple[float, float] | None = None
         self._similar_logits_checked = False
         self._model_error: str | None = None
@@ -637,6 +645,7 @@ class AIService:
         self._quality_queue: list[dict[str, Any]] = []
         self._face_scan_queue: deque[dict[str, Any]] = deque()
         self._face_active_ids: set[int] = set()
+        self._newly_indexed_ids: set[int] = set()
         self._last_face_progress = 0.0
         self._face_refs_ids = np.empty(0, dtype=np.int64)
         self._face_refs_people = np.empty(0, dtype=np.int64)
@@ -1085,6 +1094,15 @@ class AIService:
             return self._face_detector.detect(image)
         return face_detect(image, self._face_detector, self._face_det_input)
 
+    def _emit_indexed_assets(self) -> None:
+        with self._condition:
+            if (not self._newly_indexed_ids or self._active or self._queue or self._quality_queue
+                    or self._face_scan_queue or self._face_active_ids):
+                return
+            ids = sorted(self._newly_indexed_ids)
+            self._newly_indexed_ids.clear()
+        self._emit({"event": "indexed_assets", "asset_ids": ids})
+
     def _face_scan_loop(self) -> None:
         _set_background_priority()
         while True:
@@ -1104,6 +1122,7 @@ class AIService:
                 with self._condition:
                     self._face_active_ids.discard(item["asset_id"])
                     self._face_scan_queue.clear()
+                self._emit_indexed_assets()
                 self._emit({"event": "status", **self.status()})
                 continue
             try:
@@ -1146,6 +1165,7 @@ class AIService:
                 with self._condition:
                     self._face_active_ids.discard(item["asset_id"])
                     self._condition.notify_all()
+                self._emit_indexed_assets()
                 # Faces scanned before their references existed stay unknown; re-run naming now and then.
                 self._face_scans_since_recognize = getattr(self, "_face_scans_since_recognize", 0) + 1
                 with self._condition:
@@ -1596,6 +1616,7 @@ class AIService:
                 self._failed += len(errors)
                 self._offline += len(offline)
                 self.indexed_count = new_indexed_count
+                self._newly_indexed_ids.update(item["asset_id"] for item, _ in success)
                 if errors:
                     self._last_error = errors[-1][1]
                 final = not self._queue and not self._quality_queue
@@ -1608,6 +1629,7 @@ class AIService:
                 self._last_progress = now
         if should_emit:
             self._emit({"event": "progress", **self.status()})
+        self._emit_indexed_assets()
 
     def _wait_model(self) -> Any:
         self._model_ready.wait()
@@ -1682,16 +1704,34 @@ class AIService:
             self._vectors = VectorIndex([int(aid) for aid, _ in rows], values)
         return self._vectors
 
+    @staticmethod
+    def _load_vector_cuda():
+        try:
+            import torch
+            return torch if torch.cuda.is_available() else False
+        except (ImportError, OSError, RuntimeError):
+            return False
+
+    def _warm_folder_cuda(self) -> None:
+        backend = self._load_vector_cuda()
+        with self.db_lock:
+            if self._cuda_torch is None:
+                self._cuda_torch = backend
+
+    def _folder_vector_snapshot(self):
+        # A small selection can be ranked immediately while Torch and CUDA initialize.
+        with self._folder_catalog_lock:
+            if self._cuda_torch is None and not self._folder_cuda_pending:
+                self._folder_cuda_pending = True
+                self._vector_pool.submit(self._warm_folder_cuda)
+        return self._index_snapshot(use_cuda=self._cuda_torch is not None)
+
     def _index_snapshot(self, *, use_cuda: bool = False) -> tuple[list[int], Any, dict[int, int]]:
         with self.db_lock:
             index = self._ensure_vector_index()
             if use_cuda and index.count:
                 if self._cuda_torch is None:
-                    try:
-                        import torch
-                        self._cuda_torch = torch if torch.cuda.is_available() else False
-                    except (ImportError, OSError, RuntimeError):
-                        self._cuda_torch = False
+                    self._cuda_torch = self._load_vector_cuda()
                 if self._cuda_torch:
                     return index.cuda_snapshot(self._cuda_torch)
             return index.snapshot()
@@ -2303,6 +2343,140 @@ class AIService:
         groups.sort(key=lambda g: (-len(g["asset_ids"]), -g["max_sim"], g["asset_ids"][0]))
         return {"groups": groups}
 
+    @staticmethod
+    def _catalog_day(value):
+        if isinstance(value, str) and len(value) >= 10:
+            day = value[:10]
+            try:
+                if day[4] == day[7] == "-":
+                    return date.fromisoformat(day).isoformat()
+            except ValueError:
+                pass
+        return None
+
+    def _incoming_folder_metadata(self, catalog, incoming, extensions):
+        # SQLite's read-only connection observes catalogue edits, including writes from Tauri.
+        with self._folder_catalog_lock:
+            if catalog != self._folder_catalog_path:
+                connection = sqlite3.connect(Path(catalog).absolute().as_uri() + "?mode=ro",
+                                             uri=True, check_same_thread=False)
+                if self._folder_catalog is not None:
+                    self._folder_catalog.close()
+                self._folder_catalog, self._folder_catalog_path = connection, catalog
+                self._folder_metadata_key = None
+            connection = self._folder_catalog
+            version = connection.execute("PRAGMA data_version").fetchone()[0]
+            prefix = incoming.replace("/", "\\").rstrip("\\").lower() + "\\"
+            key = (version, prefix, tuple(extensions))
+            if key != self._folder_metadata_key:
+                metadata, folders = {}, {}
+                if extensions:
+                    marks = ",".join("?" for _ in extensions)
+                    rows = connection.execute(
+                        f"SELECT id,path,exif_date,file_modified FROM assets WHERE is_listed=1 AND path IS NOT NULL AND ext_lower IN ({marks}) ORDER BY id",
+                        extensions,
+                    )
+                    for aid, path, capture, modified in rows:
+                        canonical = path.replace("/", "\\")
+                        if canonical.lower().startswith(prefix):
+                            metadata[aid] = (None, self._catalog_day(capture))
+                        else:
+                            folder = ntpath.dirname(canonical)
+                            if folder:
+                                folder = folders.setdefault(folder.rstrip("\\").lower(), folder)
+                                metadata[aid] = (folder, self._catalog_day(capture) or self._catalog_day(modified))
+                self._folder_metadata, self._folder_metadata_key = metadata, key
+            return self._folder_metadata
+
+    def _indexed_asset_ids(self, request):
+        ids = request.get("asset_ids")
+        if not isinstance(ids, list) or any(isinstance(aid, bool) or not isinstance(aid, int) for aid in ids):
+            raise RequestError("asset_ids musí byť zoznam ID")
+        indexed = []
+        with self.db_lock:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start:start + 500]
+                marks = ",".join("?" for _ in chunk)
+                indexed.extend(aid for (aid,) in self.db.execute(
+                    f"SELECT asset_id FROM embeddings WHERE model=? AND dim=? AND asset_id IN ({marks})",
+                    (self.model_name, DIMENSION, *chunk),
+                ))
+        return {"asset_ids": indexed}
+
+    def _suggest_folders(self, request: dict[str, Any]) -> dict[str, Any]:
+        selected = request.get("asset_ids")
+        if not isinstance(selected, list):
+            raise RequestError("asset_ids musí byť zoznam")
+        started = time.perf_counter()
+        catalog = request.get("catalog")
+        if catalog:
+            metadata = self._incoming_folder_metadata(catalog, request["incoming"], request["extensions"])
+            # Refresh only the EXIF lookups asked for by this request.
+            overrides = {int(aid): day for aid, day in request.get("days", {}).items()}
+        else:
+            photos = request.get("photos")
+            if not isinstance(photos, list):
+                raise RequestError("photos musí byť zoznam")
+            metadata = {aid: (folder, day) for aid, folder, day in photos}
+            overrides = {}
+        metadata_s = time.perf_counter() - started
+        started = time.perf_counter()
+        index = self._folder_vector_snapshot() if catalog else self._index_snapshot(use_cuda=True)
+        _, matrix, positions = index
+        vector_s = time.perf_counter() - started
+        started = time.perf_counter()
+        queries = [aid for aid in dict.fromkeys(selected)
+                   if aid in positions and aid in metadata and metadata[aid][0] is None]
+        candidates = [(positions[aid], aid, folder, overrides.get(aid, day)) for aid, (folder, day) in metadata.items()
+                      if aid in positions and folder is not None]
+        candidates.sort(key=lambda row: row[0])
+        if not queries or not candidates:
+            return {"folders": []}
+        indexes, candidate_ids, folders, days = zip(*candidates)
+        days = np.asarray(days, dtype=object)
+        if isinstance(matrix, np.ndarray):
+            vectors = matrix[list(indexes)].astype(np.float32)
+        else:
+            torch = self._cuda_torch
+            vectors = matrix[torch.as_tensor(indexes, device=matrix.device)]
+        votes: dict[str, float] = {}
+        missing_days: set[int] = set()
+        resolve_days = request.get("resolve_days") is True
+        for start in range(0, len(queries), 32):
+            batch = queries[start:start + 32]
+            indexes = [positions[aid] for aid in batch]
+            if isinstance(matrix, np.ndarray):
+                scores = matrix[indexes].astype(np.float32) @ vectors.T
+                if catalog:
+                    scores = scores.astype(np.float16).astype(np.float32)
+            else:
+                with torch.inference_mode():
+                    scores = (matrix[indexes] @ vectors.T).float().cpu().numpy()
+            for aid, row in zip(batch, scores):
+                day = overrides.get(aid, metadata[aid][1])
+                if day:
+                    row[days == day] = -np.inf
+                positive = np.flatnonzero(row > 0)
+                if len(positive) > 25:
+                    cutoff = np.partition(row[positive], -25)[-25]
+                    stronger = positive[row[positive] > cutoff]
+                    tied = positive[row[positive] == cutoff]
+                    positive = np.concatenate((stronger, tied[:25 - len(stronger)]))
+                for index in positive:
+                    if resolve_days and day and days[index] is None:
+                        missing_days.add(candidate_ids[index])
+                    folder = folders[index]
+                    votes[folder] = votes.get(folder, 0.0) + float(row[index]) ** 4
+        total = sum(votes.values())
+        ranked = sorted(votes, key=lambda folder: (-votes[folder], folder))
+        result = {"folders": [{"folder": folder, "share": votes[folder] / total} for folder in ranked[:3]]}
+        if missing_days:
+            result["missing_days"] = sorted(missing_days)
+        if os.environ.get("DDREAMS_INCOMING_TIMINGS"):
+            _stderr(f"incoming folder Python: metadata {metadata_s*1000:.1f} ms, vectors {vector_s*1000:.1f} ms, "
+                    f"ranking {(time.perf_counter()-started)*1000:.1f} ms ({len(candidates)} candidates)")
+        return result
+
     def _series(self, request: dict[str, Any]) -> dict[str, Any]:
         items = request.get("items")
         max_gap, min_sim = request.get("max_gap"), request.get("min_sim")
@@ -2354,12 +2528,22 @@ class AIService:
                 marks = ",".join("?" for _ in chunk)
                 for aid, sharp in self.db.execute(f"SELECT asset_id,sharp FROM quality WHERE asset_id IN ({marks})", chunk):
                     sharp_by_id[int(aid)] = float(sharp) if sharp is not None else None
+        faces_by_id = {}
+        if request.get("face_aware") is True and self.faces_db is not None:
+            with self.faces_lock:
+                for start in range(0, len(rows), 500):
+                    chunk = [row[0] for row in rows[start:start + 500]]
+                    marks = ",".join("?" for _ in chunk)
+                    faces_by_id.update((aid, (count, confidence or 0.0)) for aid, count, confidence in
+                        self.faces_db.execute(f"SELECT asset_id,count(*),avg(det_score) FROM faces WHERE asset_id IN ({marks}) GROUP BY asset_id", chunk))
         groups, chain = [], []
         def finish_chain() -> None:
             if len(chain) < 2:
                 return
             ids = [rows[i][0] for i in chain]
-            best = max(ids, key=lambda aid: (sharp_by_id[aid] if sharp_by_id[aid] is not None else -1.0, -rows[by_id[aid]][1]))
+            best = max(ids, key=lambda aid: (*faces_by_id.get(aid, (0, 0.0)),
+                                            sharp_by_id[aid] if sharp_by_id[aid] is not None else -1.0,
+                                            -rows[by_id[aid]][1]))
             groups.append({"ids": ids, "best": best, "sharp": {str(aid): sharp_by_id[aid] for aid in ids}})
         for index, (aid, stamp, _) in enumerate(rows):
             if stamp is None or aid not in positions:
@@ -2485,6 +2669,10 @@ class AIService:
             return self._cluster_ignore(request)
         if cmd == "cluster_ignore_reset":
             return self._cluster_ignore_reset(request)
+        if cmd == "indexed_asset_ids":
+            return self._indexed_asset_ids(request)
+        if cmd == "suggest_folders":
+            return self._suggest_folders(request)
         if cmd == "series":
             return self._series(request)
         if cmd == "order_by_similarity":
@@ -2580,7 +2768,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "map_build", "series", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "map_build", "series", "suggest_folders", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)
@@ -2596,6 +2784,8 @@ class AIService:
     def stop(self) -> None:
         self._query_pool.shutdown(wait=True)
         self._vector_pool.shutdown(wait=True)
+        if self._folder_catalog is not None:
+            self._folder_catalog.close()
         with self._condition:
             self._stop = True
             self._condition.notify_all()

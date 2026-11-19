@@ -577,3 +577,13 @@ input[type=checkbox]{accent-color:var(--accent)}
 .help-content table{width:100%;border-collapse:collapse}.help-content th,.help-content td{text-align:left;vertical-align:top;padding:8px;border-bottom:1px solid var(--line)}.help-content th{width:34%;color:var(--bright)}
 @media(max-width:600px){.help-nav{width:155px;padding:8px}.help-content{padding:14px}.help-content th,.help-content td{padding:5px}}
 .ai-model-hint{font-size:9px;color:var(--muted);white-space:nowrap}
+
+.incoming-tools{flex:none;display:grid;gap:7px;padding:9px;border-bottom:1px solid var(--line)}
+.incoming-tools small{color:#aeb7c2}
+.incoming-tools button{padding:4px 8px;border:1px solid var(--line);border-radius:4px}
+.incoming-tools button:disabled{opacity:.55}
+.incoming-folder-suggestions{display:grid;gap:6px}
+.incoming-folder-row{display:grid;grid-template-columns:minmax(0,1fr) auto auto;align-items:center;gap:5px}
+.incoming-folder-row>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.deletion-suggestion-badge{display:inline-grid;place-items:center;width:19px;height:19px;flex:none;border-radius:4px;background:#521c20;color:#ffabad;font-size:13px;font-weight:bold}
+.thumb-wrap>.deletion-suggestion-badge{position:absolute;z-index:2;right:5px;top:28px}

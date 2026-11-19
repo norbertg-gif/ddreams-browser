@@ -11,6 +11,7 @@ mod file_ops;
 mod formats;
 mod folder_rules;
 pub mod journal;
+mod incoming;
 mod listing;
 mod metadata_view;
 mod paths;
@@ -53,8 +54,8 @@ pub fn run() {
         .filter(|(python, script)| python.is_file() && script.is_file())
         .map(|(python, script)| thumbs::RawPluginConfig { python, script });
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone(), raw_plugin);
-    let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone());
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
+    let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone(), writer.clone(), exif.clone());
     let journal_ai=ai_service.clone();
     writer.set_change_hook(Arc::new(move|kinds|for kind in kinds { journal_ai.sync_labels_debounced(kind); }));
     let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
@@ -153,6 +154,12 @@ pub fn run() {
             commands::ai_similar,
             commands::ai_duplicate_groups,
             commands::ai_series,
+            incoming::get_incoming_folder,
+            incoming::set_incoming_folder,
+            incoming::suggest_incoming_folders,
+            incoming::analyze_incoming_series,
+            incoming::get_deletion_suggestions,
+            incoming::keep_suggested_assets,
             commands::ai_suggest,
             commands::ai_reject_suggestion,
             commands::ai_suggestion_groups,

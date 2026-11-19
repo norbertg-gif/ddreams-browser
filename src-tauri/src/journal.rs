@@ -19,6 +19,13 @@ impl ChangeBuilder {
 #[serde(rename_all = "camelCase")]
 pub struct ChangeSummary { pub id: i64, pub ts: String, pub action: String, pub summary: String, pub undone: bool }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletionSuggestionChange {
+    pub change_id: Option<i64>,
+    pub summary: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct ListedAsset {
     pub temporary_id: i64,
@@ -646,6 +653,60 @@ impl CatalogWriter {
         let change_id=record_stored_change(&tx,events,"delete_files",summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(change_id)
     }
 
+    pub fn suggest_deletions(&self, incoming: &str, suggestions: &[(i64, bool)], formats: &crate::formats::FormatTable) -> Result<DeletionSuggestionChange, String> {
+        self.require_write()?;
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let mut events = Vec::new();
+        {
+            let mut select = tx.prepare("SELECT path,ext_lower,delete_suggestion FROM assets WHERE id=?1 AND is_listed=1")
+                .map_err(|e| e.to_string())?;
+            for &(id, weak) in suggestions {
+                let row = select.query_row([id], |row| Ok((row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?, row.get::<_, Option<i64>>(2)?)))
+                    .optional().map_err(|e| e.to_string())?;
+                let Some((Some(path), ext, current)) = row else { continue; };
+                if !crate::incoming::is_inside(&path, incoming) || !matches!(formats.group(&ext), Some("image" | "raw")) {
+                    continue;
+                }
+                // NULL: eligible, 0: explicitly kept, 1: suggested. A new best is eligible again.
+                let new_value = match (weak, current) {
+                    (true, None) => SqlValue::Integer(1),
+                    (false, Some(1)) => SqlValue::Null,
+                    _ => continue,
+                };
+                record_column_update(&tx, &mut events, "assets", id, "delete_suggestion", new_value)?;
+            }
+        }
+        let summary = if events.is_empty() { "Žiadne nové návrhy na vymazanie".into() }
+            else { format!("Zmenené návrhy na vymazanie ({})", events.len()) };
+        let change_id = record_stored_change(&tx, events, "suggest_deletions", &summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(DeletionSuggestionChange { change_id, summary })
+    }
+
+    pub fn keep_suggested_assets(&self, selection: Option<&[i64]>) -> Result<DeletionSuggestionChange, String> {
+        self.require_write()?;
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let selection = selection.map(|ids| ids.iter().copied().collect::<std::collections::HashSet<_>>());
+        let active = {
+            let mut select = tx.prepare("SELECT id FROM assets WHERE delete_suggestion=1 AND is_listed=1 ORDER BY id")
+                .map_err(|e| e.to_string())?;
+            select.query_map([], |row| row.get::<_, i64>(0)).map_err(|e| e.to_string())?
+                .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+        };
+        let mut events = Vec::new();
+        for id in active.into_iter().filter(|id| selection.as_ref().is_none_or(|ids| ids.contains(id))) {
+            record_column_update(&tx, &mut events, "assets", id, "delete_suggestion", SqlValue::Integer(0))?;
+        }
+        let summary = if events.is_empty() { "Žiadne návrhy na vymazanie".into() }
+            else { format!("Zrušené návrhy na vymazanie ({})", events.len()) };
+        let change_id = record_stored_change(&tx, events, "keep_suggested_assets", &summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(DeletionSuggestionChange { change_id, summary })
+    }
+
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
         let connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let mut statement = connection.prepare("SELECT id,ts,action,summary,undone FROM ddreams_changes ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
@@ -698,7 +759,7 @@ impl CatalogWriter {
 
 fn validate_item(table: &str, column: &str) -> Result<(), String> {
     let allowed = match table {
-        "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "path" | "name" | "ext" | "ext_lower" | "size" | "file_modified" | "folder_id" | "__snapshot__"),
+        "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "path" | "name" | "ext" | "ext_lower" | "size" | "file_modified" | "folder_id" | "delete_suggestion" | "__snapshot__"),
         "folders" => matches!(column,"name"|"path"|"__snapshot__"),
         "folder_roots" => matches!(column,"path"|"__snapshot__"),
         "ddreams_folder_rules" => column == "path",
@@ -1038,9 +1099,13 @@ fn apply_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column:
     Ok(())
 }
 
-fn snapshot_columns(table:&str)->Result<&'static [&'static str],String>{
+fn snapshot_columns(transaction: &Transaction<'_>, table:&str)->Result<&'static [&'static str],String>{
+    const ASSETS: &[&str] = &["id","folder_id","name","ext","ext_lower","is_listed","size","width","height","bpp","caption","notes","author","rating","tagged","label","file_modified","exif_date","acdsee_date","md_dirty","is_orphan","path","delete_suggestion"];
     match table {
-        "assets"=>Ok(&["id","folder_id","name","ext","ext_lower","is_listed","size","width","height","bpp","caption","notes","author","rating","tagged","label","file_modified","exif_date","acdsee_date","md_dirty","is_orphan","path"]),
+        "assets" => {
+            let has_flag = crate::incoming::has_deletion_column(transaction).map_err(|e| e.to_string())?;
+            Ok(if has_flag { ASSETS } else { &ASSETS[..ASSETS.len()-1] })
+        },
         "folders"=>Ok(&["id","parent_id","root_id","name","path"]),
         "folder_roots"=>Ok(&["id","name","path"]),
         "categories"=>Ok(&["id","parent_id","root_id","name","icon_key"]),
@@ -1051,14 +1116,14 @@ fn snapshot_columns(table:&str)->Result<&'static [&'static str],String>{
 }
 
 fn read_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str)->Result<SqlValue,String>{
-    let columns=snapshot_columns(table)?;let id=key_id(row_key)?;
+    let columns=snapshot_columns(transaction,table)?;let id=key_id(row_key)?;
     let sql=format!("SELECT {} FROM {table} WHERE id=?1",columns.join(","));
     let snapshot=transaction.query_row(&sql,[id],|row|{
         let mut values=Vec::with_capacity(columns.len());
         for (index, column) in columns.iter().enumerate() {
             let value = row.get::<_, SqlValue>(index)?;
-            // Keep the old snapshot representation when a category has no explicit icon.
-            if *column == "icon_key" && value == SqlValue::Null { break; }
+            // Keep compatibility with older snapshots when optional metadata is absent.
+            if matches!(*column, "icon_key" | "delete_suggestion") && value == SqlValue::Null { break; }
             values.push(encode_sql(&value).map_err(|_| rusqlite::Error::InvalidQuery)?);
         }
         Ok(values)
@@ -1067,11 +1132,11 @@ fn read_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str)->Result<S
 }
 
 fn restore_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str,value:&SqlValue)->Result<(),String>{
-    let columns=snapshot_columns(table)?;let id=key_id(row_key)?;
+    let columns=snapshot_columns(transaction,table)?;let id=key_id(row_key)?;
     if matches!(value,SqlValue::Null){transaction.execute(&format!("DELETE FROM {table} WHERE id=?1"),[id]).map_err(|e|e.to_string())?;return Ok(());}
     let SqlValue::Text(snapshot)=value else{return Err("Invalid row snapshot value".into())};
     let encoded:Vec<String>=serde_json::from_str(snapshot).map_err(|e|e.to_string())?;
-    let columns = if columns.last() == Some(&"icon_key") && encoded.len() + 1 == columns.len() {
+    let columns = if matches!(columns.last(), Some(&("icon_key" | "delete_suggestion"))) && encoded.len() + 1 == columns.len() {
         &columns[..encoded.len()]
     } else {
         if encoded.len() != columns.len() { return Err("Invalid row snapshot width".into()); }
@@ -1383,6 +1448,40 @@ mod tests {
         let result=writer.move_category(11,None).unwrap();let new_root=result.root_id.unwrap();
         let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=11",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,String>(0)).unwrap(),"Deti");drop(conn);
         writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=11",[],|r|r.get::<_,String>(0)).unwrap(),"10:1");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,i64>(0)).unwrap(),0);
+    }
+
+    #[test]
+    fn deletion_suggestions_are_batched_undoable_and_preserve_keep_decisions() {
+        let db = write_fixture();
+        db.lock().unwrap().execute("ALTER TABLE assets ADD COLUMN delete_suggestion INTEGER", []).unwrap();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let state = |id| db.lock().unwrap().query_row("SELECT delete_suggestion FROM assets WHERE id=?1",
+            [id], |row| row.get::<_, Option<i64>>(0)).unwrap();
+        let folder = r"F:\Photos";
+        let batch = [(1, true), (2, true)];
+        assert!(writer.suggest_deletions(r"F:\Elsewhere", &batch, &formats).unwrap().change_id.is_none());
+        let change = writer.suggest_deletions(folder, &batch, &formats).unwrap().change_id.unwrap();
+        assert_eq!((state(1), state(2)), (Some(1), Some(1)));
+        assert_eq!(writer.undo_last().unwrap().unwrap().id, change);
+        assert_eq!((state(1), state(2)), (None, None));
+        writer.suggest_deletions(folder, &batch, &formats).unwrap();
+
+        writer.keep_suggested_assets(Some(&[1])).unwrap();
+        assert_eq!((state(1), state(2)), (Some(0), Some(1)));
+        assert!(writer.suggest_deletions(folder, &batch, &formats).unwrap().change_id.is_none());
+        writer.keep_suggested_assets(None).unwrap();
+        assert_eq!((state(1), state(2)), (Some(0), Some(0)));
+        writer.undo_last().unwrap();
+        assert_eq!((state(1), state(2)), (Some(0), Some(1)));
+        writer.undo_last().unwrap();
+        assert_eq!((state(1), state(2)), (Some(1), Some(1)));
+
+        writer.suggest_deletions(folder, &[(1, false)], &formats).unwrap();
+        assert_eq!(state(1), None);
+        writer.undo_last().unwrap();
+        assert_eq!(state(1), Some(1));
+        assert!(CatalogWriter::new(db.clone(), false).keep_suggested_assets(None).is_err());
     }
 
     #[test]

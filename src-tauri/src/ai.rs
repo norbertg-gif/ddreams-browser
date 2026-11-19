@@ -46,6 +46,9 @@ struct AiInner {
     paths: Paths,
     db: Db,
     formats: Arc<FormatTable>,
+    writer: Arc<crate::journal::CatalogWriter>,
+    exif: Arc<crate::exiftool::ExifTool>,
+    incoming_series: Mutex<()>,
     app: Mutex<Option<tauri::AppHandle>>,
     process: Mutex<ProcessState>,
     status: Mutex<AiStatus>,
@@ -67,13 +70,13 @@ pub struct AiService(Arc<AiInner>);
 pub struct AiState(pub AiService);
 
 impl AiService {
-    pub fn new(paths: Paths, db: Db, formats: Arc<FormatTable>) -> Self {
+    pub fn new(paths: Paths, db: Db, formats: Arc<FormatTable>, writer: Arc<crate::journal::CatalogWriter>, exif: Arc<crate::exiftool::ExifTool>) -> Self {
         let reason = availability_reason(&paths);
         let status = reason.map(AiStatus::unavailable).unwrap_or(AiStatus {
             available: true, reason: None, state: "off".into(), model_state: "unloaded".into(), waiting: 0, indexed: 0, queued: 0, done: 0, failed: 0, offline: 0, total: 0, rate_per_s: 0.0, eta_s: None, last_error: None,
         });
         Self(Arc::new(AiInner {
-            paths, db, formats, app: Mutex::new(None), process: Mutex::new(ProcessState { child: None, writer: None }),
+            paths, db, formats, writer, exif, incoming_series: Mutex::new(()), app: Mutex::new(None), process: Mutex::new(ProcessState { child: None, writer: None }),
             status: Mutex::new(status), pending: Mutex::new(HashMap::new()), next_id: AtomicU64::new(1), stopping: AtomicBool::new(false),
             auto_index_started: AtomicBool::new(false), last_stderr: Mutex::new(String::new()), stderr_reader: Mutex::new(None),
             colors_attached: AtomicBool::new(false),
@@ -270,6 +273,76 @@ impl AiService {
         Ok(json!({"groups":groups}))
     }
 
+    pub fn exif(&self) -> &crate::exiftool::ExifTool { &self.0.exif }
+
+    pub fn incoming_folder(&self) -> Result<String, String> {
+        crate::incoming::configured_folder(&self.0.paths.settings, &self.0.db, !self.0.paths.readonly)
+    }
+
+    pub fn vector_queries_available(&self) -> bool {
+        matches!(self.status().state.as_str(), "ready" | "indexing" | "paused")
+    }
+
+    pub fn rank_incoming_folders(&self, ids: &[i64], folder: &str, days: &HashMap<i64, String>) -> Result<Value, String> {
+        self.request("suggest_folders", json!({
+            "asset_ids": ids,
+            "catalog": self.0.paths.catalog,
+            "incoming": folder,
+            "extensions": self.0.formats.extensions(&["image", "raw"]),
+            "days": days,
+            "resolve_days": true,
+        }), Duration::from_secs(120))
+    }
+
+    pub fn analyze_incoming(&self, after_indexing: &[i64]) -> Result<crate::journal::DeletionSuggestionChange, String> {
+        use crate::{incoming, journal::DeletionSuggestionChange};
+        let empty = || DeletionSuggestionChange { change_id: None, summary: "Žiadne nové návrhy na vymazanie".into() };
+        if self.0.paths.readonly { return Err("Katalóg je iba na čítanie".into()); }
+        let _run = self.0.incoming_series.lock().map_err(|e| e.to_string())?;
+        let folder = self.incoming_folder()?;
+        if folder.is_empty() { return Ok(empty()); }
+        if !after_indexing.is_empty() &&
+            !incoming::has_incoming_photo(&self.0.db, &self.0.formats, &folder, after_indexing)? {
+            return Ok(empty());
+        }
+        let started = std::time::Instant::now();
+        let mut photos = incoming::photos(&self.0.db, &self.0.formats)?;
+        photos.retain(|photo| incoming::is_inside(&photo.path, &folder));
+        incoming::trace_timing("series catalogue", started, photos.len());
+        let started = std::time::Instant::now();
+        let undated = photos.iter().filter(|photo| photo.capture.as_deref()
+            .and_then(crate::commands::exif_date_seconds).is_none())
+            .map(|photo| photo.id).collect::<Vec<_>>();
+        let indexed = if undated.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            let result = self.request("indexed_asset_ids", json!({"asset_ids": undated}), Duration::from_secs(30))?;
+            result["asset_ids"].as_array().ok_or("AI vrátilo neplatný zoznam indexovaných fotiek")?
+                .iter().filter_map(Value::as_i64).collect()
+        };
+        incoming::fill_capture_dates(self.exif(), &mut photos, |id| indexed.contains(&id));
+        incoming::trace_timing("series missing capture dates", started, indexed.len());
+        let items = photos.into_iter().map(|photo| json!({"asset_id":photo.id,"t":photo.capture.as_deref().and_then(crate::commands::exif_date_seconds)}))
+            .collect::<Vec<_>>();
+        if items.len() < 2 { return Ok(empty()); }
+        let (_, max_gap, min_sim) = SERIES_PRESETS[1];
+        let started = std::time::Instant::now();
+        let analyzed = items.len();
+        let result = self.request("series", json!({"items":items,"max_gap":max_gap,"min_sim":min_sim,"face_aware":true}), Duration::from_secs(300))?;
+        incoming::trace_timing("series AI", started, analyzed);
+        let mut suggestions = Vec::new();
+        for group in result["groups"].as_array().ok_or("AI vrátilo neplatný zoznam sérií")? {
+            let best = group["best"].as_i64().ok_or("AI neurčilo najlepší záber")?;
+            let ids = group["ids"].as_array().ok_or("AI vrátilo neplatnú sériu")?;
+            suggestions.extend(ids.iter().filter_map(Value::as_i64).map(|id| (id, id != best)));
+        }
+        if self.incoming_folder()? != folder { return Ok(empty()); }
+        let started = std::time::Instant::now();
+        let result = self.0.writer.suggest_deletions(&folder, &suggestions, &self.0.formats);
+        incoming::trace_timing("series journal", started, suggestions.len());
+        result
+    }
+
     pub fn analyze_series(&self, items: Vec<Value>, preset: &str) -> Result<Value, String> {
         let (_, max_gap, min_sim) = SERIES_PRESETS.iter().copied().find(|(name, _, _)| *name == preset).unwrap_or(SERIES_PRESETS[1]);
         self.request("series", json!({"items":items,"max_gap":max_gap,"min_sim":min_sim}), Duration::from_secs(300))
@@ -372,13 +445,14 @@ impl AiService {
         let id = self.0.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
         self.0.pending.lock().map_err(|e| e.to_string())?.insert(id, tx);
-        let mut request = args.as_object().cloned().unwrap_or_default();
+        let mut request = match args { Value::Object(map) => map, _ => Default::default() };
         request.insert("id".into(), json!(id));
         request.insert("cmd".into(), json!(cmd));
         let write_result = (|| {
+            let mut line = serde_json::to_vec(&Value::Object(request)).map_err(|e| e.to_string())?;
+            line.push(b'\n');
             let mut stdin = writer.lock().map_err(|e| e.to_string())?;
-            serde_json::to_writer(&mut *stdin, &Value::Object(request)).map_err(|e| e.to_string())?;
-            stdin.write_all(b"\n").map_err(|e| e.to_string())?;
+            stdin.write_all(&line).map_err(|e| e.to_string())?;
             stdin.flush().map_err(|e| e.to_string())
         })();
         if let Err(error) = write_result {
@@ -405,6 +479,22 @@ impl AiService {
                         message.get("result").cloned().ok_or_else(|| "AI server vrátil prázdny výsledok".into())
                     } else { Err(message.get("error").and_then(Value::as_str).unwrap_or("AI požiadavka zlyhala").to_string()) };
                     let _ = sender.send(result);
+                }
+            } else if message["event"] == "indexed_assets" && !self.0.paths.readonly {
+                let ids = message["asset_ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect::<Vec<_>>();
+                if !ids.is_empty() {
+                    let service = self.clone();
+                    let _ = thread::Builder::new().name("ai-incoming-series".into()).spawn(move || {
+                        match service.analyze_incoming(&ids) {
+                            Ok(change) if change.change_id.is_some() => {
+                                if let Some(app) = service.0.app.lock().unwrap().as_ref() {
+                                    let _ = app.emit("deletion-suggestions-changed", change);
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(error) => eprintln!("Návrhy na vymazanie: {error}"),
+                        }
+                    });
                 }
             } else if matches!(message.get("event").and_then(Value::as_str), Some("status" | "progress")) {
                 self.update_status(&message);

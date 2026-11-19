@@ -133,7 +133,7 @@ pub struct AiSeriesGroup { pub ids:Vec<i64>, pub best:i64 }
 #[serde(rename_all="camelCase")]
 pub struct AiSeriesResult { pub groups:Vec<AiSeriesGroup>, pub analyzed:usize, pub truncated:bool }
 
-fn exif_date_seconds(value:&str)->Option<f64>{
+pub(crate) fn exif_date_seconds(value:&str)->Option<f64>{
     if !value.is_ascii(){return None;}
     let split=value.find(|c|c=='T'||c==' ')?;let date=&value[..split];let time=&value[split+1..];
     if date.len()!=10||date.as_bytes()[4]!=b'-'||date.as_bytes()[7]!=b'-'||time.len()<8{return None;}
@@ -595,8 +595,18 @@ pub fn get_folder_previews(state: State<'_, BackgroundDbState>, formats: State<'
 }
 fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
     let (path,files)=listing.uncatalogued_files(filter)?;
-    if path.is_empty()||files.is_empty()||writer.effective_folder_mode(&path).as_deref()!=Some("include"){return Ok(0);}
-    let candidates=files.into_iter().filter(|a|matches!(formats.group(&a.ext),Some("image"|"raw"|"video"))).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name,ext:a.ext,size:a.size,file_modified:a.file_modified,path:file_path,folder_path})}).collect::<Vec<_>>();
+    if path.is_empty() || files.is_empty() { return Ok(0); }
+    let mode = writer.effective_folder_mode(&path);
+    let included = mode.as_deref() == Some("include");
+    if mode.as_deref() == Some("exclude") || (!included &&
+        !ai.incoming_folder().is_ok_and(|folder| crate::incoming::contains_folder(&path, &folder))) {
+        return Ok(0);
+    }
+    let candidates=files.into_iter().filter(|a|match formats.group(&a.ext) {
+        Some("image" | "raw") => true,
+        Some("video") => included,
+        _ => false,
+    }).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name,ext:a.ext,size:a.size,file_modified:a.file_modified,path:file_path,folder_path})}).collect::<Vec<_>>();
     if candidates.is_empty(){return Ok(0);}
     let remaps=writer.catalog_listed_assets(&candidates)?;
     if !remaps.is_empty(){let _=listing.invalidate_path(&path);ai.index_assets(&remaps.iter().map(|r|r.new_id).collect::<Vec<_>>());}
@@ -629,15 +639,11 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
 pub struct Editor { name: String, path: String, multi: bool }
 
 fn read_editor_settings(path: &Path) -> Result<Vec<Editor>, String> {
-    let text = match std::fs::read_to_string(path) { Ok(text) => text, Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]), Err(e) => return Err(e.to_string()) };
-    let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    if !value.is_object() { return Err("settings.json must contain an object".into()); }
-    match value.get("editors") { Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string()), None => Ok(vec![]) }
+    let settings = crate::incoming::read_settings(path)?;
+    match settings.get("editors") { Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string()), None => Ok(vec![]) }
 }
 fn write_editor_settings(path: &Path, editors: &[Editor]) -> Result<(), String> {
-    let mut value: Value = match std::fs::read_to_string(path) { Ok(text) => serde_json::from_str(&text).map_err(|e| e.to_string())?, Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}), Err(e) => return Err(e.to_string()) };
-    value.as_object_mut().ok_or("settings.json must contain an object")?.insert("editors".into(), serde_json::to_value(editors).map_err(|e| e.to_string())?);
-    std::fs::write(path, serde_json::to_vec_pretty(&value).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+    crate::incoming::write_setting(path, "editors", serde_json::to_value(editors).map_err(|e| e.to_string())?)
 }
 #[tauri::command(async)]
 pub fn get_editors(info: State<'_, AppInfoState>) -> Result<Vec<Editor>, String> { read_editor_settings(Path::new(&info.0.settings)) }

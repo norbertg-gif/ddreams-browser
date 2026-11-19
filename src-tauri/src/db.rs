@@ -560,6 +560,7 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "unkeyworded" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_keywords akx WHERE akx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
+            "delete_suggested" if crate::incoming::has_deletion_column(&conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
             _ => where_sql.push_str(" AND 0"),
         },
         "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
@@ -768,6 +769,7 @@ pub fn asset_ids_page(
             "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "unkeyworded" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
+            "delete_suggested" if crate::incoming::has_deletion_column(&conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
             _ => where_sql.push_str(" AND 0"),
         },
         "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
@@ -1067,7 +1069,10 @@ pub fn values_page(
         "special" => {
             let photos=formats.sql_in("a.ext_lower", &["image", "raw"]);
             let hidden=formats.sql_not_in("a.ext_lower", &formats.hidden_extensions());
-            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
+            let suggested = if crate::incoming::has_deletion_column(&conn)? {
+                format!(" UNION ALL SELECT 'delete_suggested' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND a.delete_suggestion=1")
+            } else { String::new() };
+            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0{suggested}) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
             let mut stmt=conn.prepare(&sql)?;
             return stmt.query_map(params![limit.clamp(1,500),offset.max(0)],|r|Ok(ValueCount{value:r.get(0)?,count:r.get(1)?}))?.collect();
         }

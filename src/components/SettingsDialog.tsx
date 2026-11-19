@@ -1,10 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import FileOperationDialog from "./FileOperationDialog";
 import { useFolderRules, type FolderRuleAction } from "../folderRules";
 import { saveEditors, useEditors, editorsSuggested, type Editor } from "../editors";
 
 type Props = {
   onClose: () => void;
+  incomingFolder: string;
+  readOnly: boolean;
+  onIncomingFolderChange: (path:string) => Promise<void>;
   onRule: FolderRuleAction;
   showOtherFiles: boolean;
   onShowOtherFiles: (value: boolean) => void;
@@ -23,10 +27,21 @@ type MissingSource={path:string;assets:number;offline:boolean;missing:boolean};
 type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
 
 /** Application settings. Sections grow as features arrive. */
-export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiLoadModelAtStart, onAiLoadModelAtStart, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
+export default function SettingsDialog({ onClose, incomingFolder, onIncomingFolderChange, readOnly, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiLoadModelAtStart, onAiLoadModelAtStart, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
+  const [incomingPicker, setIncomingPicker] = useState(false);
+  const [incomingError, setIncomingError] = useState("");
+  const [incomingBusy, setIncomingBusy] = useState(false);
+  const saveIncoming = async (path: string) => {
+    setIncomingPicker(false);
+    setIncomingError("");
+    setIncomingBusy(true);
+    try { await onIncomingFolderChange(path); }
+    catch (error) { setIncomingError(String(error)); }
+    finally { setIncomingBusy(false); }
+  };
   const [backup, setBackup] = useState<BackupStatus | null>(null);
   const [backupBusy, setBackupBusy] = useState(false);
   const [backupDone, setBackupDone] = useState(false);
@@ -54,10 +69,10 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
     const reloadSources=()=>{setSourcesLoading(true);void invoke<MissingSource[]>("get_catalog_missing_sources").then(setMissingSources).catch(()=>setMissingSources([])).finally(()=>setSourcesLoading(false))};window.addEventListener("ddreams-catalog-changed",reloadSources);return()=>window.removeEventListener("ddreams-catalog-changed",reloadSources);
   }, []);
   useEffect(() => {
-    const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); onClose(); } };
+    const key = (e: KeyboardEvent) => { if (e.key === "Escape") { e.stopPropagation(); if (incomingPicker) setIncomingPicker(false); else onClose(); } };
     window.addEventListener("keydown", key, true);
     return () => window.removeEventListener("keydown", key, true);
-  }, [onClose]);
+  }, [onClose, incomingPicker]);
   useEffect(() => { void invoke<BackupStatus>("get_backup_status").then(setBackup).catch(e => setBackupError(String(e)));setSourcesLoading(true);void invoke<MissingSource[]>("get_catalog_missing_sources").then(setMissingSources).catch(()=>setMissingSources([])).finally(()=>setSourcesLoading(false)); }, []);
   const backupNow = async () => {
     setBackupBusy(true); setBackupDone(false); setBackupError("");
@@ -76,7 +91,7 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
     if (!exists) { setError("Priečinok neexistuje alebo nie je dostupný."); return; }
     setError(""); setPath(""); onRule(value, mode);
   };
-  return <div className="modal-backdrop" onPointerDown={e => { if (!box.current?.contains(e.target as Node)) onClose(); }}>
+  return <><div className="modal-backdrop" onPointerDown={e => { if (!box.current?.contains(e.target as Node)) onClose(); }}>
     <div className="settings-dialog" ref={box} role="dialog" aria-label="Nastavenia">
       <div className="settings-head"><b>Nastavenia</b><button onClick={onClose} title="Zavrieť (Esc)">✕</button></div>
       <section className="settings-section">
@@ -126,6 +141,15 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
         {editorError && <small className="settings-error">{editorError}</small>}
       </section>
       <section className="settings-section">
+        <h3>Priečinok s novými fotkami</h3>
+        <p className="settings-help" title={incomingFolder}>{incomingFolder || "Priečinok zatiaľ nie je vybraný."}</p>
+        <div className="settings-add">
+          <button disabled={readOnly||incomingBusy} onClick={()=>setIncomingPicker(true)}>Vybrať priečinok…</button>
+          {incomingFolder&&<button disabled={readOnly||incomingBusy} onClick={()=>void saveIncoming("")}>Zrušiť výber</button>}
+        </div>
+        {incomingError&&<small className="settings-error">{incomingError}</small>}
+      </section>
+      <section className="settings-section">
         <h3>AI</h3>
         {aiAvailable ? <>
           <label className="settings-check"><input type="checkbox" checked={aiEnabled} onChange={onToggleAi} /> Zapnúť AI (hľadanie obsahom, návrhy, farby, duplicity)</label>
@@ -135,5 +159,8 @@ export default function SettingsDialog({ onClose, onRule, showOtherFiles, onShow
         </> : <p className="settings-help">AI modul nie je nainštalovaný.</p>}
       </section>
     </div>
-  </div>;
+  </div>
+  {incomingPicker&&<FileOperationDialog mode="select" initialPath={incomingFolder}
+    onChoose={path=>void saveIncoming(path)} onClose={()=>setIncomingPicker(false)}/>}
+  </>;
 }

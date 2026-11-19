@@ -1,4 +1,5 @@
 import builtins
+from contextlib import closing
 import io
 import json
 import os
@@ -246,6 +247,18 @@ class LazyModelTests(unittest.TestCase):
     def tearDown(self):
         self.service.stop()
         self.temp.cleanup()
+
+    def test_indexed_asset_ids_checks_stored_model_and_dimension_without_loading_vectors(self):
+        self.assertIsNone(self.service._vectors)
+        with self.service.db_lock, self.service.db:
+            self.service.db.executemany("INSERT INTO embeddings VALUES(?,?,1,1,?,?)", [
+                (11, self.service.model_name, DIMENSION, b""),
+                (12, "other-model", DIMENSION, b""),
+                (13, self.service.model_name, 2, b""),
+            ])
+        self.assertEqual(self.service.execute({"cmd": "indexed_asset_ids", "asset_ids": [11, 12, 13, 14]}),
+                         {"asset_ids": [11]})
+        self.assertIsNone(self.service._vectors)
 
     def test_lazy_start_does_not_import_torch(self):
         original_import = builtins.__import__
@@ -828,6 +841,90 @@ class ServerTests(unittest.TestCase):
         self.service.db.commit()
         return self.service.execute({"cmd": "series", "items": [{"asset_id": aid, "t": stamp} for aid, stamp in timed_ids],
                                      "max_gap": max_gap, "min_sim": min_sim})["groups"]
+
+    def test_indexed_assets_event_waits_for_face_scans_and_only_emits_once(self):
+        self.service._newly_indexed_ids.update([8, 7])
+        self.service._face_active_ids.add(7)
+        self.service._emit_indexed_assets()
+        self.assertFalse(any(event.get("event") == "indexed_assets" for event in self.events))
+        self.service._face_active_ids.clear()
+        self.service._emit_indexed_assets()
+        self.service._emit_indexed_assets()
+        self.assertEqual([event for event in self.events if event.get("event") == "indexed_assets"],
+                         [{"event": "indexed_assets", "asset_ids": [7, 8]}])
+
+    def test_folder_suggestions_aggregate_votes_and_exclude_the_shoot_and_incoming(self):
+        scores = {
+            1: (1, 0), 2: (0, 1), 3: (1, 0), 4: (1, 0),
+            5: (0.75, 0), 6: (0, 0.75), 7: (0.85, 0), 8: (0, 0.45), 9: (-1, 0),
+        }
+        set_vectors(self.service, {i: np.asarray(parts, dtype=np.float32) for i, parts in scores.items()})
+        photos = [
+            (1, None, "2026-11-01"), (2, None, "2026-11-02"),
+            (3, None, "2026-10-04"), (4, "same-day", "2026-11-01"),
+            (5, "A", "2026-09-01"), (6, "A", "2026-09-02"),
+            (7, "B", "2026-09-01"), (8, "C", None), (9, "opposite", None),
+        ]
+        result = self.service.execute({"cmd": "suggest_folders", "asset_ids": [1, 2, 17], "photos": photos})
+        self.assertEqual([folder["folder"] for folder in result["folders"]], ["A", "B", "C"])
+        pending = self.service.execute({"cmd": "suggest_folders", "asset_ids": [1, 2], "photos": photos, "resolve_days": True})
+        self.assertEqual(pending["missing_days"], [8])
+        expected = [2 * 0.75**4, 0.85**4, 0.45**4]
+        np.testing.assert_allclose([row["share"] for row in result["folders"]],
+                                   np.array(expected) / sum(expected), atol=0.001)
+
+    def test_catalogue_folder_cache_uses_modified_day_and_refreshes_after_edits(self):
+        catalogue = self.root / "catalog.sqlite"
+        with closing(sqlite3.connect(catalogue)) as connection:
+            with connection:
+                connection.execute("""CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT,exif_date TEXT,
+                                        file_modified TEXT,is_listed INTEGER,ext_lower TEXT)""")
+                connection.executemany("INSERT INTO assets VALUES(?,?,?,?,1,'jpg')", [
+                    (1, "F:/Incoming/a.jpg", "2026-11-01T12:00:00", None),
+                    (2, "F:/Incoming/nested/c.jpg", None, None),
+                    (3, "F:/Sorted/A/b.jpg", None, "2026-11-01T13:00:00"),
+                    (4, "F:/Sorted/B/c.jpg", None, "2026-10-01T13:00:00"),
+                ])
+            set_vectors(self.service, {i: np.array([1, 0], dtype=np.float32) for i in range(1, 5)})
+            self.service._cuda_torch = False
+            request = {"cmd": "suggest_folders", "catalog": str(catalogue), "incoming": "F:/Incoming",
+                       "extensions": ["jpg"], "asset_ids": [1], "resolve_days": True}
+            result = self.service.execute(request)
+            self.assertEqual(result, {"folders": [{"folder": r"F:\Sorted\B", "share": 1.0}]})
+            cached = self.service._folder_metadata
+            self.assertEqual(self.service.execute(request), result)
+            self.assertIs(self.service._folder_metadata, cached)
+
+            with connection:
+                connection.execute("UPDATE assets SET path='F:/Sorted/C/c.jpg' WHERE id=4")
+            self.assertEqual(self.service.execute(request), {"folders": [{"folder": r"F:\Sorted\C", "share": 1.0}]})
+            self.assertIsNot(self.service._folder_metadata, cached)
+
+            with connection:
+                connection.execute("UPDATE assets SET file_modified=NULL WHERE id=4")
+            self.assertEqual(self.service.execute(request)["missing_days"], [4])
+            self.assertEqual(self.service.execute({**request, "days": {"4": "2026-11-01"}}), {"folders": []})
+
+    def test_folder_suggestions_take_only_the_25_nearest_eligible_neighbours(self):
+        values = {i: np.array([1 if i <= 26 else 0.99, 0], dtype=np.float32) for i in range(1, 29)}
+        set_vectors(self.service, values)
+        photos = [(1, None, None)] + [(i, "strong" if i <= 26 else "weak", None) for i in range(2, 29)]
+        result = self.service.execute({"cmd": "suggest_folders", "asset_ids": [1], "photos": photos})
+        self.assertEqual(result, {"folders": [{"folder": "strong", "share": 1.0}]})
+
+    def test_face_aware_series_prefers_face_count_then_confidence(self):
+        vector = np.array([1, 0], dtype=np.float32)
+        self.series([(i, i) for i in range(1, 5)], {i: vector for i in range(1, 5)},
+                    {1: 0.9, 2: 0.7, 3: 0.6, 4: 0.5})
+        with self.service.faces_db:
+            self.service.faces_db.executemany(
+                "INSERT INTO faces(asset_id,det_score,source,state) VALUES(?,?,'ai','unknown')",
+                [(2, 0.99), (3, 0.85), (3, 0.85), (4, 0.90), (4, 0.90)],
+            )
+        request = {"cmd": "series", "items": [{"asset_id": i, "t": i} for i in range(1, 5)],
+                   "max_gap": 10, "min_sim": 0.90}
+        self.assertEqual(self.service.execute(request)["groups"][0]["best"], 1)
+        self.assertEqual(self.service.execute({**request, "face_aware": True})["groups"][0]["best"], 4)
 
     def test_series_chain_and_sharpness_tie_uses_earliest_time(self):
         vectors = {10: np.array([1, 0], dtype=np.float32), 11: np.array([0.98, 0.2], dtype=np.float32), 12: np.array([0.96, 0.28], dtype=np.float32)}

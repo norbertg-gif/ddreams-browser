@@ -34,7 +34,13 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
         set_meta_if_absent(&transaction, "schema_version", "1")?;
     }
     transaction.execute_batch("CREATE INDEX IF NOT EXISTS folders_norm_path ON folders(lower(rtrim(replace(path,'/','\\'),'\\'))); CREATE INDEX IF NOT EXISTS idx_assets_folder_listed ON assets(folder_id,is_listed); CREATE TABLE IF NOT EXISTS asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL CHECK(state IN (0,1)),PRIMARY KEY(asset_id,color)); CREATE TABLE IF NOT EXISTS ai_suggestion_rejections(asset_id INTEGER NOT NULL,kind TEXT NOT NULL,label_id INTEGER NOT NULL,PRIMARY KEY(asset_id,kind,label_id)); CREATE TABLE IF NOT EXISTS ddreams_folder_rules(path TEXT PRIMARY KEY COLLATE NOCASE,mode TEXT NOT NULL CHECK(mode IN ('include','exclude')),created TEXT NOT NULL);").map_err(|e|e.to_string())?;
-    transaction.commit().map_err(|e|e.to_string())
+    if !crate::incoming::has_deletion_column(&transaction).map_err(|e| e.to_string())? {
+        transaction.execute("ALTER TABLE assets ADD COLUMN delete_suggestion INTEGER CHECK(delete_suggestion IN (0,1))", [])
+            .map_err(|e| e.to_string())?;
+    }
+    transaction.execute("CREATE INDEX IF NOT EXISTS idx_assets_delete_suggestion ON assets(id) WHERE is_listed=1 AND delete_suggestion=1", [])
+        .map_err(|e| e.to_string())?;
+    transaction.commit().map_err(|e| e.to_string())
 }
 
 fn set_meta(transaction: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<(), String> {
@@ -81,6 +87,17 @@ mod tests {
             assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",[index],|row|row.get::<_,i64>(0)).unwrap(),1);
         }
         assert!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ddreams_change_items'",[],|row|row.get::<_,i64>(0)).unwrap()==1);
+    }
+
+    #[test]
+    fn deletion_suggestion_migration_preserves_existing_rows_and_values() {
+        let mut conn = fixture();
+        conn.execute("INSERT INTO assets(id,is_listed) VALUES(1,1)", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        assert_eq!(conn.query_row("SELECT delete_suggestion FROM assets WHERE id=1", [], |row| row.get::<_, Option<i64>>(0)).unwrap(), None);
+        conn.execute("UPDATE assets SET delete_suggestion=0 WHERE id=1", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        assert_eq!(conn.query_row("SELECT is_listed,delete_suggestion FROM assets WHERE id=1", [], |row| Ok((row.get::<_, i64>(0)?,row.get::<_, i64>(1)?))).unwrap(), (1,0));
     }
 
     #[test]
