@@ -24,3 +24,7 @@
 .category-icon-grid button{display:grid;place-items:center;padding:6px 0;color:#d4aa67}
 .category-icon-picker button[aria-pressed="true"]{background:var(--select);border-color:var(--accent)}
 .category-icon-picker button:hover:not(:disabled){border-color:var(--accent)}
+
+.property-keyword-chip.partial{border-style:dashed;opacity:.85}
+.property-keyword-chip .property-keyword-assign{padding:0;background:none;border:0;color:inherit;font:inherit;cursor:pointer;text-decoration:underline dotted}
+.property-keyword-chip .property-keyword-assign small{opacity:.7}

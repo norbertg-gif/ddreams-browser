@@ -587,3 +587,11 @@ input[type=checkbox]{accent-color:var(--accent)}
 .incoming-folder-row>span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .deletion-suggestion-badge{display:inline-grid;place-items:center;width:19px;height:19px;flex:none;border-radius:4px;background:#521c20;color:#ffabad;font-size:13px;font-weight:bold}
 .thumb-wrap>.deletion-suggestion-badge{position:absolute;z-index:2;right:5px;top:28px}
+
+/* Edit panel: labels sit at the top of their row, so chips are clearly part of their own row. */
+.meta-row.editor-row{align-items:start;padding:4px 0;border-top:1px solid rgba(255,255,255,.05)}
+.meta-row.editor-row>span{padding-top:4px}
+.assignment-people{display:flex;flex-direction:column;gap:4px}
+.person-assignment-chips>span{border-color:#3d6fa8;background:rgba(61,111,168,.18)}
+.person-assignment-chips>span>span::before{content:'';display:inline-block;width:7px;height:7px;margin-right:4px;border-radius:50%;background:#5aa9ff;vertical-align:middle}
+.property-keyword-editor{display:flex;flex-direction:column;gap:4px}
