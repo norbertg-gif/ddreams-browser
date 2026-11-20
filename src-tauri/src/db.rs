@@ -474,12 +474,16 @@ pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, S
     Ok(result)
 }
 
-pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
-    if filter.kind == "ai" || filter.kind == "series" || filter.kind == "people" { return ai_assets_page(db, filter, formats); }
-    let conn = db.lock().unwrap();
-    let ai_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
-    let quality_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
-    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+struct CatalogAssetFilter {
+    with_sql: String,
+    from_sql: String,
+    where_sql: String,
+    args: Vec<rusqlite::types::Value>,
+}
+
+fn catalog_asset_filter(conn: &Connection, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<CatalogAssetFilter> {
+    let ai_attached = filter.kind == "color" && conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='colors')", [], |r| r.get::<_, bool>(0)).unwrap_or(false);
+    let quality_attached = filter.kind == "quality" && conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')", [], |r| r.get::<_, bool>(0)).unwrap_or(false);
     let mut from_sql = String::from("assets a");
     let mut with_sql = String::new();
     let mut where_sql = format!("a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
@@ -560,7 +564,7 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "unkeyworded" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_keywords akx WHERE akx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
-            "delete_suggested" if crate::incoming::has_deletion_column(&conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
+            "delete_suggested" if crate::incoming::has_deletion_column(conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
             _ => where_sql.push_str(" AND 0"),
         },
         "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
@@ -581,6 +585,14 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         args.push(format!("%{escaped}%").into());
     }
     add_view_filters(&mut where_sql, &mut args, filter, formats);
+    Ok(CatalogAssetFilter { with_sql, from_sql, where_sql, args })
+}
+
+pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
+    if filter.kind == "ai" || filter.kind == "series" || filter.kind == "people" { return ai_assets_page(db, filter, formats); }
+    let conn = db.lock().unwrap();
+    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let CatalogAssetFilter { with_sql, from_sql, where_sql, args } = catalog_asset_filter(&conn, filter, formats)?;
     let order = order_clause(&filter.sort, filter.descending);
     let cacheable = conn.is_autocommit() && !matches!(filter.kind.as_str(), "auto" | "color" | "quality")
         && !where_sql.contains("ai.") && !where_sql.contains("auto_exif.");
@@ -703,91 +715,7 @@ pub fn asset_ids_page(
 ) -> rusqlite::Result<Vec<i64>> {
     if filter.kind=="ai"||filter.kind=="series"||filter.kind=="people"{let mut page_filter=filter.clone();page_filter.offset=offset;page_filter.limit=limit.clamp(1,500);return Ok(ai_assets_page(db,&page_filter,formats)?.items.into_iter().map(|asset|asset.id).collect());}
     let conn = db.lock().unwrap();
-    let quality_attached=conn.query_row("SELECT EXISTS(SELECT 1 FROM ai.sqlite_master WHERE type='table' AND name='quality')",[],|r|r.get::<_,bool>(0)).unwrap_or(false);
-    let mut with_sql = String::new();
-    let mut from_sql = String::from("assets a");
-    let mut where_sql = format!("a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
-    let mut args: Vec<rusqlite::types::Value> = Vec::new();
-    if let Some((cte, root_or_node_id)) = descendant_assets_cte(filter) {
-        with_sql = cte;
-        args.push(root_or_node_id);
-        from_sql = "matching_assets m CROSS JOIN assets a".into();
-        where_sql.push_str(" AND a.id=m.asset_id");
-    }
-    match filter.kind.as_str() {
-        "auto" => {
-            let pair=filter.value.as_deref().and_then(|v|v.split_once('\t'));
-            if let Some((group,field,value))=pair.and_then(|(group,value)|crate::exif_index::field(group).map(|field|(group,field,value))) {
-                where_sql.push_str(&format!(" AND a.id IN (SELECT asset_id FROM auto_exif.exif_index WHERE {field}=?)"));
-                match group { "iso"|"focal"|"exposure"|"bucket" => args.push(value.parse::<i64>().unwrap_or(-1).into()), "aperture" => args.push(value.parse::<f64>().unwrap_or(-1.0).into()), _ => args.push(value.to_string().into()) }
-            } else { where_sql.push_str(" AND 0"); }
-        }
-        "folder" => {
-            if let Some(ids) = filter.ids.as_ref().filter(|ids| !ids.is_empty()) {
-                where_sql.push_str(&format!(" AND a.folder_id IN ({})", vec!["?"; ids.len()].join(",")));
-                args.extend(ids.iter().copied().map(Into::into));
-            } else { where_sql.push_str(" AND a.folder_id=?"); args.push(filter.id.unwrap_or(-1).into()); }
-        }
-        "category" => {
-            if with_sql.is_empty() {
-                where_sql.push_str(" AND EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id AND ac.category_id=?)");
-                args.push(filter.id.unwrap_or(-1).into())
-            }
-        }
-        "keyword" => {
-            if with_sql.is_empty() {
-                where_sql.push_str(" AND EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id AND ak.keyword_id=?)");
-                args.push(filter.id.unwrap_or(-1).into())
-            }
-        }
-        "rating" => {
-            if filter.value.as_deref() == Some("unrated") {
-                where_sql.push_str(" AND coalesce(a.rating,0)=0")
-            } else {
-                where_sql.push_str(" AND a.rating=?");
-                args.push(
-                    filter
-                        .value
-                        .as_deref()
-                        .unwrap_or("0")
-                        .parse::<i64>()
-                        .unwrap_or(0)
-                        .into(),
-                )
-            }
-        }
-        "label" => {
-            where_sql.push_str(" AND coalesce(a.label,'')=?");
-            args.push(filter.value.clone().unwrap_or_default().into())
-        }
-        "quality" => match filter.value.as_deref().and_then(crate::quality::flag_sql) {
-            Some(fragment) if quality_attached => where_sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM ai.quality q WHERE q.asset_id=a.id AND q.version={} AND ({fragment}))",crate::quality::QUALITY_VERSION)),
-            _ => where_sql.push_str(" AND 0"),
-        },
-        "special" => match filter.value.as_deref().unwrap_or("") {
-            "all_photos" => where_sql.push_str(&format!(" AND {}", formats.sql_in("a.ext_lower", &["image", "raw"]))),
-            "uncategorized" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
-            "unkeyworded" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
-            "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
-            "delete_suggested" if crate::incoming::has_deletion_column(&conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
-            _ => where_sql.push_str(" AND 0"),
-        },
-        "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
-        _ => where_sql.push_str(" AND 0"),
-    }
-    add_view_filters(&mut where_sql, &mut args, filter, formats);
-    if let Some(q) = filter.query.as_ref().filter(|q| !q.trim().is_empty()) {
-        where_sql.push_str(
-            " AND (a.name LIKE ? ESCAPE '\\' OR coalesce(a.caption,'') LIKE ? ESCAPE '\\' OR coalesce(a.notes,'') LIKE ? ESCAPE '\\')",
-        );
-        let e = q
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        args.push(format!("%{e}%").into());
-        args.push(format!("%{e}%").into());
-        args.push(format!("%{e}%").into());
-    }
+    let CatalogAssetFilter { with_sql, from_sql, where_sql, mut args } = catalog_asset_filter(&conn, filter, formats)?;
     let sql = format!("{with_sql} SELECT a.id FROM {from_sql} WHERE {where_sql} ORDER BY {} LIMIT ? OFFSET ?", order_clause(&filter.sort, filter.descending));
     args.push(limit.clamp(1, 500).into());
     args.push(offset.max(0).into());
@@ -817,10 +745,9 @@ pub fn folders_page(
     }
     let parents=parent_ids.filter(|v|!v.is_empty()).unwrap_or_else(||vec![parent_id.unwrap_or(0)]);
     let placeholders=vec!["?";parents.len()].join(",");
-    let sql=format!("WITH RECURSIVE candidate AS (SELECT f.id,f.parent_id,f.root_id,f.name,f.path FROM folders f WHERE f.parent_id IN ({placeholders})), d(folder_id,id) AS (SELECT c.id,c.id FROM candidate c UNION ALL SELECT d.folder_id,f.id FROM folders f JOIN d ON f.parent_id=d.id), counts AS (SELECT d.folder_id,count(a.id) n FROM d JOIN assets a ON a.folder_id=d.id AND a.is_listed=1 GROUP BY d.folder_id) SELECT c.id,c.parent_id,c.root_id,c.name,c.path,coalesce(n,0) FROM candidate c LEFT JOIN counts ON counts.folder_id=c.id WHERE coalesce(n,0)>0 ORDER BY c.name COLLATE NOCASE,c.id LIMIT ? OFFSET ?");
-    let mut args:Vec<rusqlite::types::Value>=parents.into_iter().map(Into::into).collect(); args.push(limit.clamp(1,500).into()); args.push(offset.max(0).into());
+    let sql=format!("WITH RECURSIVE candidate AS (SELECT f.id,f.parent_id,f.root_id,f.name,f.path FROM folders f WHERE f.parent_id IN ({placeholders})), d(folder_id,id) AS (SELECT c.id,c.id FROM candidate c UNION ALL SELECT d.folder_id,f.id FROM folders f JOIN d ON f.parent_id=d.id), counts AS (SELECT d.folder_id,count(a.id) n FROM d JOIN assets a ON a.folder_id=d.id AND a.is_listed=1 GROUP BY d.folder_id) SELECT c.id,c.parent_id,c.root_id,c.name,c.path,coalesce(n,0) FROM candidate c LEFT JOIN counts ON counts.folder_id=c.id WHERE coalesce(n,0)>0 ORDER BY c.name COLLATE NOCASE,c.id");
     let mut stmt=conn.prepare(&sql)?;
-    let rows=stmt.query_map(rusqlite::params_from_iter(args),|r|{let id=r.get(0)?; Ok(Folder{id, parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![id],virtual_node:None,offline:false,missing:false})})?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let rows=stmt.query_map(rusqlite::params_from_iter(parents),|r|{let id=r.get(0)?; Ok(Folder{id, parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,path:r.get(4)?,count:r.get(5)?,folder_ids:vec![id],virtual_node:None,offline:false,missing:false})})?.collect::<rusqlite::Result<Vec<_>>>()?;
     let mut merged:std::collections::BTreeMap<String,Folder>=std::collections::BTreeMap::new();
     for folder in rows { let key=folder.name.to_lowercase(); if let Some(existing)=merged.get_mut(&key) {existing.count+=folder.count;existing.folder_ids.push(folder.id);} else {merged.insert(key,folder);} }
     Ok(merged.into_values().skip(offset.max(0) as usize).take(limit.clamp(1,500) as usize).collect())
@@ -1182,6 +1109,113 @@ mod feature_tests {
         assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
+    #[test]
+    fn asset_id_pages_match_grid_for_every_view_kind() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch(
+            "ALTER TABLE assets ADD COLUMN delete_suggestion INTEGER;
+             INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,rating,label,tagged,exif_date,delete_suggestion) VALUES
+               (1,9,'a_1.jpg','jpg','jpg',1,4,'Red',1,'2025-01-01',1),
+               (2,9,'b.jpg','jpg','jpg',1,4,'Red',0,'2025-01-02',NULL),
+               (3,10,'c.jpg','jpg','jpg',1,NULL,NULL,0,NULL,NULL),
+               (4,9,'d.jpg','jpg','jpg',0,4,'Red',1,'2025-01-01',1);
+             INSERT INTO category_roots VALUES(10,'Root');
+             INSERT INTO categories VALUES(100,NULL,10,'Top'),(101,100,10,'Child');
+             INSERT INTO keywords VALUES(200,NULL,'Top'),(201,200,'Child');
+             INSERT INTO asset_categories VALUES(1,100),(2,101);
+             INSERT INTO asset_keywords VALUES(1,200),(2,201);
+             CREATE TABLE asset_color_overrides(asset_id INTEGER,color TEXT,state INTEGER);
+             INSERT INTO asset_color_overrides VALUES(1,'modrá',1),(2,'modrá',0),(3,'modrá',1);
+             ATTACH DATABASE ':memory:' AS ai;
+             CREATE TABLE ai.colors(asset_id INTEGER, auto TEXT);
+             INSERT INTO ai.colors VALUES(2,'[\"modrá\",\"biela\"]'),(3,'[\"biela\"]');
+             CREATE TABLE ai.quality(asset_id INTEGER,version INTEGER,sharp REAL,hi REAL,mean REAL);
+             INSERT INTO ai.quality VALUES(1,1,10,0,0.5),(2,1,90,0,0.5);
+             ATTACH DATABASE ':memory:' AS auto_exif;
+             CREATE TABLE auto_exif.exif_index(asset_id INTEGER,camera TEXT);
+             INSERT INTO auto_exif.exif_index VALUES(1,'Canon'),(2,'Nikon'),(3,'Canon');"
+        ).unwrap();
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let mut cases = vec![
+            (test_filter("auto", "camera\tCanon"), vec![1,3]),
+            (test_filter("rating", "4"), vec![1,2]),
+            (test_filter("rating", "unrated"), vec![3]),
+            (test_filter("label", "Red"), vec![1,2]),
+            (test_filter("color", "modrá"), vec![1,3]),
+            (test_filter("color", "modrá, biela"), vec![3]),
+            (test_filter("color", "invalid"), vec![]),
+            (test_filter("quality", "blur"), vec![1]),
+            (test_filter("special", "all_photos"), vec![1,2,3]),
+            (test_filter("special", "uncategorized"), vec![3]),
+            (test_filter("special", "unkeyworded"), vec![3]),
+            (test_filter("special", "tagged"), vec![1]),
+            (test_filter("special", "delete_suggested"), vec![1]),
+            (test_filter("unknown", ""), vec![]),
+        ];
+        for (kind, id) in [("folder",9), ("category",100), ("keyword",200)] {
+            let mut filter = test_filter(kind, "");
+            filter.id = Some(id);
+            cases.push((filter.clone(), if kind == "folder" { vec![1,2] } else { vec![1] }));
+            if kind == "folder" { filter.ids = Some(vec![9,10]); } else { filter.include_children = true; }
+            cases.push((filter, if kind == "folder" { vec![1,2,3] } else { vec![1,2] }));
+        }
+        let mut root = test_filter("category", "");
+        root.root_id = Some(10);
+        cases.push((root.clone(), vec![1]));
+        root.include_children = true;
+        cases.push((root, vec![1,2]));
+        let mut date = test_filter("date", "");
+        date.date_source = Some("taken".into());
+        date.date_from = Some("2025-01-01".into());
+        date.date_to = Some("2025-01-02".into());
+        cases.push((date, vec![1,2]));
+        for kind in ["ai", "series", "people"] {
+            let mut filter = test_filter(kind, "");
+            filter.ids = Some(vec![3,1,3,4,-1,2]);
+            cases.push((filter, vec![3,1,2]));
+        }
+        let mut combined = test_filter("color", "modrá");
+        combined.query = Some("_".into());
+        combined.rating_mode = Some("atLeast".into());
+        combined.rating_value = Some(4);
+        combined.label_filter = Some("Red".into());
+        combined.tagged_only = true;
+        combined.file_group = Some("images".into());
+        cases.push((combined, vec![1]));
+
+        for (mut filter, expected) in cases {
+            for (offset, limit) in [(0,10), (1,1), (10,2)] {
+                filter.offset = offset;
+                filter.limit = limit;
+                let page = assets_page(&db, &filter, &formats).unwrap();
+                let grid = page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+                assert_eq!(grid, expected.iter().copied().skip(offset as usize).take(limit as usize).collect::<Vec<_>>(), "{} {:?}", filter.kind, filter.value);
+                assert_eq!(asset_ids_page(&db, &filter, &formats, offset, limit).unwrap(), grid, "{}", filter.kind);
+            }
+        }
+        db.lock().unwrap().execute_batch("DETACH DATABASE ai;").unwrap();
+        let filter = test_filter("color", "modrá");
+        assert_eq!(asset_ids_page(&db, &filter, &formats, 0, 10).unwrap(), vec![1,3]);
+        assert_eq!(assets_page(&db, &filter, &formats).unwrap().items.iter().map(|item| item.id).collect::<Vec<_>>(), vec![1,3]);
+    }
+
+    #[test]
+    fn folder_pages_slice_after_merging_equal_names() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch(
+            "CREATE TABLE folders(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT,path TEXT);
+             INSERT INTO folders VALUES (1,50,1,'A',NULL),(2,51,2,'a',NULL),(3,50,1,'B',NULL),
+                                       (4,51,2,'C',NULL),(5,50,1,'D',NULL);
+             INSERT INTO assets(id,folder_id,is_listed) VALUES(1,1,1),(2,2,1),(3,3,1),(4,4,1),(5,5,1);"
+        ).unwrap();
+        let page = |offset| folders_page(&db, Some(50), Some(vec![50,51]), offset, 2).unwrap();
+        let first = page(0);
+        assert_eq!((first[0].name.as_str(), first[0].count, first[0].folder_ids.as_slice()), ("A", 2, &[1,2][..]));
+        assert_eq!(first[1].name, "B");
+        assert_eq!(page(2).iter().map(|folder| folder.name.as_str()).collect::<Vec<_>>(), ["C", "D"]);
+        assert!(page(4).is_empty());
+    }
+
     #[test]
     fn cached_catalog_pages_keep_order_totals_and_invalidate_on_write() {
         let db = test_db();

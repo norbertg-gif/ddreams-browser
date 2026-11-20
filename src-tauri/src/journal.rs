@@ -1,23 +1,11 @@
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, types::Value as SqlValue};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 use std::{collections::HashMap, path::PathBuf, sync::{Arc,Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
-#[derive(Clone, Debug)]
-pub struct PendingItem { table_name: String, row_key: String, column_name: String, old_value: Value, new_value: Value }
-
-#[derive(Clone, Debug)]
-pub struct ChangeBuilder { action: String, summary: String, items: Vec<PendingItem> }
-
-impl ChangeBuilder {
-    pub fn record(&mut self, table_name: &str, row_key: &str, column_name: &str, old_value: Value, new_value: Value) {
-        self.items.push(PendingItem { table_name: table_name.into(), row_key: row_key.into(), column_name: column_name.into(), old_value, new_value });
-    }
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct ChangeSummary { pub id: i64, pub ts: String, pub action: String, pub summary: String, pub undone: bool }
+pub struct ChangeSummary { pub id: i64, pub ts: String, pub summary: String }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -82,21 +70,24 @@ pub struct ExclusionImpact { pub files: usize, pub with_categories: usize, pub w
 #[serde(rename_all="camelCase")]
 pub struct RemoveCatalogResult { pub change_id:Option<i64>,pub summary:String,pub removed_assets:usize,pub removed_folders:usize,pub asset_ids:Vec<i64> }
 
-/// Removes catalogue rows of `ids` (category/keyword/colour links, then the asset row) as journal
-/// events, so undo restores them exactly. Used by folder exclusion and by deleting files.
-fn remove_asset_rows(tx:&Transaction<'_>,ids:&[i64],events:&mut Vec<StoredItem>)->Result<(),String>{
-    for &id in ids {
-        if read_asset_values(tx,id)?.is_none() { continue; }
-        for (table,column) in [("asset_categories","category_id"),("asset_keywords","keyword_id")] {
-            let targets=tx.prepare(&format!("SELECT {column} FROM {table} WHERE asset_id=?1")).and_then(|mut s|s.query_map([id],|r|r.get::<_,i64>(0))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
-            for target in targets { let key=format!("{id}:{target}");apply_item(tx,table,&key,"__exists__",&SqlValue::Integer(0))?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(1),new_value:SqlValue::Integer(0)}); }
+fn remove_asset_rows(tx: &Transaction<'_>, ids: &[i64], permanent: bool) -> Result<(), String> {
+    if let Some(&max_id) = ids.iter().max() {
+        remember_id(tx, "assets", max_id)?;
+    }
+    let tables = ["asset_categories", "asset_keywords", "asset_color_overrides", "ai_suggestion_rejections"];
+    for table in tables.into_iter().take(if permanent { tables.len() } else { tables.len() - 1 }) {
+        if table_exists(tx, table)? {
+            for chunk in ids.chunks(500) {
+                let marks = vec!["?"; chunk.len()].join(",");
+                tx.execute(&format!("DELETE FROM {table} WHERE asset_id IN ({marks})"), rusqlite::params_from_iter(chunk))
+                    .map_err(|e| e.to_string())?;
+            }
         }
-        let has_overrides:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='asset_color_overrides')",[],|r|r.get(0)).map_err(|e|e.to_string())?;
-        if has_overrides {
-            let colors=tx.prepare("SELECT color,state FROM asset_color_overrides WHERE asset_id=?1").and_then(|mut s|s.query_map([id],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e|e.to_string())?;
-            for (color,state) in colors { let key=format!("{id}:{color}");apply_item(tx,"asset_color_overrides",&key,"__exists__",&SqlValue::Null)?;events.push(StoredItem{table_name:"asset_color_overrides".into(),row_key:key,column_name:"__exists__".into(),old_value:SqlValue::Integer(state),new_value:SqlValue::Null}); }
-        }
-        delete_row_snapshot(tx,events,"assets",id)?;
+    }
+    for chunk in ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        tx.execute(&format!("DELETE FROM assets WHERE id IN ({marks})"), rusqlite::params_from_iter(chunk))
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -122,19 +113,21 @@ pub struct KeywordMutationResult { pub change_id: Option<i64>, pub summary: Stri
 #[serde(rename_all = "camelCase")]
 pub struct KeywordDeleteInfo { pub id: i64, pub name: String, pub assigned_files: usize, pub subkeywords: usize }
 
-#[derive(Clone, Debug)]
-struct StoredItem { table_name: String, row_key: String, column_name: String, old_value: SqlValue, new_value: SqlValue }
+type ChangeHook = Arc<dyn Fn(&[&str]) + Send + Sync>;
 
-pub type ChangeHook = Arc<dyn Fn(&[String]) + Send + Sync>;
-static JOURNAL_CHANGE_HOOK: std::sync::OnceLock<Mutex<Option<ChangeHook>>> = std::sync::OnceLock::new();
 pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>>, rules: crate::folder_rules::FolderRules }
 
 impl CatalogWriter {
     pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None), rules: crate::folder_rules::FolderRules::default() } }
-    pub fn set_change_hook(&self, hook: ChangeHook) { *self.change_hook.lock().unwrap() = Some(hook.clone()); *JOURNAL_CHANGE_HOOK.get_or_init(||Mutex::new(None)).lock().unwrap()=Some(hook); }
-    fn notify_change(&self, kinds:&[String]) { if !kinds.is_empty() { if let Some(hook)=self.change_hook.lock().unwrap().as_ref() { hook(kinds); } } }
-    pub fn begin_change(&self, action: impl Into<String>, summary: impl Into<String>) -> ChangeBuilder {
-        ChangeBuilder { action: action.into(), summary: summary.into(), items: Vec::new() }
+    pub fn set_change_hook(&self, hook: ChangeHook) {
+        *self.change_hook.lock().unwrap() = Some(hook);
+    }
+
+    fn notify_labels_changed(&self, kinds: &[&str]) {
+        let hook = self.change_hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(kinds);
+        }
     }
 
     pub fn folder_rules(&self) -> Result<Vec<crate::folder_rules::FolderRule>, String> { let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?; self.rules.list(&conn) }
@@ -142,7 +135,7 @@ impl CatalogWriter {
     /// Effective rule for a folder path: Some("include") / Some("exclude") / None (legacy, no rule).
     pub fn effective_folder_mode(&self, path:&str) -> Option<String> { self.folder_rule_state(path).ok().and_then(|s|s.effective) }
 
-    /// Adds files found in an included folder to the catalogue as ONE journaled change (undoable).
+    /// Adds files found in an included folder in a single catalogue transaction.
     /// Files already catalogued (by path) are skipped. Returns listing id → new catalogue id.
     pub fn catalog_listed_assets(&self, listed:&[ListedAsset]) -> Result<Vec<AssetIdRemap>, String> {
         self.require_write()?;
@@ -150,18 +143,18 @@ impl CatalogWriter {
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;
-        let mut events=Vec::new();let mut remaps=Vec::new();
+        let mut remaps=Vec::new();
         for candidate in listed {
             if candidate.ext.trim().is_empty() || find_asset_by_path(&tx,&candidate.path)?.is_some() { continue; }
-            let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;
+            let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots)?;
             let id=next_id(&tx,"assets")?;
             insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false})?;
-            push_insert_snapshot(&tx,&mut events,"assets",id)?;
+
             remaps.push(AssetIdRemap{old_id:candidate.temporary_id,new_id:id});
         }
         if remaps.is_empty() { return Ok(remaps); }
         let summary=format!("Pridané do katalógu: {} {}",remaps.len(),slovak_count(remaps.len(),"súbor","súbory","súborov"));
-        record_stored_change(&tx,events,"auto_catalog",&summary)?;
+        record_change(&tx, "auto_catalog", &summary)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(remaps)
     }
@@ -187,15 +180,13 @@ impl CatalogWriter {
         let normal=normalize_fs_path(&path);let prefix=format!("{normal}\\");let ids={let mut stmt=tx.prepare("SELECT id,path FROM assets WHERE path IS NOT NULL ORDER BY id").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?.into_iter().filter(|(_,p)|{let p=normalize_fs_path(p);p==normal||p.starts_with(&prefix)}).map(|(id,_)|id).collect::<Vec<_>>()};
         let folder_rows={let mut stmt=tx.prepare("SELECT id,path,root_id FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};
         let folders=folder_rows.into_iter().filter(|(_,p,_)|normalize_fs_path(p)==normalize_fs_path(&path)||normalize_fs_path(p).starts_with(&prefix)).collect::<Vec<_>>();
-        for chunk in ids.chunks(500){if chunk.is_empty(){continue}let marks=vec!["?";chunk.len()].join(",");for table in ["asset_categories","asset_keywords","asset_color_overrides"]{let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0)).unwrap_or(false);if exists{tx.execute(&format!("DELETE FROM {table} WHERE asset_id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}}tx.execute(&format!("DELETE FROM assets WHERE id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}
-        for chunk in folders.iter().map(|f|f.0).collect::<Vec<_>>().chunks(500){if !chunk.is_empty(){let marks=vec!["?";chunk.len()].join(",");tx.execute(&format!("DELETE FROM folders WHERE id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}}
-        let roots=folders.iter().filter_map(|f|f.2).collect::<std::collections::HashSet<_>>();for root in roots{tx.execute("DELETE FROM folder_roots WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM folders WHERE root_id=?1)",[root]).map_err(|e|e.to_string())?;}
-        tx.commit().map_err(|e|e.to_string())?;Ok(RemoveCatalogResult{change_id:None,summary:format!("Odstránené z katalógu: {} súborov a {} priečinkov",ids.len(),folders.len()),removed_assets:ids.len(),removed_folders:folders.len(),asset_ids:ids})
+        remove_asset_rows(&tx, &ids, false)?;
+        remove_folder_rows(&tx, &folders)?;
+        tx.commit().map_err(|e|e.to_string())?;if !ids.is_empty() { self.notify_labels_changed(&["category", "keyword"]); } Ok(RemoveCatalogResult{change_id:None,summary:format!("Odstránené z katalógu: {} súborov a {} priečinkov",ids.len(),folders.len()),removed_assets:ids.len(),removed_folders:folders.len(),asset_ids:ids})
     }
 
     /// Saves (or clears, `mode=None`) the rule for `path`. Excluding removes every catalogue row under the
-    /// folder (assets + category/keyword/colour links) as ONE journaled change, so Ctrl+Z restores it all;
-    /// the rule itself is configuration and stays. Returns the removed asset ids (for the AI index).
+    /// folder, including category, keyword and colour links. Returns the removed ids for the AI index.
     pub fn set_folder_rule(&self, path:&str, mode:Option<&str>) -> Result<Vec<i64>, String> {
         self.require_write()?;
         let path=path.trim().trim_end_matches(['\\','/']).replace('/',"\\");
@@ -207,10 +198,9 @@ impl CatalogWriter {
         let mut removed=Vec::new();
         if mode==Some("exclude") {
             removed=assets_under(&tx,&path)?;
-            let mut events=Vec::new();
-            remove_asset_rows(&tx,&removed,&mut events)?;
+            remove_asset_rows(&tx, &removed, false)?;
             let summary=format!("Vylúčené z katalógu: {path} ({} {})",removed.len(),slovak_count(removed.len(),"súbor","súbory","súborov"));
-            record_stored_change(&tx,events,"exclude_folder",&summary)?;
+            if !removed.is_empty() { record_change(&tx, "exclude_folder", &summary)?; }
         }
         match mode {
             Some(mode)=>{tx.execute("INSERT INTO ddreams_folder_rules(path,mode,created) VALUES(?1,?2,?3) ON CONFLICT(path) DO UPDATE SET mode=excluded.mode",(&path,mode,iso_now())).map_err(|e|e.to_string())?;}
@@ -218,6 +208,7 @@ impl CatalogWriter {
         }
         tx.commit().map_err(|e|e.to_string())?;
         self.rules.invalidate();
+        if !removed.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
         Ok(removed)
     }
 
@@ -225,55 +216,29 @@ impl CatalogWriter {
         const PALETTE: [&str;13] = ["červená","oranžová","hnedá","žltá","zelená","tyrkysová","modrá","fialová","ružová","biela","sivá","čierna","čiernobiela"];
         self.require_write()?;
         if !PALETTE.contains(&color) { return Err("Neznáma farba".into()); }
-        let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
-        self.rules.guard(&conn,asset_ids,&[])?;
-        let mut change=ChangeBuilder{action:"set_asset_colors".into(),summary:summary.into(),items:Vec::new()};
-        let new_value=state.map(|value|Value::from(if value {1} else {0})).unwrap_or(Value::Null);
-        let mut seen=std::collections::HashSet::new();
-        for id in asset_ids.iter().copied().filter(|id|*id>0).filter(|id|seen.insert(*id)) {
-            let listed:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        self.rules.guard(&tx, asset_ids, &[])?;
+        let state = state.map(i64::from);
+        let mut count = 0;
+        let mut seen = std::collections::HashSet::new();
+        for id in asset_ids.iter().copied().filter(|id| *id > 0 && seen.insert(*id)) {
+            let listed: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)", [id], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
             if !listed { continue; }
-            let old:Option<i64>=conn.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;
-            let old_value=old.map(Value::from).unwrap_or(Value::Null);
-            if old_value!=new_value { change.record("asset_color_overrides",&format!("{id}:{color}"),"__exists__",old_value,new_value.clone()); }
+            let old: Option<i64> = tx.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2", (id, color), |r| r.get(0))
+                .optional().map_err(|e| e.to_string())?;
+            if old == state { continue; }
+            if let Some(state) = state {
+                tx.execute("INSERT OR REPLACE INTO asset_color_overrides(asset_id,color,state) VALUES(?1,?2,?3)", (id, color, state))
+            } else {
+                tx.execute("DELETE FROM asset_color_overrides WHERE asset_id=?1 AND color=?2", (id, color))
+            }.map_err(|e| e.to_string())?;
+            count += 1;
         }
-        drop(conn);
-        let count=change.items.len();
-        if count>0 { self.commit_change(change)?; }
+        if count > 0 { record_change(&tx, "set_asset_colors", summary)?; }
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(count)
-    }
-
-    pub fn commit_change(&self, change: ChangeBuilder) -> Result<i64, String> {
-        self.require_write()?;
-        if change.items.is_empty() { return Err("A change must contain at least one item".into()); }
-        let kinds=resync_kinds_for_tables(change.items.iter().map(|item|item.table_name.as_str()));
-        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let guarded_ids=change.items.iter().filter_map(|item| match item.table_name.as_str() { "assets"|"asset_categories"|"asset_keywords"|"asset_color_overrides"=>item.row_key.split(':').next().and_then(|id|id.parse::<i64>().ok()), _=>None }).collect::<Vec<_>>();
-        self.rules.guard(&transaction,&guarded_ids,&[])?;
-        let mut stored = Vec::with_capacity(change.items.len());
-        for item in change.items {
-            validate_item(&item.table_name, &item.column_name)?;
-            let old_value = json_to_sql(&item.old_value)?;
-            let new_value = json_to_sql(&item.new_value)?;
-            let current = read_item(&transaction, &item.table_name, &item.row_key, &item.column_name)?;
-            if current != old_value { return Err(format!("Catalog row changed before commit: {} {}", item.table_name, item.row_key)); }
-            apply_item(&transaction, &item.table_name, &item.row_key, &item.column_name, &new_value)?;
-            stored.push(StoredItem { table_name: item.table_name, row_key: item.row_key, column_name: item.column_name, old_value: current, new_value });
-        }
-        let ts = iso_now();
-        transaction.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)", (&ts, &change.action, &change.summary)).map_err(|e| e.to_string())?;
-        let change_id = transaction.last_insert_rowid();
-        for item in stored {
-            transaction.execute(
-                "INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",
-                (change_id, item.table_name, item.row_key, item.column_name, encode_sql(&item.old_value)?, encode_sql(&item.new_value)?),
-            ).map_err(|e| e.to_string())?;
-        }
-        mark_catalog_modified(&transaction)?;
-        transaction.commit().map_err(|e| e.to_string())?;
-        self.notify_change(&kinds);
-        Ok(change_id)
     }
 
     pub fn set_asset_values(
@@ -285,159 +250,56 @@ impl CatalogWriter {
         self.require_write()?;
         let updates = parse_asset_updates(changes)?;
         if updates.is_empty() { return Err("No asset values were supplied".into()); }
-        let candidates = listed_assets.iter().map(|asset| (asset.temporary_id, asset)).collect::<HashMap<_, _>>();
-        let mut ids = asset_ids.iter().copied().collect::<Vec<_>>();
-        ids.sort_unstable(); ids.dedup();
-        if ids.is_empty() { return Err("No files were selected".into()); }
-
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        self.rules.guard(&transaction,asset_ids,listed_assets)?;
-        let mut folder_paths = load_folder_paths(&transaction)?;
-        let mut folder_roots = load_folder_roots(&transaction)?;
-        let mut events = Vec::<StoredItem>::new();
-        let mut targets = Vec::<AssetValueState>::new();
-        let mut insertions = HashMap::<i64, (ListedAsset, i64)>::new();
-        let mut remapped_ids = Vec::new();
-        let mut any_untagged = false;
-
-        for requested_id in ids {
-            let id = if requested_id < 0 {
-                let candidate = candidates.get(&requested_id).ok_or_else(|| format!("Listed file {requested_id} is no longer available"))?;
-                if candidate.ext.trim().is_empty() { continue; }
-                if let Some(existing) = find_asset_by_path(&transaction, &candidate.path)? {
-                    if existing != requested_id { remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id: existing }); }
-                    existing
-                } else {
-                    let folder_id = ensure_folder(&transaction, &candidate.folder_path, &mut folder_paths, &mut folder_roots, &mut events)?;
-                    let new_id = next_id(&transaction, "assets")?;
-                    insertions.insert(new_id, ((*candidate).clone(), folder_id));
-                    remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id });
-                    new_id
-                }
-            } else { requested_id };
-
-            if let Some((candidate, _)) = insertions.get(&id) {
-                targets.push(AssetValueState { id, rating: None, label: None, tagged: false });
-                let _ = candidate;
-            } else {
-                let Some(state) = read_asset_values(&transaction, id)? else { continue; };
-                if !state.tagged { any_untagged = true; }
-                targets.push(state);
-            }
-        }
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        self.rules.guard(&tx, asset_ids, listed_assets)?;
+        let (mut targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, true, true)?;
         if targets.is_empty() { return Err("No files were selected".into()); }
-        if targets.iter().any(|asset| !asset.tagged) { any_untagged = true; }
-        let toggle_tagged_to = if updates.tagged_toggle { Some(any_untagged) } else { updates.tagged };
-
+        let toggle_tagged_to = if updates.tagged_toggle { Some(targets.iter().any(|asset| !asset.tagged)) } else { updates.tagged };
+        let mut changed = inserted > 0;
         for target in &mut targets {
-            let rating = updates.rating.unwrap_or(target.rating);
-            let label = updates.label.as_ref().map(|value| value.clone()).unwrap_or_else(|| target.label.clone());
-            let tagged = toggle_tagged_to.unwrap_or(target.tagged);
-            if let Some((candidate, folder_id)) = insertions.get(&target.id) {
-                let row = NewCatalogAsset { id: target.id, folder_id: *folder_id, name: candidate.name.clone(), ext: candidate.ext.clone(), size: candidate.size, file_modified: candidate.file_modified.clone(), path: candidate.path.clone(), rating, label: label.clone(), tagged };
-                insert_asset(&transaction, &row)?;
-                push_insert_snapshot(&transaction, &mut events, "assets", target.id)?;
-            } else {
-                if updates.rating.is_some() { record_asset_update(&transaction, &mut events, target.id, "rating", rating.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?; }
-                if updates.label.is_some() { record_asset_update(&transaction, &mut events, target.id, "label", label.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null))?; }
-                if updates.tagged.is_some() || updates.tagged_toggle { record_asset_update(&transaction, &mut events, target.id, "tagged", SqlValue::Integer(i64::from(tagged)))?; }
+            if let Some(rating) = updates.rating {
+                changed |= update_column(&tx, "assets", target.id, "rating", rating)?;
+                target.rating = rating;
             }
-            target.rating = rating; target.label = label; target.tagged = tagged;
+            if let Some(label) = &updates.label {
+                changed |= update_column(&tx, "assets", target.id, "label", label.as_deref())?;
+                target.label = label.clone();
+            }
+            if let Some(tagged) = toggle_tagged_to {
+                changed |= update_column(&tx, "assets", target.id, "tagged", i64::from(tagged))?;
+                target.tagged = tagged;
+            }
         }
 
         let action_parts = update_summary_parts(&updates, toggle_tagged_to);
         let file_word = slovak_count(targets.len(), "súbor", "súbory", "súborov");
         let summary = format!("{} · {} {}", action_parts.join(" · "), targets.len(), file_word);
-        let change_id = if events.is_empty() {
-            None
-        } else {
-            let ts = iso_now();
-            transaction.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,'set_asset_values',?2,0)", (&ts, &summary)).map_err(|e| e.to_string())?;
-            let change_id = transaction.last_insert_rowid();
-            for item in events {
-                transaction.execute(
-                    "INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",
-                    (change_id, item.table_name, item.row_key, item.column_name, encode_sql(&item.old_value)?, encode_sql(&item.new_value)?),
-                ).map_err(|e| e.to_string())?;
-            }
-            mark_catalog_modified(&transaction)?;
-            Some(change_id)
-        };
-        transaction.commit().map_err(|e| e.to_string())?;
+        let change_id = if changed { record_change(&tx, "set_asset_values", &summary)? } else { None };
+        tx.commit().map_err(|e| e.to_string())?;
         Ok(SetAssetValuesResult { change_id, summary, remapped_ids, assets: targets })
     }
 
     pub fn set_asset_categories(&self, asset_ids: &[i64], listed_assets: &[ListedAsset], category_id: i64, assign: bool) -> Result<SetAssetCategoriesResult, String> {
         self.require_write()?;
-        let candidates = listed_assets.iter().map(|asset| (asset.temporary_id, asset)).collect::<HashMap<_, _>>();
-        let mut ids = asset_ids.iter().copied().collect::<Vec<_>>();
-        ids.sort_unstable(); ids.dedup();
-        if ids.is_empty() { return Err("No files were selected".into()); }
+        if asset_ids.is_empty() { return Err("No files were selected".into()); }
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let category_path = category_path(&transaction, category_id)?;
-        self.rules.guard(&transaction,asset_ids,listed_assets)?;
-        let mut folder_paths = load_folder_paths(&transaction)?;
-        let mut folder_roots = load_folder_roots(&transaction)?;
-        let mut events = Vec::<StoredItem>::new();
-        let mut remapped_ids = Vec::new();
-        let mut targets = Vec::new();
-        let mut insertions = HashMap::<i64, (ListedAsset, i64)>::new();
-        for requested_id in ids {
-            let id = if requested_id < 0 {
-                let Some(candidate) = candidates.get(&requested_id) else { continue; };
-                if candidate.ext.trim().is_empty() { continue; }
-                if let Some(existing) = find_asset_by_path(&transaction, &candidate.path)? {
-                    if existing != requested_id { remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id: existing }); }
-                    existing
-                } else if assign {
-                    let folder_id = ensure_folder(&transaction, &candidate.folder_path, &mut folder_paths, &mut folder_roots, &mut events)?;
-                    let new_id = next_id(&transaction, "assets")?;
-                    insertions.insert(new_id, ((*candidate).clone(), folder_id));
-                    remapped_ids.push(AssetIdRemap { old_id: requested_id, new_id });
-                    new_id
-                } else { continue; }
-            } else { requested_id };
-            if insertions.contains_key(&id) || read_asset_values(&transaction, id)?.is_some() { targets.push(id); }
-        }
-        let mut changed = Vec::new();
-        for id in targets {
-            if let Some((candidate, folder_id)) = insertions.get(&id) {
-                let row = NewCatalogAsset { id, folder_id: *folder_id, name: candidate.name.clone(), ext: candidate.ext.clone(), size: candidate.size, file_modified: candidate.file_modified.clone(), path: candidate.path.clone(), rating: None, label: None, tagged: false };
-                insert_asset(&transaction, &row)?;
-                push_insert_snapshot(&transaction, &mut events, "assets", id)?;
-            }
-            let key = format!("{id}:{category_id}");
-            let old_value = read_item(&transaction, "asset_categories", &key, "__exists__")?;
-            let old = value_truth(&old_value)?;
-            if old == assign { continue; }
-            let new_value = SqlValue::Integer(i64::from(assign));
-            apply_item(&transaction, "asset_categories", &key, "__exists__", &new_value)?;
-            events.push(StoredItem { table_name: "asset_categories".into(), row_key: key, column_name: "__exists__".into(), old_value, new_value });
-            changed.push(id);
-        }
-        // If an asset was newly inserted, it necessarily changes on assign; for an unusual
-        // duplicate relation, avoid leaving an unjournaled inserted asset behind.
-        let changed_set = changed.iter().copied().collect::<std::collections::HashSet<_>>();
-        for id in insertions.keys().copied().collect::<Vec<_>>() {
-            if !changed_set.contains(&id) { return Err("New catalog asset did not receive its category".into()); }
-        }
-        let file_word = slovak_count(changed.len(), "súbor", "súbory", "súborov");
-        let summary = format!("{} {} · {} {}", if assign { "Zaradené do" } else { "Vyradené z" }, category_path, changed.len(), file_word);
-        let change_id = if events.is_empty() { None } else {
-            let ts = iso_now();
-            transaction.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,'set_asset_categories',?2,0)", (&ts, &summary)).map_err(|e| e.to_string())?;
-            let change_id = transaction.last_insert_rowid();
-            for item in events {
-                transaction.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)", (change_id, item.table_name, item.row_key, item.column_name, encode_sql(&item.old_value)?, encode_sql(&item.new_value)?)).map_err(|e| e.to_string())?;
-            }
-            mark_catalog_modified(&transaction)?;
-            Some(change_id)
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let category_path = category_path(&tx, category_id)?;
+        self.rules.guard(&tx, asset_ids, listed_assets)?;
+        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false)?;
+        let changed = set_asset_links(&tx, "asset_categories", "category_id", &targets, category_id, assign)?;
+        if changed < inserted { return Err("New catalog asset did not receive its category".into()); }
+        let summary = if changed == 0 {
+            format!("Žiadne zmeny v kategórii {category_path}")
+        } else {
+            let file_word = slovak_count(changed, "súbor", "súbory", "súborov");
+            format!("{} {category_path} · {changed} {file_word}", if assign { "Zaradené do" } else { "Vyradené z" })
         };
-        transaction.commit().map_err(|e| e.to_string())?;
-        let summary = if changed.is_empty() { format!("Žiadne zmeny v kategórii {category_path}") } else { summary };
-        Ok(SetAssetCategoriesResult { change_id, summary, changed_count: changed.len(), remapped_ids })
+        let change_id = if changed > 0 { record_change(&tx, "set_asset_categories", &summary)? } else { None };
+        tx.commit().map_err(|e| e.to_string())?;
+        if changed > 0 { self.notify_labels_changed(&["category"]); }
+        Ok(SetAssetCategoriesResult { change_id, summary, changed_count: changed, remapped_ids })
     }
 
     pub fn create_category(&self, parent_id: Option<i64>, name: &str, icon_key: Option<&str>) -> Result<CategoryMutationResult, String> {
@@ -446,25 +308,25 @@ impl CatalogWriter {
         validate_category_icon(icon_key)?;
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        let (category_id,summary,events,root_id)=if let Some(parent)=parent_id {
+        let (category_id,summary,root_id)=if let Some(parent)=parent_id {
             let root_id:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Nadradená kategória neexistuje".to_string())?;
             ensure_unique_category_name(&tx,Some(parent),root_id,&name,None,None)?;
             let id=next_id(&tx,"categories")?;
             tx.execute("INSERT INTO categories(id,parent_id,root_id,name,icon_key) VALUES(?1,?2,?3,?4,?5)",(id,parent,root_id,&name,icon_key)).map_err(|e|e.to_string())?;
-            let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"categories",id)?;
+
             let parent_path=category_path(&tx,parent)?;
-            (id,format!("Nová kategória {parent_path} › {name}"),events,root_id)
+            (id,format!("Nová kategória {parent_path} › {name}"),root_id)
         } else {
             ensure_unique_category_name(&tx,None,None,&name,None,None)?;
             let root_id=next_id(&tx,"category_roots")?;let id=next_id(&tx,"categories")?;
             tx.execute("INSERT INTO category_roots(id,name,icon_key) VALUES(?1,?2,?3)",(root_id,&name,icon_key)).map_err(|e|e.to_string())?;
             tx.execute("INSERT INTO categories(id,parent_id,root_id,name,icon_key) VALUES(?1,NULL,?2,?3,?4)",(id,root_id,&name,icon_key)).map_err(|e|e.to_string())?;
-            let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"category_roots",root_id)?;push_insert_snapshot(&tx,&mut events,"categories",id)?;
-            (id,format!("Nová kategória {name}"),events,Some(root_id))
+
+            (id,format!("Nová kategória {name}"),Some(root_id))
         };
         let ancestor_ids=category_ancestor_ids(&tx,category_id)?;
-        let change_id=record_stored_change(&tx,events,"create_category",&summary)?;
-        tx.commit().map_err(|e|e.to_string())?;
+        let change_id=record_change(&tx, "create_category", &summary)?;
+        tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["category"]);
         Ok(CategoryMutationResult{change_id,summary,category_id:Some(category_id),parent_id,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
     }
 
@@ -476,18 +338,16 @@ impl CatalogWriter {
         let table = if is_root { "category_roots" } else { "categories" };
         let name: String = tx.query_row(&format!("SELECT name FROM {table} WHERE id=?1"), [id], |row| row.get(0))
             .optional().map_err(|e| e.to_string())?.ok_or("Kategória neexistuje")?;
-        let value = icon_key.map(|key| SqlValue::Text(key.into())).unwrap_or(SqlValue::Null);
-        let mut events = Vec::new();
-        record_column_update(&tx, &mut events, table, id, "icon_key", value.clone())?;
-        // A merged root is edited as one row. Keep its category icon when that category moves.
+        let mut changed = update_column(&tx, table, id, "icon_key", icon_key)?;
+        // Keep the merged category's icon when the category moves.
         if is_root {
             if let Some(paired) = crate::db::category_root_matches(&tx, id).map_err(|e| e.to_string())? {
-                record_column_update(&tx, &mut events, "categories", paired, "icon_key", value)?;
+                changed |= update_column(&tx, "categories", paired, "icon_key", icon_key)?;
             }
         }
-        let summary = if events.is_empty() { format!("Ikona kategórie {name} je bez zmeny") }
+        let summary = if !changed { format!("Ikona kategórie {name} je bez zmeny") }
             else { format!("Zmenená ikona kategórie {name}") };
-        let change_id = record_stored_change(&tx, events, "set_category_icon", &summary)?;
+        let change_id = if changed { record_change(&tx, "set_category_icon", &summary)? } else { None };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(CategoryMutationResult {
             change_id, summary, category_id: None, parent_id: None, root_id: None, ancestor_ids: Vec::new(),
@@ -502,10 +362,10 @@ impl CatalogWriter {
         let paired_root=if parent.is_none(){if let Some(root)=root_id{let root_name:Option<String>=tx.query_row("SELECT name FROM category_roots WHERE id=?1",[root],|r|r.get(0)).optional().map_err(|e|e.to_string())?;if root_name.is_some_and(|value|value.trim().to_lowercase()==old.trim().to_lowercase()){Some(root)}else{None}}else{None}}else{None};
         ensure_unique_category_name(&tx,parent,root_id,&name,Some(id),paired_root)?;
         if old==name {let path=category_path(&tx,id)?;let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;let summary=format!("Kategória už má názov {path}");return Ok(CategoryMutationResult{change_id:None,summary,category_id:Some(id),parent_id:parent,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
-        let mut events=Vec::new();record_column_update(&tx,&mut events,"categories",id,"name",SqlValue::Text(name.clone()))?;
-        if let Some(root)=paired_root{record_column_update(&tx,&mut events,"category_roots",root,"name",SqlValue::Text(name.clone()))?;}
-        let summary=format!("Premenované {old} → {name}");let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"rename_category",&summary)?;
-        tx.commit().map_err(|e|e.to_string())?;
+        update_column(&tx,"categories",id,"name",SqlValue::Text(name.clone()))?;
+        if let Some(root)=paired_root{update_column(&tx,"category_roots",root,"name",SqlValue::Text(name.clone()))?;}
+        let summary=format!("Premenované {old} → {name}");let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_change(&tx, "rename_category", &summary)?;
+        tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["category"]);
         Ok(CategoryMutationResult{change_id,summary,category_id:Some(id),parent_id:parent,root_id,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
     }
 
@@ -513,23 +373,23 @@ impl CatalogWriter {
         self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let (name,old_parent,old_root):(String,Option<i64>,Option<i64>)=tx.query_row("SELECT name,parent_id,root_id FROM categories WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kategória neexistuje".to_string())?;
         let subtree=category_subtree(&tx,id)?;
-        let mut events=Vec::new();let new_root;
+        let new_root;
         if let Some(parent)=new_parent_id {
             if subtree.contains(&parent){return Err("Kategóriu nemožno presunúť do seba ani do jej podkategórie".into());}
             let target_root:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[parent],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Cieľová kategória neexistuje".to_string())?;
             ensure_unique_category_name(&tx,Some(parent),target_root,&name,Some(id),None)?;
             if old_parent==Some(parent){let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(CategoryMutationResult{change_id:None,summary:format!("Kategória {name} je už na tomto mieste"),category_id:Some(id),parent_id:old_parent,root_id:old_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
             new_root=target_root;
-            record_column_update(&tx,&mut events,"categories",id,"parent_id",SqlValue::Integer(parent))?;
+            update_column(&tx,"categories",id,"parent_id",SqlValue::Integer(parent))?;
         }else{
             if old_parent.is_none(){let ancestor_ids=category_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(CategoryMutationResult{change_id:None,summary:format!("Kategória {name} je už na najvyššej úrovni"),category_id:Some(id),parent_id:None,root_id:old_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()});}
             ensure_unique_category_name(&tx,None,None,&name,Some(id),None)?;
-            let root=next_id(&tx,"category_roots")?;tx.execute("INSERT INTO category_roots(id,name) VALUES(?1,?2)",(root,&name)).map_err(|e|e.to_string())?;push_insert_snapshot(&tx,&mut events,"category_roots",root)?;new_root=Some(root);
-            record_column_update(&tx,&mut events,"categories",id,"parent_id",SqlValue::Null)?;
+            let root=next_id(&tx,"category_roots")?;tx.execute("INSERT INTO category_roots(id,name) VALUES(?1,?2)",(root,&name)).map_err(|e|e.to_string())?;new_root=Some(root);
+            update_column(&tx,"categories",id,"parent_id",SqlValue::Null)?;
         }
-        if old_root!=new_root{for descendant in subtree.iter().copied(){if descendant!=id{record_column_update(&tx,&mut events,"categories",descendant,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}}record_column_update(&tx,&mut events,"categories",id,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}
-        if let Some(old_root)=old_root.filter(|root|Some(*root)!=new_root){let remaining:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM categories WHERE root_id=?1)",[old_root],|r|r.get(0)).map_err(|e|e.to_string())?;if !remaining{delete_row_snapshot(&tx,&mut events,"category_roots",old_root)?;}}
-        let summary=if let Some(parent)=new_parent_id{format!("Presunuté {name} do {}",category_path(&tx,parent)?)}else{format!("Presunuté {name} na najvyššiu úroveň")};let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"move_category",&summary)?;tx.commit().map_err(|e|e.to_string())?;
+        if old_root!=new_root{for descendant in subtree.iter().copied(){if descendant!=id{update_column(&tx,"categories",descendant,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}}update_column(&tx,"categories",id,"root_id",new_root.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;}
+        if let Some(old_root)=old_root.filter(|root|Some(*root)!=new_root){let remaining:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM categories WHERE root_id=?1)",[old_root],|r|r.get(0)).map_err(|e|e.to_string())?;if !remaining{delete_row(&tx,"category_roots",old_root)?;}}
+        let summary=if let Some(parent)=new_parent_id{format!("Presunuté {name} do {}",category_path(&tx,parent)?)}else{format!("Presunuté {name} na najvyššiu úroveň")};let ancestor_ids=category_ancestor_ids(&tx,id)?;let change_id=record_change(&tx, "move_category", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["category"]);
         Ok(CategoryMutationResult{change_id,summary,category_id:Some(id),parent_id:new_parent_id,root_id:new_root,ancestor_ids,deleted_category_ids:Vec::new(),deleted_root_ids:Vec::new()})
     }
 
@@ -539,125 +399,200 @@ impl CatalogWriter {
         self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let info=category_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kategóriu {} nie je možné zmazať, obsahuje {} {} (vrátane podkategórií). Najprv z nej súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files as usize,"súbor","súbory","súborov")));}
         let root_id:Option<i64>=tx.query_row("SELECT root_id FROM categories WHERE id=?1",[id],|r|r.get(0)).map_err(|e|e.to_string())?;
-        let ids=category_subtree(&tx,id)?;let mut events=Vec::new();
-        for category_id in ids.iter().rev().copied(){delete_row_snapshot(&tx,&mut events,"categories",category_id)?;}
+        let ids=category_subtree(&tx,id)?;
+        for category_id in ids.iter().rev().copied(){delete_row(&tx,"categories",category_id)?;}
         let mut deleted_root_ids=Vec::new();
         if let Some(root_id)=root_id{
             let any_left:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM categories WHERE root_id=?1)",[root_id],|r|r.get(0)).map_err(|e|e.to_string())?;
-            if !any_left{delete_row_snapshot(&tx,&mut events,"category_roots",root_id)?;deleted_root_ids.push(root_id);}
+            if !any_left{delete_row(&tx,"category_roots",root_id)?;deleted_root_ids.push(root_id);}
         }
-        let summary=format!("Zmazaná kategória {}",info.name);let change_id=record_stored_change(&tx,events,"delete_category",&summary)?;tx.commit().map_err(|e|e.to_string())?;
+        let summary=format!("Zmazaná kategória {}",info.name);let change_id=record_change(&tx, "delete_category", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["category"]);
         Ok(CategoryMutationResult{change_id,summary,category_id:None,parent_id:None,root_id,ancestor_ids:Vec::new(),deleted_category_ids:ids,deleted_root_ids})
     }
 
     pub fn set_asset_keywords(&self,asset_ids:&[i64],listed_assets:&[ListedAsset],keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
         self.require_write()?;
-        let candidates=listed_assets.iter().map(|asset|(asset.temporary_id,asset)).collect::<HashMap<_,_>>();
-        let mut ids=asset_ids.to_vec();ids.sort_unstable();ids.dedup();if ids.is_empty(){return Err("Nie sú vybrané žiadne súbory".into());}
-        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        self.rules.guard(&tx,asset_ids,listed_assets)?;
-        let name:String=tx.query_row("SELECT name FROM keywords WHERE id=?1",[keyword_id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;
-        let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;let mut events=Vec::new();let mut remapped_ids=Vec::new();let mut insertions=HashMap::<i64,(ListedAsset,i64)>::new();let mut targets=Vec::new();
-        for requested in ids{let id=if requested<0{let Some(candidate)=candidates.get(&requested)else{continue};if candidate.ext.trim().is_empty(){continue;}if let Some(existing)=find_asset_by_path(&tx,&candidate.path)?{if existing!=requested{remapped_ids.push(AssetIdRemap{old_id:requested,new_id:existing});}existing}else if assign{let folder=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;let new_id=next_id(&tx,"assets")?;insertions.insert(new_id,((*candidate).clone(),folder));remapped_ids.push(AssetIdRemap{old_id:requested,new_id});new_id}else{continue}}else{requested};if insertions.contains_key(&id)||read_asset_values(&tx,id)?.is_some(){targets.push(id);}}
-        let mut changed=0usize;
-        for id in targets{if let Some((candidate,folder_id))=insertions.get(&id){let row=NewCatalogAsset{id,folder_id:*folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false};insert_asset(&tx,&row)?;push_insert_snapshot(&tx,&mut events,"assets",id)?;}
-            let key=format!("{id}:{keyword_id}");let old=read_item(&tx,"asset_keywords",&key,"__exists__")?;if value_truth(&old)?==assign{continue;}let new=SqlValue::Integer(i64::from(assign));apply_item(&tx,"asset_keywords",&key,"__exists__",&new)?;events.push(StoredItem{table_name:"asset_keywords".into(),row_key:key,column_name:"__exists__".into(),old_value:old,new_value:new});changed+=1;}
-        if !insertions.is_empty()&&changed<insertions.len(){return Err("Nový súbor sa nepodarilo priradiť ku kľúčovému slovu".into());}
-        let summary=if changed==0{format!("Žiadne zmeny pri kľúčovom slove {name}")}else{format!("{} kľúčové slovo {name} · {} {}",if assign{"Pridané"}else{"Odobrané"},changed,slovak_count(changed,"súbor","súbory","súborov"))};
-        let parent_id:Option<i64>=tx.query_row("SELECT parent_id FROM keywords WHERE id=?1",[keyword_id],|r|r.get(0)).map_err(|e|e.to_string())?;let ancestor_ids=keyword_ancestor_ids(&tx,keyword_id)?;let change_id=record_stored_change(&tx,events,"set_asset_keywords",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(SetAssetKeywordsResult{change_id,summary,changed_count:changed,remapped_ids,keyword_id:Some(keyword_id),parent_id,ancestor_ids})
+        if asset_ids.is_empty() { return Err("Nie sú vybrané žiadne súbory".into()); }
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        self.rules.guard(&tx, asset_ids, listed_assets)?;
+        let (name, parent_id): (String, Option<i64>) = tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1", [keyword_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional().map_err(|e| e.to_string())?.ok_or("Kľúčové slovo neexistuje")?;
+        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false)?;
+        let changed = set_asset_links(&tx, "asset_keywords", "keyword_id", &targets, keyword_id, assign)?;
+        if changed < inserted { return Err("Nový súbor sa nepodarilo priradiť ku kľúčovému slovu".into()); }
+        let summary = if changed == 0 {
+            format!("Žiadne zmeny pri kľúčovom slove {name}")
+        } else {
+            let file_word = slovak_count(changed, "súbor", "súbory", "súborov");
+            format!("{} kľúčové slovo {name} · {changed} {file_word}", if assign { "Pridané" } else { "Odobrané" })
+        };
+        let ancestor_ids = keyword_ancestor_ids(&tx, keyword_id)?;
+        let change_id = if changed > 0 { record_change(&tx, "set_asset_keywords", &summary)? } else { None };
+        tx.commit().map_err(|e| e.to_string())?;
+        if changed > 0 { self.notify_labels_changed(&["keyword"]); }
+        Ok(SetAssetKeywordsResult { change_id, summary, changed_count: changed, remapped_ids, keyword_id: Some(keyword_id), parent_id, ancestor_ids })
     }
 
     pub fn create_keyword(&self,parent_id:Option<i64>,name:&str)->Result<KeywordMutationResult,String>{
         self.require_write()?;let name=validated_keyword_name(name)?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         if let Some(parent)=parent_id{if !keyword_exists(&tx,parent)?{return Err("Nadradené kľúčové slovo neexistuje".into());}}
-        ensure_unique_keyword_name(&tx,parent_id,&name,None)?;let id=next_id(&tx,"keywords")?;tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)",(id,parent_id,&name)).map_err(|e|e.to_string())?;let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"keywords",id)?;
-        let summary=if let Some(parent)=parent_id{format!("Nové kľúčové slovo {} › {name}",keyword_path(&tx,parent)?)}else{format!("Nové kľúčové slovo {name}")};let ancestors=keyword_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"create_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})
+        ensure_unique_keyword_name(&tx,parent_id,&name,None)?;let id=next_id(&tx,"keywords")?;tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)",(id,parent_id,&name)).map_err(|e|e.to_string())?;
+        let summary=if let Some(parent)=parent_id{format!("Nové kľúčové slovo {} › {name}",keyword_path(&tx,parent)?)}else{format!("Nové kľúčové slovo {name}")};let ancestors=keyword_ancestor_ids(&tx,id)?;let change_id=record_change(&tx, "create_keyword", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["keyword"]);Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})
     }
 
     pub fn create_and_assign_keyword(&self,asset_ids:&[i64],listed_assets:&[ListedAsset],parent_id:Option<i64>,name:&str)->Result<SetAssetKeywordsResult,String>{
-        self.require_write()?;let name=validated_keyword_name(name)?;let candidates=listed_assets.iter().map(|asset|(asset.temporary_id,asset)).collect::<HashMap<_,_>>();let mut ids=asset_ids.to_vec();ids.sort_unstable();ids.dedup();if ids.is_empty(){return Err("Nie sú vybrané žiadne súbory".into());}
-        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;if let Some(parent)=parent_id{if !keyword_exists(&tx,parent)?{return Err("Nadradené kľúčové slovo neexistuje".into());}}ensure_unique_keyword_name(&tx,parent_id,&name,None)?;
-        self.rules.guard(&tx,asset_ids,listed_assets)?;
-        let keyword_id=next_id(&tx,"keywords")?;tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)",(keyword_id,parent_id,&name)).map_err(|e|e.to_string())?;let mut events=Vec::new();push_insert_snapshot(&tx,&mut events,"keywords",keyword_id)?;
-        let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;let mut remapped_ids=Vec::new();let mut insertions=HashMap::<i64,(ListedAsset,i64)>::new();let mut targets=Vec::new();
-        for requested in ids{let id=if requested<0{let Some(candidate)=candidates.get(&requested)else{continue};if candidate.ext.trim().is_empty(){continue;}if let Some(existing)=find_asset_by_path(&tx,&candidate.path)?{remapped_ids.push(AssetIdRemap{old_id:requested,new_id:existing});existing}else{let folder=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots,&mut events)?;let new_id=next_id(&tx,"assets")?;insertions.insert(new_id,((*candidate).clone(),folder));remapped_ids.push(AssetIdRemap{old_id:requested,new_id});new_id}}else{requested};if insertions.contains_key(&id)||read_asset_values(&tx,id)?.is_some(){targets.push(id);}}
-        let mut changed=0usize;for id in targets{if let Some((candidate,folder_id))=insertions.get(&id){let row=NewCatalogAsset{id,folder_id:*folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false};insert_asset(&tx,&row)?;push_insert_snapshot(&tx,&mut events,"assets",id)?;}let key=format!("{id}:{keyword_id}");let old=read_item(&tx,"asset_keywords",&key,"__exists__")?;let new=SqlValue::Integer(1);apply_item(&tx,"asset_keywords",&key,"__exists__",&new)?;events.push(StoredItem{table_name:"asset_keywords".into(),row_key:key,column_name:"__exists__".into(),old_value:old,new_value:new});changed+=1;}
-        if changed==0{return Err("Nie je možné vytvoriť kľúčové slovo bez platných súborov".into());}let ancestor_ids=keyword_ancestor_ids(&tx,keyword_id)?;let summary=format!("Nové kľúčové slovo {} a priradené · {} {}",if let Some(parent)=parent_id{format!("{} › {name}",keyword_path(&tx,parent)?)}else{name},changed,slovak_count(changed,"súbor","súbory","súborov"));let change_id=record_stored_change(&tx,events,"create_assign_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(SetAssetKeywordsResult{change_id,summary,changed_count:changed,remapped_ids,keyword_id:Some(keyword_id),parent_id,ancestor_ids})
+        self.require_write()?;
+        let name = validated_keyword_name(name)?;
+        if asset_ids.is_empty() { return Err("Nie sú vybrané žiadne súbory".into()); }
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        if let Some(parent) = parent_id {
+            if !keyword_exists(&tx, parent)? { return Err("Nadradené kľúčové slovo neexistuje".into()); }
+        }
+        ensure_unique_keyword_name(&tx, parent_id, &name, None)?;
+        self.rules.guard(&tx, asset_ids, listed_assets)?;
+        let keyword_id = next_id(&tx, "keywords")?;
+        tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)", (keyword_id, parent_id, &name)).map_err(|e| e.to_string())?;
+        let (targets, remapped_ids, _) = resolve_write_assets(&tx, asset_ids, listed_assets, true, false)?;
+        let changed = set_asset_links(&tx, "asset_keywords", "keyword_id", &targets, keyword_id, true)?;
+        if changed == 0 { return Err("Nie je možné vytvoriť kľúčové slovo bez platných súborov".into()); }
+        let ancestor_ids = keyword_ancestor_ids(&tx, keyword_id)?;
+        let path = keyword_path(&tx, keyword_id)?;
+        let file_word = slovak_count(changed, "súbor", "súbory", "súborov");
+        let summary = format!("Nové kľúčové slovo {path} a priradené · {changed} {file_word}");
+        let change_id = record_change(&tx, "create_assign_keyword", &summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.notify_labels_changed(&["keyword"]);
+        Ok(SetAssetKeywordsResult { change_id, summary, changed_count: changed, remapped_ids, keyword_id: Some(keyword_id), parent_id, ancestor_ids })
     }
 
-    pub fn rename_keyword(&self,id:i64,name:&str)->Result<KeywordMutationResult,String>{self.require_write()?;let name=validated_keyword_name(name)?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let(old,parent):(String,Option<i64>)=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;ensure_unique_keyword_name(&tx,parent,&name,Some(id))?;let ancestors=keyword_ancestor_ids(&tx,id)?;if old==name{tx.commit().map_err(|e|e.to_string())?;return Ok(KeywordMutationResult{change_id:None,summary:format!("Kľúčové slovo už má názov {old}"),keyword_id:Some(id),parent_id:parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()});}let mut events=Vec::new();record_column_update(&tx,&mut events,"keywords",id,"name",SqlValue::Text(name.clone()))?;let summary=format!("Premenované {old} → {name}");let change_id=record_stored_change(&tx,events,"rename_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id:parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})}
+    pub fn rename_keyword(&self,id:i64,name:&str)->Result<KeywordMutationResult,String>{self.require_write()?;let name=validated_keyword_name(name)?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let(old,parent):(String,Option<i64>)=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;ensure_unique_keyword_name(&tx,parent,&name,Some(id))?;let ancestors=keyword_ancestor_ids(&tx,id)?;if old==name{tx.commit().map_err(|e|e.to_string())?;return Ok(KeywordMutationResult{change_id:None,summary:format!("Kľúčové slovo už má názov {old}"),keyword_id:Some(id),parent_id:parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()});}update_column(&tx,"keywords",id,"name",SqlValue::Text(name.clone()))?;let summary=format!("Premenované {old} → {name}");let change_id=record_change(&tx, "rename_keyword", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["keyword"]);Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id:parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})}
 
-    pub fn move_keyword(&self,id:i64,new_parent_id:Option<i64>)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let(name,old_parent):(String,Option<i64>)=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;let subtree=keyword_subtree(&tx,id)?;if new_parent_id.is_some_and(|parent|subtree.contains(&parent)){return Err("Kľúčové slovo nemožno presunúť do seba ani do jeho podriadeného slova".into());}if let Some(parent)=new_parent_id{if !keyword_exists(&tx,parent)?{return Err("Cieľové kľúčové slovo neexistuje".into());}}ensure_unique_keyword_name(&tx,new_parent_id,&name,Some(id))?;if old_parent==new_parent_id{let ancestors=keyword_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(KeywordMutationResult{change_id:None,summary:format!("Kľúčové slovo {name} je už na tomto mieste"),keyword_id:Some(id),parent_id:old_parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()});}let mut events=Vec::new();record_column_update(&tx,&mut events,"keywords",id,"parent_id",new_parent_id.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;let summary=if let Some(parent)=new_parent_id{format!("Presunuté {name} do {}",keyword_path(&tx,parent)?)}else{format!("Presunuté {name} na najvyššiu úroveň")};let ancestors=keyword_ancestor_ids(&tx,id)?;let change_id=record_stored_change(&tx,events,"move_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id:new_parent_id,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})}
+    pub fn move_keyword(&self,id:i64,new_parent_id:Option<i64>)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let(name,old_parent):(String,Option<i64>)=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;let subtree=keyword_subtree(&tx,id)?;if new_parent_id.is_some_and(|parent|subtree.contains(&parent)){return Err("Kľúčové slovo nemožno presunúť do seba ani do jeho podriadeného slova".into());}if let Some(parent)=new_parent_id{if !keyword_exists(&tx,parent)?{return Err("Cieľové kľúčové slovo neexistuje".into());}}ensure_unique_keyword_name(&tx,new_parent_id,&name,Some(id))?;if old_parent==new_parent_id{let ancestors=keyword_ancestor_ids(&tx,id)?;tx.commit().map_err(|e|e.to_string())?;return Ok(KeywordMutationResult{change_id:None,summary:format!("Kľúčové slovo {name} je už na tomto mieste"),keyword_id:Some(id),parent_id:old_parent,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()});}update_column(&tx,"keywords",id,"parent_id",new_parent_id.map(SqlValue::Integer).unwrap_or(SqlValue::Null))?;let summary=if let Some(parent)=new_parent_id{format!("Presunuté {name} do {}",keyword_path(&tx,parent)?)}else{format!("Presunuté {name} na najvyššiu úroveň")};let ancestors=keyword_ancestor_ids(&tx,id)?;let change_id=record_change(&tx, "move_keyword", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["keyword"]);Ok(KeywordMutationResult{change_id,summary,keyword_id:Some(id),parent_id:new_parent_id,ancestor_ids:ancestors,deleted_keyword_ids:Vec::new()})}
 
     pub fn keyword_delete_info(&self,id:i64)->Result<KeywordDeleteInfo,String>{let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;keyword_delete_info(&conn,id)}
 
-    pub fn delete_keyword(&self,id:i64)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let info=keyword_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kľúčové slovo {} nie je možné zmazať, obsahuje {} {} (vrátane podriadených slov). Najprv z neho súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files,"súbor","súbory","súborov")));}let ancestors=keyword_ancestor_ids(&tx,id)?;let ids=keyword_subtree(&tx,id)?;let mut events=Vec::new();for keyword_id in ids.iter().rev().copied(){delete_row_snapshot(&tx,&mut events,"keywords",keyword_id)?;}let summary=format!("Zmazané kľúčové slovo {}",info.name);let change_id=record_stored_change(&tx,events,"delete_keyword",&summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(KeywordMutationResult{change_id,summary,keyword_id:None,parent_id:None,ancestor_ids:ancestors,deleted_keyword_ids:ids})}
+    pub fn delete_keyword(&self,id:i64)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let info=keyword_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kľúčové slovo {} nie je možné zmazať, obsahuje {} {} (vrátane podriadených slov). Najprv z neho súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files,"súbor","súbory","súborov")));}let ancestors=keyword_ancestor_ids(&tx,id)?;let ids=keyword_subtree(&tx,id)?;for keyword_id in ids.iter().rev().copied(){delete_row(&tx,"keywords",keyword_id)?;}let summary=format!("Zmazané kľúčové slovo {}",info.name);let change_id=record_change(&tx, "delete_keyword", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["keyword"]);Ok(KeywordMutationResult{change_id,summary,keyword_id:None,parent_id:None,ancestor_ids:ancestors,deleted_keyword_ids:ids})}
 
-    pub fn record_file_change(&self, action:&str, summary:&str, moved:&[FileCatalogMove], copied:&[FileCatalogCopy], created_folders:&[String], undo_payload:&str)->Result<(Option<i64>,Vec<AssetIdRemap>),String>{
+    pub fn record_file_change(&self, action:&str, summary:&str, moved:&[FileCatalogMove], copied:&[FileCatalogCopy], created_folders:&[String])->Result<(Option<i64>,Vec<AssetIdRemap>),String>{
         self.require_write()?;
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        let mut events=Vec::new();let mut paths=load_folder_paths(&tx)?;let mut roots=load_folder_roots(&tx)?;let mut remapped=Vec::new();
+        let mut paths=load_folder_paths(&tx)?;let mut roots=load_folder_roots(&tx)?;let mut remapped=Vec::new();
         for item in moved {
-            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots,&mut events)?;
+            if read_asset_values(&tx, item.asset_id)?.is_none() {
+                return Err(format!("Súbor katalógu {} sa nenašiel", item.asset_id));
+            }
+            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots)?;
             for (column,value) in [("folder_id",SqlValue::Integer(folder)),("path",SqlValue::Text(item.target_path.clone())),("name",SqlValue::Text(item.name.clone())),("ext",SqlValue::Text(item.ext.clone())),("ext_lower",SqlValue::Text(item.ext.to_ascii_lowercase())),("size",SqlValue::Real(item.size)),("file_modified",item.file_modified.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null))] {
-                record_asset_update(&tx,&mut events,item.asset_id,column,value)?;
+                update_column(&tx, "assets", item.asset_id,column,value)?;
             }
         }
         for item in copied {
-            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots,&mut events)?;
+            let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots)?;
             let source_exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1 AND ext_lower<>'')",[item.source_asset_id],|r|r.get(0)).map_err(|e|e.to_string())?;
             if !source_exists { continue; }
             let id=next_id(&tx,"assets")?;
             tx.execute("INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) SELECT ?1,?2,?3,?4,lower(?4),is_listed,?5,width,height,bpp,caption,notes,author,rating,tagged,label,?6,exif_date,acdsee_date,md_dirty,is_orphan,?7 FROM assets WHERE id=?8",(id,folder,&item.name,&item.ext,item.size,&item.file_modified,&item.target_path,item.source_asset_id)).map_err(|e|e.to_string())?;
-            push_insert_snapshot(&tx,&mut events,"assets",id)?;remapped.push(AssetIdRemap{old_id:item.source_asset_id,new_id:id});
-            for table in ["asset_categories","asset_keywords"] {
-                let target_column=if table=="asset_categories"{"category_id"}else{"keyword_id"};
-                let mut stmt=tx.prepare(&format!("SELECT {target_column} FROM {table} WHERE asset_id=?1")).map_err(|e|e.to_string())?;
-                let relations=stmt.query_map([item.source_asset_id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;drop(stmt);
-                for relation in relations { let key=format!("{id}:{relation}");let old=read_item(&tx,table,&key,"__exists__")?;let new=SqlValue::Integer(1);apply_item(&tx,table,&key,"__exists__",&new)?;events.push(StoredItem{table_name:table.into(),row_key:key,column_name:"__exists__".into(),old_value:old,new_value:new}); }
+            remapped.push(AssetIdRemap{old_id:item.source_asset_id,new_id:id});
+            for (table, column) in [("asset_categories", "category_id"), ("asset_keywords", "keyword_id")] {
+                tx.execute(&format!("INSERT OR IGNORE INTO {table}(asset_id,{column}) SELECT ?1,{column} FROM {table} WHERE asset_id=?2"),
+                    (id, item.source_asset_id)).map_err(|e| e.to_string())?;
             }
         }
-        for folder_path in created_folders { let _=ensure_folder(&tx,folder_path,&mut paths,&mut roots,&mut events)?; }
-        events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});
-        let change_id=record_stored_change(&tx,events,action,summary)?;tx.commit().map_err(|e|e.to_string())?;Ok((change_id,remapped))
+        for folder_path in created_folders { ensure_folder(&tx, folder_path, &mut paths, &mut roots)?; }
+        let change_id = record_change(&tx, action, summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        if !remapped.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
+        Ok((change_id, remapped))
     }
 
-    /// Permanently deleted files: drop their catalogue rows for good (no undo — the files are gone).
-    pub fn rewrite_folder_paths(&self,old:&str,new:&str,action:&str,summary:&str,undo_payload:&str)->Result<Option<i64>,String>{self.require_write()?;let old_norm=normalize_fs_path(old);let prefix=format!("{old_norm}\\");let new_norm=new.trim_end_matches(['\\','/']).replace('/',"\\");let rewrite=|path:&str|{let normalized=path.replace('/',"\\");let lower=normalize_fs_path(&normalized);if lower==old_norm{new_norm.clone()}else if lower.starts_with(&prefix){format!("{}{}",new_norm,&normalized[old.len()..])}else{normalized}};let mut conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let mut events=Vec::new();for table in ["assets","folders","folder_roots"]{let rows={let mut stmt=tx.prepare(&format!("SELECT id,path FROM {table} WHERE path IS NOT NULL")).map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};for(id,path)in rows{let lower=normalize_fs_path(&path);if lower==old_norm||lower.starts_with(&prefix){record_column_update(&tx,&mut events,table,id,"path",SqlValue::Text(rewrite(&path)))?;if table=="folders"&&lower==old_norm{record_column_update(&tx,&mut events,table,id,"name",SqlValue::Text(new.rsplit(['\\','/']).next().unwrap_or(new).to_string()))?;}}}}let rules_exist:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ddreams_folder_rules')",[],|r|r.get(0)).unwrap_or(false);if rules_exist{let rows={let mut stmt=tx.prepare("SELECT path FROM ddreams_folder_rules").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};for rule in rows{let lower=normalize_fs_path(&rule);if lower==old_norm||lower.starts_with(&prefix){let target=rewrite(&rule);tx.execute("UPDATE ddreams_folder_rules SET path=?1 WHERE path=?2",(&target,&rule)).map_err(|e|e.to_string())?;events.push(StoredItem{table_name:"ddreams_folder_rules".into(),row_key:target.clone(),column_name:"path".into(),old_value:SqlValue::Text(rule),new_value:SqlValue::Text(target)});}}}events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});let id=record_stored_change(&tx,events,action,summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(id)}
-
-    pub fn record_folder_delete(&self,path:&str,summary:&str,undo_payload:&str)->Result<Option<i64>,String>{self.require_write()?;let mut conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let ids=assets_under(&tx,path)?;let normal=normalize_fs_path(path);let prefix=format!("{normal}\\");let folders={let mut stmt=tx.prepare("SELECT id,path,root_id FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,Option<i64>>(2)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?.into_iter().filter(|(_,p,_)|{let n=normalize_fs_path(p);n==normal||n.starts_with(&prefix)}).collect::<Vec<_>>()};let mut events=Vec::new();for chunk in ids.chunks(500){remove_asset_rows(&tx,chunk,&mut events)?;}for(id,_,_)in &folders{delete_row_snapshot(&tx,&mut events,"folders",*id)?;}for chunk in folders.iter().map(|f|f.0).collect::<Vec<_>>().chunks(500){if !chunk.is_empty(){let marks=vec!["?";chunk.len()].join(",");tx.execute(&format!("DELETE FROM folders WHERE id IN ({marks})"),rusqlite::params_from_iter(chunk.iter())).map_err(|e|e.to_string())?;}}let roots=folders.iter().filter_map(|f|f.2).collect::<std::collections::HashSet<_>>();for root in roots{let remains:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM folders WHERE root_id=?1)",[root],|r|r.get(0)).map_err(|e|e.to_string())?;if !remains{delete_row_snapshot(&tx,&mut events,"folder_roots",root)?;tx.execute("DELETE FROM folder_roots WHERE id=?1",[root]).map_err(|e|e.to_string())?;}}events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.into())});let id=record_stored_change(&tx,events,"delete_folder",summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(id)}
-
-    pub fn purge_assets(&self, asset_ids:&[i64])->Result<(),String>{
+    pub fn rewrite_folder_paths(&self, old: &str, new: &str, action: &str, summary: &str) -> Result<Option<i64>, String> {
         self.require_write()?;
-        if asset_ids.is_empty(){return Ok(());}
-        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
-        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        for table in ["asset_categories","asset_keywords","asset_color_overrides","ai_suggestion_rejections"]{
-            let exists:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",[table],|r|r.get(0)).map_err(|e|e.to_string())?;
-            if exists{for id in asset_ids{tx.execute(&format!("DELETE FROM {table} WHERE asset_id=?1"),[id]).map_err(|e|e.to_string())?;}}
+        let old = normalize_fs_path(old);
+        let new = new.trim_end_matches(['\\', '/']).replace('/', "\\");
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        for table in ["assets", "folders", "folder_roots"] {
+            let mut stmt = tx.prepare(&format!("SELECT id,path FROM {table} WHERE path IS NOT NULL")).map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
+                .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+            for (id, path) in rows {
+                if let Some(suffix) = matched_path_suffix(&path, &old) {
+                    let target = format!("{new}{}", suffix.replace('/', "\\"));
+                    update_column(&tx, table, id, "path", target)?;
+                    if table == "folders" && suffix.is_empty() {
+                        update_column(&tx, table, id, "name", new.rsplit('\\').next().unwrap_or(&new))?;
+                    }
+                }
+            }
         }
-        for id in asset_ids{tx.execute("DELETE FROM assets WHERE id=?1",[id]).map_err(|e|e.to_string())?;}
-        mark_catalog_modified(&tx)?;tx.commit().map_err(|e|e.to_string())?;Ok(())
+        if table_exists(&tx, "ddreams_folder_rules")? {
+            let mut stmt = tx.prepare("SELECT path FROM ddreams_folder_rules").map_err(|e| e.to_string())?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+            for path in rows {
+                if let Some(suffix) = matched_path_suffix(&path, &old) {
+                    let target = format!("{new}{}", suffix.replace('/', "\\"));
+                    tx.execute("UPDATE ddreams_folder_rules SET path=?1 WHERE path=?2", (&target, &path)).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+        let change_id = record_change(&tx, action, summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.rules.invalidate();
+        Ok(change_id)
     }
 
-    /// Files were moved to the Recycle Bin: remove their catalogue rows and store the file payload,
-    /// all in ONE change, so undo restores the files first and then the rows.
-    pub fn record_file_delete(&self, asset_ids:&[i64], summary:&str, undo_payload:&str)->Result<Option<i64>,String>{
+    pub fn record_folder_delete(&self, path: &str, summary: &str) -> Result<Option<i64>, String> {
         self.require_write()?;
-        let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
-        let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
-        let mut events=Vec::new();
-        remove_asset_rows(&tx,&asset_ids.iter().copied().filter(|id|*id>0).collect::<Vec<_>>(),&mut events)?;
-        events.push(StoredItem{table_name:"__file_ops".into(),row_key:"batch".into(),column_name:"__payload__".into(),old_value:SqlValue::Null,new_value:SqlValue::Text(undo_payload.to_owned())});
-        let change_id=record_stored_change(&tx,events,"delete_files",summary)?;tx.commit().map_err(|e|e.to_string())?;Ok(change_id)
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let ids = assets_under(&tx, path)?;
+        let old = normalize_fs_path(path);
+        let folders = {
+            let mut stmt = tx.prepare("SELECT id,path,root_id FROM folders WHERE path IS NOT NULL").map_err(|e| e.to_string())?;
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<i64>>(2)?)))
+                .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
+                .into_iter().filter(|(_, path, _)| matched_path_suffix(path, &old).is_some()).collect::<Vec<_>>()
+        };
+        remove_asset_rows(&tx, &ids, true)?;
+        remove_folder_rows(&tx, &folders)?;
+        let change_id = record_change(&tx, "delete_folder", summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        if !ids.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
+        Ok(change_id)
+    }
+
+    pub fn purge_assets(&self, asset_ids: &[i64]) -> Result<(), String> {
+        self.require_write()?;
+        if asset_ids.is_empty() { return Ok(()); }
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        remove_asset_rows(&tx, asset_ids, true)?;
+        mark_catalog_modified(&tx)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        self.notify_labels_changed(&["category", "keyword"]);
+        Ok(())
+    }
+
+    pub fn record_file_delete(&self, asset_ids: &[i64], summary: &str) -> Result<Option<i64>, String> {
+        self.require_write()?;
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        remove_asset_rows(&tx, asset_ids, true)?;
+        let change_id = record_change(&tx, "delete_files", summary)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        if !asset_ids.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
+        Ok(change_id)
     }
 
     pub fn suggest_deletions(&self, incoming: &str, suggestions: &[(i64, bool)], formats: &crate::formats::FormatTable) -> Result<DeletionSuggestionChange, String> {
         self.require_write()?;
         let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let mut events = Vec::new();
+        let mut changed = 0;
         {
             let mut select = tx.prepare("SELECT path,ext_lower,delete_suggestion FROM assets WHERE id=?1 AND is_listed=1")
                 .map_err(|e| e.to_string())?;
@@ -675,12 +610,12 @@ impl CatalogWriter {
                     (false, Some(1)) => SqlValue::Null,
                     _ => continue,
                 };
-                record_column_update(&tx, &mut events, "assets", id, "delete_suggestion", new_value)?;
+                changed += usize::from(update_column(&tx, "assets", id, "delete_suggestion", new_value)?);
             }
         }
-        let summary = if events.is_empty() { "Žiadne nové návrhy na vymazanie".into() }
-            else { format!("Zmenené návrhy na vymazanie ({})", events.len()) };
-        let change_id = record_stored_change(&tx, events, "suggest_deletions", &summary)?;
+        let summary = if changed == 0 { "Žiadne nové návrhy na vymazanie".into() }
+            else { format!("Zmenené návrhy na vymazanie ({changed})") };
+        let change_id = if changed > 0 { record_change(&tx, "suggest_deletions", &summary)? } else { None };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(DeletionSuggestionChange { change_id, summary })
     }
@@ -696,87 +631,27 @@ impl CatalogWriter {
             select.query_map([], |row| row.get::<_, i64>(0)).map_err(|e| e.to_string())?
                 .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
         };
-        let mut events = Vec::new();
+        let mut changed = 0;
         for id in active.into_iter().filter(|id| selection.as_ref().is_none_or(|ids| ids.contains(id))) {
-            record_column_update(&tx, &mut events, "assets", id, "delete_suggestion", SqlValue::Integer(0))?;
+            changed += usize::from(update_column(&tx, "assets", id, "delete_suggestion", 0)?);
         }
-        let summary = if events.is_empty() { "Žiadne návrhy na vymazanie".into() }
-            else { format!("Zrušené návrhy na vymazanie ({})", events.len()) };
-        let change_id = record_stored_change(&tx, events, "keep_suggested_assets", &summary)?;
+        let summary = if changed == 0 { "Žiadne návrhy na vymazanie".into() }
+            else { format!("Zrušené návrhy na vymazanie ({changed})") };
+        let change_id = if changed > 0 { record_change(&tx, "keep_suggested_assets", &summary)? } else { None };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(DeletionSuggestionChange { change_id, summary })
     }
 
     pub fn recent_changes(&self, limit: i64) -> Result<Vec<ChangeSummary>, String> {
         let connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
-        let mut statement = connection.prepare("SELECT id,ts,action,summary,undone FROM ddreams_changes ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
-        statement.query_map([limit.clamp(1, 200)], |row| Ok(ChangeSummary { id: row.get(0)?, ts: row.get(1)?, action: row.get(2)?, summary: row.get(3)?, undone: row.get::<_, i64>(4)? != 0 }))
+        let mut statement = connection.prepare("SELECT id,ts,summary FROM ddreams_changes WHERE undone=0 ORDER BY id DESC LIMIT ?1").map_err(|e| e.to_string())?;
+        statement.query_map([limit.clamp(1, 200)], |row| Ok(ChangeSummary { id: row.get(0)?, ts: row.get(1)?, summary: row.get(2)? }))
             .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
-    }
-
-    pub fn undo_last(&self) -> Result<Option<ChangeSummary>, String> { self.undo_last_with(|_|Err("This change requires the file-operation undo service".into())) }
-
-    pub fn undo_last_with<F>(&self, mut undo_external:F) -> Result<Option<ChangeSummary>, String> where F:FnMut(&str)->Result<(),String> {
-        self.require_write()?;
-        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
-        let latest = transaction.query_row(
-            "SELECT id,ts,action,summary,undone FROM ddreams_changes WHERE undone=0 ORDER BY id DESC LIMIT 1", [],
-            |row| Ok(ChangeSummary { id: row.get(0)?, ts: row.get(1)?, action: row.get(2)?, summary: row.get(3)?, undone: row.get::<_, i64>(4)? != 0 }),
-        ).optional().map_err(|e| e.to_string())?;
-        let Some(change) = latest else { return Ok(None); };
-        let items = {
-            let mut statement = transaction.prepare("SELECT table_name,row_key,column_name,old_value,new_value FROM ddreams_change_items WHERE change_id=?1 ORDER BY rowid DESC").map_err(|e| e.to_string())?;
-            statement.query_map([change.id], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?)))
-                .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
-        };
-        let kinds=resync_kinds_for_tables(items.iter().filter(|item| item.2 != "icon_key").map(|item|item.0.as_str()));
-        let mut external_payload=None;
-        for (table,key,column,old,new) in &items {
-            validate_item(&table, &column)?;
-            let old_value=decode_sql(old)?;let new_value=decode_sql(new)?;
-            if table=="__file_ops" { external_payload=Some(match new_value{SqlValue::Text(payload)=>payload,_=>return Err("Invalid file-operation journal payload".into())});continue; }
-            if read_item(&transaction, &table, &key, &column)? != new_value { return Err(format!("Cannot undo because {} {} changed since the journal entry", table, key)); }
-            if matches!(old_value,SqlValue::Null)&&column!="__snapshot__" { continue; }
-        }
-        if let Some(payload)=external_payload { undo_external(&payload)?; }
-        for (table,key,column,old,_) in items {
-            if table=="__file_ops" { continue; }
-            let old_value=decode_sql(&old)?;
-            apply_item(&transaction, &table, &key, &column, &old_value)?;
-        }
-        transaction.execute("UPDATE ddreams_changes SET undone=1 WHERE id=?1", [change.id]).map_err(|e| e.to_string())?;
-        mark_catalog_modified(&transaction)?;
-        transaction.commit().map_err(|e| e.to_string())?;
-        self.notify_change(&kinds);
-        Ok(Some(change))
     }
 
     fn require_write(&self) -> Result<(), String> {
         if self.writable { Ok(()) } else { Err("Catalog is in strict read-only mode".into()) }
     }
-}
-
-fn validate_item(table: &str, column: &str) -> Result<(), String> {
-    let allowed = match table {
-        "assets" => matches!(column, "rating" | "label" | "tagged" | "caption" | "author" | "notes" | "path" | "name" | "ext" | "ext_lower" | "size" | "file_modified" | "folder_id" | "delete_suggestion" | "__snapshot__"),
-        "folders" => matches!(column,"name"|"path"|"__snapshot__"),
-        "folder_roots" => matches!(column,"path"|"__snapshot__"),
-        "ddreams_folder_rules" => column == "path",
-        "categories" => matches!(column, "name" | "parent_id" | "root_id" | "icon_key" | "__snapshot__"),
-        "category_roots" => matches!(column, "name" | "icon_key" | "__snapshot__"),
-        "keywords" => matches!(column, "name" | "parent_id" | "__snapshot__"),
-        "asset_categories" | "asset_keywords" | "asset_color_overrides" => column == "__exists__",
-        "__file_ops" => column == "__payload__",
-        _ => false,
-    };
-    if allowed { Ok(()) } else { Err(format!("Unsupported journal target: {table}.{column}")) }
-}
-
-fn resync_kinds_for_tables<'a>(tables:impl IntoIterator<Item=&'a str>)->Vec<String>{
-    let mut kinds=std::collections::BTreeSet::new();
-    for table in tables {match table{"asset_categories"|"categories"|"category_roots"=>{kinds.insert("category".to_owned());},"asset_keywords"|"keywords"=>{kinds.insert("keyword".to_owned());},_=>{}}}
-    kinds.into_iter().collect()
 }
 
 #[derive(Default)]
@@ -915,25 +790,11 @@ fn keyword_ancestor_ids(tx:&Transaction<'_>,id:i64)->Result<Vec<i64>,String>{let
 fn keyword_path(tx:&Transaction<'_>,id:i64)->Result<String,String>{let mut current=Some(id);let mut seen=std::collections::HashSet::new();let mut names=Vec::new();while let Some(key)=current{if !seen.insert(key){break;}let row:Option<(String,Option<i64>)>=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;let Some((name,parent))=row else{if key==id{return Err("Kľúčové slovo neexistuje".into());}break;};names.push(name);current=parent;}names.reverse();Ok(names.join(" › "))}
 fn keyword_delete_info(connection:&rusqlite::Connection,id:i64)->Result<KeywordDeleteInfo,String>{let name:String=connection.query_row("SELECT name FROM keywords WHERE id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;let mut stmt=connection.prepare("WITH RECURSIVE subtree(id) AS (SELECT id FROM keywords WHERE id=?1 UNION SELECT k.id FROM keywords k JOIN subtree s ON k.parent_id=s.id) SELECT id FROM subtree").map_err(|e|e.to_string())?;let ids=stmt.query_map([id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let marks=std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT count(DISTINCT asset_id) FROM asset_keywords WHERE keyword_id IN ({marks})");let assigned=connection.query_row(&sql,rusqlite::params_from_iter(ids.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? as usize;Ok(KeywordDeleteInfo{id,name,assigned_files:assigned,subkeywords:ids.len().saturating_sub(1)})}
 
-fn record_column_update(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64,column:&str,new_value:SqlValue)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),column)?;if old==new_value{return Ok(());}apply_item(tx,table,&id.to_string(),column,&new_value)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:column.into(),old_value:old,new_value});Ok(())}
-
-fn delete_row_snapshot(tx:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64)->Result<(),String>{let old=read_item(tx,table,&id.to_string(),"__snapshot__")?;if matches!(old,SqlValue::Null){return Err(format!("Riadok {table} {id} neexistuje"));}apply_item(tx,table,&id.to_string(),"__snapshot__",&SqlValue::Null)?;events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:"__snapshot__".into(),old_value:old,new_value:SqlValue::Null});Ok(())}
-
-fn record_stored_change(tx:&Transaction<'_>,events:Vec<StoredItem>,action:&str,summary:&str)->Result<Option<i64>,String>{if events.is_empty(){return Ok(None);}let kinds=resync_kinds_for_tables(events.iter().filter(|item| item.column_name != "icon_key").map(|item|item.table_name.as_str()));let ts=iso_now();tx.execute("INSERT INTO ddreams_changes(ts,action,summary,undone) VALUES(?1,?2,?3,0)",(&ts,action,summary)).map_err(|e|e.to_string())?;let change_id=tx.last_insert_rowid();for item in events{tx.execute("INSERT INTO ddreams_change_items(change_id,table_name,row_key,column_name,old_value,new_value) VALUES(?1,?2,?3,?4,?5,?6)",(change_id,item.table_name,item.row_key,item.column_name,encode_sql(&item.old_value)?,encode_sql(&item.new_value)?)).map_err(|e|e.to_string())?;}mark_catalog_modified(tx)?;if !kinds.is_empty(){if let Some(callback)=JOURNAL_CHANGE_HOOK.get().and_then(|hook|hook.lock().ok()).and_then(|hook|hook.clone()){callback(&kinds);}}Ok(Some(change_id))}
-
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
     transaction.execute(
         "INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) VALUES(?1,?2,?3,?4,?5,1,?6,NULL,NULL,NULL,NULL,NULL,NULL,?7,?8,?9,?10,NULL,NULL,NULL,NULL,?11)",
         (asset.id, asset.folder_id, &asset.name, &asset.ext, asset.ext.to_lowercase(), asset.size, asset.rating, i64::from(asset.tagged), &asset.label, &asset.file_modified, &asset.path),
     ).map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-fn record_asset_update(transaction: &Transaction<'_>, events: &mut Vec<StoredItem>, id: i64, column: &str, new_value: SqlValue) -> Result<(), String> {
-    let old_value = read_item(transaction, "assets", &id.to_string(), column)?;
-    if old_value == new_value { return Ok(()); }
-    apply_item(transaction, "assets", &id.to_string(), column, &new_value)?;
-    events.push(StoredItem { table_name: "assets".into(), row_key: id.to_string(), column_name: column.into(), old_value, new_value });
     Ok(())
 }
 
@@ -945,32 +806,33 @@ fn load_folder_paths(transaction: &Transaction<'_>) -> Result<HashMap<String, i6
     Ok(result)
 }
 
-fn load_folder_roots(transaction: &Transaction<'_>) -> Result<Vec<(i64, String, String)>, String> {
-    let mut statement = transaction.prepare("SELECT id,name,path FROM folder_roots WHERE path IS NOT NULL").map_err(|e| e.to_string())?;
-    statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+fn load_folder_roots(transaction: &Transaction<'_>) -> Result<Vec<(i64, String)>, String> {
+    let mut statement = transaction.prepare("SELECT id,path FROM folder_roots WHERE path IS NOT NULL").map_err(|e| e.to_string())?;
+    statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
         .map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())
 }
 
-fn ensure_folder(transaction: &Transaction<'_>, target: &str, folders: &mut HashMap<String, i64>, roots: &mut Vec<(i64, String, String)>, events: &mut Vec<StoredItem>) -> Result<i64, String> {
+fn ensure_folder(transaction: &Transaction<'_>, target: &str, folders: &mut HashMap<String, i64>, roots: &mut Vec<(i64, String)>) -> Result<i64, String> {
     let target_key = normalize_fs_path(target);
     if let Some(id) = folders.get(&target_key) { return Ok(*id); }
     if target.trim().is_empty() { return Err("Folder path is empty".into()); }
-    let mut root = roots.iter().filter(|(_,_,path)| is_path_prefix(path,target)).max_by_key(|(_,_,path)| path.len()).cloned();
-    if root.is_none() {
+    let root = roots.iter().filter(|(_,path)| is_path_prefix(path,target)).max_by_key(|(_,path)| path.len()).cloned();
+    let (root_id, root_path) = if let Some(root) = root {
+        root
+    } else {
         let (name,path) = derive_path_root(target);
         let id = next_id(transaction,"folder_roots")?;
         transaction.execute("INSERT INTO folder_roots(id,name,path) VALUES(?1,?2,?3)",(id,&name,&path)).map_err(|e|e.to_string())?;
-        push_insert_snapshot(transaction,events,"folder_roots",id)?;
-        root = Some((id,name,path));
-    }
-    let (root_id,root_name,root_path) = root.unwrap();
+
+        roots.push((id, path.clone()));
+        (id, path)
+    };
     let root_key = normalize_fs_path(&root_path);
     let mut parent_id = if let Some(id)=folders.get(&root_key) { *id } else {
         let id=next_id(transaction,"folders")?;
         transaction.execute("INSERT INTO folders(id,parent_id,root_id,name,path) VALUES(?1,NULL,?2,'\\',?3)",(id,root_id,&root_path)).map_err(|e|e.to_string())?;
-        push_insert_snapshot(transaction,events,"folders",id)?;
+
         folders.insert(root_key.clone(),id);
-        let _=root_name;
         id
     };
     let target_parts = path_parts(target);
@@ -983,7 +845,7 @@ fn ensure_folder(transaction: &Transaction<'_>, target: &str, folders: &mut Hash
         if let Some(id)=folders.get(&key) { parent_id=*id; continue; }
         let id=next_id(transaction,"folders")?;
         transaction.execute("INSERT INTO folders(id,parent_id,root_id,name,path) VALUES(?1,?2,?3,?4,?5)",(id,parent_id,root_id,&part,&path)).map_err(|e|e.to_string())?;
-        push_insert_snapshot(transaction,events,"folders",id)?;
+
         folders.insert(key,id); parent_id=id;
     }
     Ok(parent_id)
@@ -1007,149 +869,146 @@ fn path_parts(path:&str)->Vec<String>{path.split(['\\','/']).filter(|part|!part.
 pub(crate) fn normalize_fs_path(path:&str)->String{path.trim_end_matches(['\\','/']).replace('/',"\\").to_lowercase()}
 fn is_path_prefix(root:&str,target:&str)->bool{let root=normalize_fs_path(root);let target=normalize_fs_path(target);target==root||target.strip_prefix(&root).is_some_and(|suffix|suffix.starts_with('\\'))}
 
-fn next_id(transaction:&Transaction<'_>,table:&str)->Result<i64,String>{
-    let (max_id,journal_id):(i64,i64)=transaction.query_row(&format!("SELECT coalesce((SELECT max(id) FROM {table}),0),coalesce((SELECT max(CAST(row_key AS INTEGER)) FROM ddreams_change_items WHERE table_name=?1 AND column_name='__snapshot__'),0)"),[table],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|e|e.to_string())?;
-    Ok(max_id.max(journal_id)+1)
-}
-
-fn push_insert_snapshot(transaction:&Transaction<'_>,events:&mut Vec<StoredItem>,table:&str,id:i64)->Result<(),String>{
-    let value=read_item(transaction,table,&id.to_string(),"__snapshot__")?;
-    events.push(StoredItem{table_name:table.into(),row_key:id.to_string(),column_name:"__snapshot__".into(),old_value:SqlValue::Null,new_value:value});
-    Ok(())
-}
-
-fn json_to_sql(value: &Value) -> Result<SqlValue, String> {
-    match value {
-        Value::Null => Ok(SqlValue::Null),
-        Value::Bool(value) => Ok(SqlValue::Integer(i64::from(*value))),
-        Value::Number(value) => value.as_i64().map(SqlValue::Integer).or_else(|| value.as_f64().map(SqlValue::Real)).ok_or_else(|| "Unsupported JSON number".into()),
-        Value::String(value) => Ok(SqlValue::Text(value.clone())),
-        _ => Err("Journal values must be SQLite scalar values".into()),
+// Map the normalized prefix to the separator in the original path, whose UTF-8 width can differ.
+fn matched_path_suffix<'a>(path: &'a str, old_normalized: &str) -> Option<&'a str> {
+    let normalized = normalize_fs_path(path);
+    if normalized == old_normalized {
+        return Some("");
     }
-}
-
-fn encode_sql(value: &SqlValue) -> Result<String, String> {
-    let tagged = match value {
-        SqlValue::Null => serde_json::json!({"type":"null"}),
-        SqlValue::Integer(value) => serde_json::json!({"type":"integer","value":value}),
-        SqlValue::Real(value) => serde_json::json!({"type":"real","value":value}),
-        SqlValue::Text(value) => serde_json::json!({"type":"text","value":value}),
-        SqlValue::Blob(value) => serde_json::json!({"type":"blob","value":value.iter().map(|byte|format!("{byte:02x}")).collect::<String>()}),
-    };
-    serde_json::to_string(&tagged).map_err(|e| e.to_string())
-}
-
-fn decode_sql(value: &str) -> Result<SqlValue, String> {
-    let tagged: Value = serde_json::from_str(value).map_err(|e| e.to_string())?;
-    match tagged.get("type").and_then(Value::as_str) {
-        Some("null") => Ok(SqlValue::Null),
-        Some("integer") => tagged.get("value").and_then(Value::as_i64).map(SqlValue::Integer).ok_or_else(|| "Invalid journal integer".into()),
-        Some("real") => tagged.get("value").and_then(Value::as_f64).map(SqlValue::Real).ok_or_else(|| "Invalid journal real".into()),
-        Some("text") => tagged.get("value").and_then(Value::as_str).map(|value| SqlValue::Text(value.into())).ok_or_else(|| "Invalid journal text".into()),
-        Some("blob") => {
-            let text = tagged.get("value").and_then(Value::as_str).ok_or("Invalid journal blob")?;
-            if text.len() % 2 != 0 { return Err("Invalid journal blob encoding".into()); }
-            let bytes = (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i+2],16).map_err(|e|e.to_string())).collect::<Result<Vec<_>,_>>()?;
-            Ok(SqlValue::Blob(bytes))
-        }
-        _ => Err("Invalid journal value type".into()),
+    if !normalized.strip_prefix(old_normalized)?.starts_with('\\') {
+        return None;
     }
+    let separators = old_normalized.matches('\\').count();
+    let (boundary, _) = path.match_indices(['\\', '/']).nth(separators)?;
+    Some(&path[boundary..])
 }
 
-fn key_id(row_key: &str) -> Result<i64, String> { row_key.parse::<i64>().map_err(|e| e.to_string()) }
-
-fn link_ids(row_key: &str) -> Result<(i64,i64), String> {
-    let (left,right) = row_key.split_once(':').ok_or("Relationship row key must be asset_id:target_id")?;
-    Ok((key_id(left)?, key_id(right)?))
-}
-
-fn color_key(row_key:&str)->Result<(i64,&str),String>{let (id,color)=row_key.split_once(':').ok_or("Color row key must be asset_id:color")?;let id=key_id(id)?;if id<=0{return Err("Color row key asset_id must be positive".into());}Ok((id,color))}
-
-fn read_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column: &str) -> Result<SqlValue, String> {
-    if column == "__snapshot__" { return read_snapshot(transaction, table, row_key); }
-    if table=="ddreams_folder_rules"&&column=="path"{return transaction.query_row("SELECT path FROM ddreams_folder_rules WHERE path=?1",[row_key],|r|r.get::<_,String>(0)).map(SqlValue::Text).map_err(|e|e.to_string())}
-    if table == "asset_color_overrides" { let (id,color)=color_key(row_key)?;let state:Option<i64>=transaction.query_row("SELECT state FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color),|r|r.get(0)).optional().map_err(|e|e.to_string())?;return Ok(state.map(SqlValue::Integer).unwrap_or(SqlValue::Null)); }
-    if table == "asset_categories" || table == "asset_keywords" {
-        let (asset_id, target_id) = link_ids(row_key)?;
-        let target_column = if table == "asset_categories" { "category_id" } else { "keyword_id" };
-        let exists: bool = transaction.query_row(&format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE asset_id=?1 AND {target_column}=?2)"), (asset_id,target_id), |row| row.get(0)).map_err(|e|e.to_string())?;
-        return Ok(SqlValue::Integer(i64::from(exists)));
-    }
-    let id = key_id(row_key)?;
-    transaction.query_row(&format!("SELECT {column} FROM {table} WHERE id=?1"), [id], |row| row.get(0)).map_err(|e|e.to_string())
-}
-
-fn apply_item(transaction: &Transaction<'_>, table: &str, row_key: &str, column: &str, value: &SqlValue) -> Result<(), String> {
-    if column == "__snapshot__" { return restore_snapshot(transaction, table, row_key, value); }
-    if table=="ddreams_folder_rules"&&column=="path"{let SqlValue::Text(path)=value else{return Err("Invalid folder rule path".into())};transaction.execute("UPDATE ddreams_folder_rules SET path=?1 WHERE path=?2",(path,row_key)).map_err(|e|e.to_string())?;return Ok(())}
-    if table == "asset_color_overrides" { let (id,color)=color_key(row_key)?;match value { SqlValue::Null=>{transaction.execute("DELETE FROM asset_color_overrides WHERE asset_id=?1 AND color=?2",(id,color)).map_err(|e|e.to_string())?;},SqlValue::Integer(state @ (0|1))=>{transaction.execute("INSERT OR REPLACE INTO asset_color_overrides(asset_id,color,state) VALUES(?1,?2,?3)",(id,color,state)).map_err(|e|e.to_string())?;},_=>return Err("Invalid color override state".into()) }return Ok(()); }
-    if table == "asset_categories" || table == "asset_keywords" {
-        let (asset_id,target_id) = link_ids(row_key)?;
-        let target_column = if table == "asset_categories" { "category_id" } else { "keyword_id" };
-        if value_truth(value)? {
-            transaction.execute(&format!("INSERT OR IGNORE INTO {table}(asset_id,{target_column}) VALUES(?1,?2)"), (asset_id,target_id)).map_err(|e|e.to_string())?;
+fn resolve_write_assets(
+    tx: &Transaction<'_>, asset_ids: &[i64], listed: &[ListedAsset], insert_missing: bool, require_temporary_id: bool,
+) -> Result<(Vec<AssetValueState>, Vec<AssetIdRemap>, usize), String> {
+    let mut ids = asset_ids.to_vec();
+    ids.sort_unstable();
+    ids.dedup();
+    let candidates: HashMap<_, _> = listed.iter().map(|asset| (asset.temporary_id, asset)).collect();
+    let mut folders = None;
+    let mut next_asset_id = None;
+    let mut states = Vec::new();
+    let mut remapped = Vec::new();
+    let mut resolved = std::collections::HashSet::new();
+    let mut inserted = 0;
+    for requested in ids {
+        let id = if requested >= 0 {
+            requested
         } else {
-            transaction.execute(&format!("DELETE FROM {table} WHERE asset_id=?1 AND {target_column}=?2"), (asset_id,target_id)).map_err(|e|e.to_string())?;
+            let Some(candidate) = candidates.get(&requested) else {
+                if require_temporary_id { return Err(format!("Listed file {requested} is no longer available")); }
+                continue;
+            };
+            if candidate.ext.trim().is_empty() { continue; }
+            let id = match find_asset_by_path(tx, &candidate.path)? {
+                Some(id) => id,
+                None if insert_missing => {
+                    if folders.is_none() { folders = Some((load_folder_paths(tx)?, load_folder_roots(tx)?)); }
+                    let (paths, roots) = folders.as_mut().unwrap();
+                    let folder_id = ensure_folder(tx, &candidate.folder_path, paths, roots)?;
+                    let id = match next_asset_id {
+                        Some(id) => id,
+                        None => next_id(tx, "assets")?,
+                    };
+                    next_asset_id = Some(id.checked_add(1).ok_or("Asset ID limit reached")?);
+                    insert_asset(tx, &NewCatalogAsset {
+                        id, folder_id, name: candidate.name.clone(), ext: candidate.ext.clone(), size: candidate.size,
+                        file_modified: candidate.file_modified.clone(), path: candidate.path.clone(),
+                        rating: None, label: None, tagged: false,
+                    })?;
+                    inserted += 1;
+                    id
+                }
+                None => continue,
+            };
+            remapped.push(AssetIdRemap { old_id: requested, new_id: id });
+            id
+        };
+        if resolved.insert(id) {
+            if let Some(state) = read_asset_values(tx, id)? { states.push(state); }
         }
-        return Ok(());
     }
-    let id = key_id(row_key)?;
-    let changed = transaction.execute(&format!("UPDATE {table} SET {column}=?1 WHERE id=?2"), (value,id)).map_err(|e|e.to_string())?;
-    if changed != 1 { return Err(format!("Journal target row not found: {table} {row_key}")); }
-    Ok(())
+    Ok((states, remapped, inserted))
 }
 
-fn snapshot_columns(transaction: &Transaction<'_>, table:&str)->Result<&'static [&'static str],String>{
-    const ASSETS: &[&str] = &["id","folder_id","name","ext","ext_lower","is_listed","size","width","height","bpp","caption","notes","author","rating","tagged","label","file_modified","exif_date","acdsee_date","md_dirty","is_orphan","path","delete_suggestion"];
-    match table {
-        "assets" => {
-            let has_flag = crate::incoming::has_deletion_column(transaction).map_err(|e| e.to_string())?;
-            Ok(if has_flag { ASSETS } else { &ASSETS[..ASSETS.len()-1] })
-        },
-        "folders"=>Ok(&["id","parent_id","root_id","name","path"]),
-        "folder_roots"=>Ok(&["id","name","path"]),
-        "categories"=>Ok(&["id","parent_id","root_id","name","icon_key"]),
-        "category_roots"=>Ok(&["id","name","icon_key"]),
-        "keywords"=>Ok(&["id","parent_id","name"]),
-        _=>Err(format!("Unsupported snapshot table: {table}")),
-    }
-}
-
-fn read_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str)->Result<SqlValue,String>{
-    let columns=snapshot_columns(transaction,table)?;let id=key_id(row_key)?;
-    let sql=format!("SELECT {} FROM {table} WHERE id=?1",columns.join(","));
-    let snapshot=transaction.query_row(&sql,[id],|row|{
-        let mut values=Vec::with_capacity(columns.len());
-        for (index, column) in columns.iter().enumerate() {
-            let value = row.get::<_, SqlValue>(index)?;
-            // Keep compatibility with older snapshots when optional metadata is absent.
-            if matches!(*column, "icon_key" | "delete_suggestion") && value == SqlValue::Null { break; }
-            values.push(encode_sql(&value).map_err(|_| rusqlite::Error::InvalidQuery)?);
-        }
-        Ok(values)
-    }).optional().map_err(|e|e.to_string())?;
-    match snapshot {None=>Ok(SqlValue::Null),Some(values)=>serde_json::to_string(&values).map(SqlValue::Text).map_err(|e|e.to_string())}
-}
-
-fn restore_snapshot(transaction:&Transaction<'_>,table:&str,row_key:&str,value:&SqlValue)->Result<(),String>{
-    let columns=snapshot_columns(transaction,table)?;let id=key_id(row_key)?;
-    if matches!(value,SqlValue::Null){transaction.execute(&format!("DELETE FROM {table} WHERE id=?1"),[id]).map_err(|e|e.to_string())?;return Ok(());}
-    let SqlValue::Text(snapshot)=value else{return Err("Invalid row snapshot value".into())};
-    let encoded:Vec<String>=serde_json::from_str(snapshot).map_err(|e|e.to_string())?;
-    let columns = if matches!(columns.last(), Some(&("icon_key" | "delete_suggestion"))) && encoded.len() + 1 == columns.len() {
-        &columns[..encoded.len()]
+fn set_asset_links(
+    tx: &Transaction<'_>, table: &str, column: &str, targets: &[AssetValueState], label_id: i64, assign: bool,
+) -> Result<usize, String> {
+    let sql = if assign {
+        format!("INSERT OR IGNORE INTO {table}(asset_id,{column}) VALUES(?1,?2)")
     } else {
-        if encoded.len() != columns.len() { return Err("Invalid row snapshot width".into()); }
-        columns
+        format!("DELETE FROM {table} WHERE asset_id=?1 AND {column}=?2")
     };
-    let values=encoded.iter().map(|item|decode_sql(item)).collect::<Result<Vec<_>,_>>()?;
-    let sql=format!("INSERT OR REPLACE INTO {table}({}) VALUES({})",columns.join(","),vec!["?";columns.len()].join(","));
-    transaction.execute(&sql,rusqlite::params_from_iter(values.iter())).map_err(|e|e.to_string())?;
+    let mut stmt = tx.prepare(&sql).map_err(|e| e.to_string())?;
+    let mut changed = 0;
+    for target in targets {
+        changed += stmt.execute((target.id, label_id)).map_err(|e| e.to_string())?;
+    }
+    Ok(changed)
+}
+
+fn update_column(tx: &Transaction<'_>, table: &str, id: i64, column: &str, value: impl rusqlite::ToSql) -> Result<bool, String> {
+    let count = tx.execute(&format!("UPDATE {table} SET {column}=?1 WHERE id=?2 AND {column} IS NOT ?1"), (value, id))
+        .map_err(|e| e.to_string())?;
+    Ok(count > 0)
+}
+
+fn table_exists(tx: &Transaction<'_>, table: &str) -> Result<bool, String> {
+    tx.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |r| r.get(0))
+        .map_err(|e| e.to_string())
+}
+
+fn delete_row(tx: &Transaction<'_>, table: &str, id: i64) -> Result<(), String> {
+    remember_id(tx, table, id)?;
+    tx.execute(&format!("DELETE FROM {table} WHERE id=?1"), [id]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn value_truth(value: &SqlValue) -> Result<bool, String> {
-    match value { SqlValue::Integer(value) => Ok(*value != 0), SqlValue::Null => Ok(false), _ => Err("Relationship journal values must be boolean or integer".into()) }
+fn remove_folder_rows(tx: &Transaction<'_>, folders: &[(i64, String, Option<i64>)]) -> Result<(), String> {
+    let ids = folders.iter().map(|row| row.0).collect::<Vec<_>>();
+    if let Some(&max_id) = ids.iter().max() { remember_id(tx, "folders", max_id)?; }
+    for chunk in ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        tx.execute(&format!("DELETE FROM folders WHERE id IN ({marks})"), rusqlite::params_from_iter(chunk))
+            .map_err(|e| e.to_string())?;
+    }
+    let roots = folders.iter().filter_map(|row| row.2).collect::<std::collections::HashSet<_>>();
+    for root in roots {
+        remember_id(tx, "folder_roots", root)?;
+        tx.execute("DELETE FROM folder_roots WHERE id=?1 AND NOT EXISTS(SELECT 1 FROM folders WHERE root_id=?1)", [root])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+// Deleted IDs can still be present in the AI index and in listing caches.
+pub(crate) fn remember_id(tx: &Transaction<'_>, table: &str, id: i64) -> Result<(), String> {
+    let key = format!("ddreams_last_deleted_{table}_id");
+    tx.execute("INSERT INTO meta(key,value) VALUES(?1,CAST(?2 AS TEXT)) ON CONFLICT(key) DO UPDATE SET value=excluded.value WHERE CAST(meta.value AS INTEGER) < ?2",
+        (key, id)).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn next_id(tx: &Transaction<'_>, table: &str) -> Result<i64, String> {
+    let key = format!("ddreams_last_deleted_{table}_id");
+    let (live, deleted): (i64, i64) = tx.query_row(
+        &format!("SELECT coalesce((SELECT max(id) FROM {table}),0), coalesce((SELECT CAST(value AS INTEGER) FROM meta WHERE key=?1),0)"),
+        [key], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).map_err(|e| e.to_string())?;
+    live.max(deleted).checked_add(1).ok_or_else(|| format!("ID limit reached for {table}"))
+}
+
+fn record_change(tx: &Transaction<'_>, action: &str, summary: &str) -> Result<Option<i64>, String> {
+    tx.execute("INSERT INTO ddreams_changes(ts,action,summary) VALUES(?1,?2,?3)", (iso_now(), action, summary))
+        .map_err(|e| e.to_string())?;
+    let id = tx.last_insert_rowid();
+    mark_catalog_modified(tx)?;
+    Ok(Some(id))
 }
 
 fn mark_catalog_modified(transaction: &Transaction<'_>) -> Result<(), String> {
@@ -1173,21 +1032,8 @@ mod tests {
     use super::*;
     use rusqlite::Connection;
 
-    #[test]
-    fn journal_change_hook_resync_kind_decision_covers_assignments_and_undo(){
-        assert_eq!(resync_kinds_for_tables(["asset_categories"]),vec!["category"]);
-        assert_eq!(resync_kinds_for_tables(["asset_keywords"]),vec!["keyword"]);
-        assert_eq!(resync_kinds_for_tables(["categories","asset_keywords"]),vec!["category","keyword"]);
-        assert!(resync_kinds_for_tables(["assets","asset_color_overrides"]).is_empty());
-    }
     use crate::db::Db;
     use std::sync::{Arc,Mutex};
-
-    fn fixture() -> Db {
-        let connection=Connection::open_in_memory().unwrap();
-        connection.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);INSERT INTO meta VALUES('catalog_modified','0');CREATE TABLE assets(id INTEGER PRIMARY KEY,rating INTEGER,label TEXT,tagged INTEGER);INSERT INTO assets VALUES(1,2,'Red',0);CREATE TABLE categories(id INTEGER PRIMARY KEY,name TEXT,parent_id INTEGER,root_id INTEGER);CREATE TABLE keywords(id INTEGER PRIMARY KEY,name TEXT,parent_id INTEGER);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER,PRIMARY KEY(asset_id,keyword_id));CREATE TABLE ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);CREATE TABLE ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT);CREATE INDEX idx_change_items_change ON ddreams_change_items(change_id);").unwrap();
-        Arc::new(Mutex::new(connection))
-    }
 
     fn write_fixture() -> Db {
         let mut connection=Connection::open_in_memory().unwrap();
@@ -1210,8 +1056,84 @@ mod tests {
     fn dump(db:&Db)->Vec<String>{let conn=db.lock().unwrap();let mut out=Vec::new();for sql in ["SELECT id||':'||coalesce(path,'')||':'||coalesce(rating,'') FROM assets ORDER BY id","SELECT asset_id||':'||category_id FROM asset_categories ORDER BY 1","SELECT asset_id||':'||keyword_id FROM asset_keywords ORDER BY 1","SELECT asset_id||':'||color||':'||state FROM asset_color_overrides ORDER BY 1"]{let mut s=conn.prepare(sql).unwrap();out.extend(s.query_map([],|r|r.get::<_,String>(0)).unwrap().map(|r|r.unwrap()));}out}
 
     #[test]
-    fn exclusion_removes_folder_rows_and_undo_restores_them(){
-        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);let before=dump(&db);
+    fn multi_file_writes_allocate_distinct_ids_and_keep_remaps() {
+        for operation in ["values", "category", "keyword", "create_keyword"] {
+            let db = keyword_fixture();
+            let writer = CatalogWriter::new(db.clone(), true);
+            let listed = [(-10, "Camera", "a.jpg"), (-11, "Mobile", "b.jpg")].map(|(temporary_id, folder, name)| ListedAsset {
+                temporary_id, name: name.into(), ext: "jpg".into(), size: Some(5.0), file_modified: None,
+                path: format!(r"G:\{folder}\{name}"), folder_path: format!(r"G:\{folder}"),
+            });
+            let ids = [-10, -11];
+            let remaps = match operation {
+                "values" => writer.set_asset_values(&ids, &listed, &serde_json::Map::from_iter([("rating".into(), Value::from(3))])).unwrap().remapped_ids,
+                "category" => writer.set_asset_categories(&ids, &listed, 11, true).unwrap().remapped_ids,
+                "keyword" => writer.set_asset_keywords(&ids, &listed, 10, true).unwrap().remapped_ids,
+                _ => writer.create_and_assign_keyword(&ids, &listed, None, "Nové").unwrap().remapped_ids,
+            };
+            assert_eq!(remaps.iter().map(|r| (r.old_id, r.new_id)).collect::<Vec<_>>(), [(-11, 3), (-10, 4)], "{operation}");
+            let conn = db.lock().unwrap();
+            let sql = match operation {
+                "values" => "SELECT count(*) FROM assets WHERE id IN (3,4) AND rating=3",
+                "category" => "SELECT count(*) FROM asset_categories WHERE asset_id IN (3,4) AND category_id=11",
+                "keyword" => "SELECT count(*) FROM asset_keywords WHERE asset_id IN (3,4) AND keyword_id=10",
+                _ => "SELECT count(*) FROM asset_keywords WHERE asset_id IN (3,4) AND keyword_id=(SELECT id FROM keywords WHERE name='Nové')",
+            };
+            assert_eq!(conn.query_row(sql, [], |r| r.get::<_, i64>(0)).unwrap(), 2, "{operation}");
+            assert_eq!(conn.query_row("SELECT count(*) FROM folder_roots WHERE name='G:'", [], |r| r.get::<_, i64>(0)).unwrap(), 1, "{operation}");
+            assert_eq!(conn.query_row("SELECT count(DISTINCT folder_id) FROM assets WHERE id IN (3,4)", [], |r| r.get::<_, i64>(0)).unwrap(), 2, "{operation}");
+        }
+    }
+
+    #[test]
+    fn folder_rewrite_handles_trailing_slashes_and_unicode_prefix_widths() {
+        let db = write_fixture();
+        {
+            let conn = db.lock().unwrap();
+            conn.execute("UPDATE folders SET path=?1 WHERE id=2", [r"F:\Kút\"]).unwrap();
+            conn.execute("UPDATE assets SET path=?1 WHERE id=1", [r"f:/Kút/Sub/Čaj.JPG"]).unwrap();
+            conn.execute("UPDATE assets SET path=?1 WHERE id=2", [r"F:\Kút_old\Two.jpg"]).unwrap();
+            conn.execute_batch("CREATE TABLE ddreams_folder_rules(path TEXT PRIMARY KEY,mode TEXT,created TEXT);").unwrap();
+            conn.execute("INSERT INTO ddreams_folder_rules VALUES(?1,'include','now')", [r"F:\Kút\Ľudia"]).unwrap();
+        }
+        let writer = CatalogWriter::new(db.clone(), true);
+        writer.rewrite_folder_paths(r"F:\kút///", r"G:/Nový/", "rename_folder", "Premenovaný priečinok").unwrap();
+        let conn = db.lock().unwrap();
+        for (sql, expected) in [
+            ("SELECT path FROM folders WHERE id=2", r"G:\Nový"),
+            ("SELECT name FROM folders WHERE id=2", "Nový"),
+            ("SELECT path FROM assets WHERE id=1", r"G:\Nový\Sub\Čaj.JPG"),
+            ("SELECT path FROM assets WHERE id=2", r"F:\Kút_old\Two.jpg"),
+            ("SELECT path FROM ddreams_folder_rules", r"G:\Nový\Ľudia"),
+        ] {
+            assert_eq!(conn.query_row(sql, [], |r| r.get::<_, String>(0)).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn label_writes_notify_both_kinds_and_keep_legacy_history_details() {
+        let db = keyword_fixture();
+        db.lock().unwrap().execute_batch(
+            "INSERT INTO ddreams_changes VALUES(1,'2000-01-01','old','Starý záznam',1);
+             INSERT INTO ddreams_change_items VALUES(1,'assets','1','rating','old','new');"
+        ).unwrap();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let observed = calls.clone();
+        writer.set_change_hook(Arc::new(move |kinds| observed.lock().unwrap().extend(kinds.iter().map(|kind| kind.to_string()))));
+        writer.set_asset_categories(&[1], &[], 11, true).unwrap();
+        writer.set_asset_keywords(&[2], &[], 10, true).unwrap();
+        writer.set_asset_keywords(&[2], &[], 10, true).unwrap();
+        assert_eq!(*calls.lock().unwrap(), ["category", "keyword"]);
+        assert_eq!(writer.recent_changes(5).unwrap().len(), 2);
+        let conn = db.lock().unwrap();
+        assert_eq!(conn.query_row("SELECT count(*) FROM ddreams_changes", [], |r| r.get::<_, i64>(0)).unwrap(), 3);
+        assert_eq!(conn.query_row("SELECT count(*) FROM ddreams_change_items", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+    }
+
+    #[test]
+    fn exclusion_removes_only_rows_under_the_folder(){
+        let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
         assert_eq!(writer.exclusion_impact("f:/photos/").unwrap(),ExclusionImpact{files:2,with_categories:1,with_keywords:2,with_rating_label_tagged:2,with_color_overrides:1});
         let removed=writer.set_folder_rule("F:\\Photos",Some("exclude")).unwrap();
         assert_eq!(removed,vec![1,2]);
@@ -1219,11 +1141,6 @@ mod tests {
         assert!(after.contains(&"4:F:\\Photos_old\\p_1%.jpg:".to_string()),"component boundary: Photos_old must stay");
         assert_eq!(writer.folder_rule_state("F:\\Photos\\sub").unwrap().effective.as_deref(),Some("exclude"));
         assert!(writer.set_asset_values(&[3],&[],&serde_json::Map::from_iter([("rating".to_string(),serde_json::json!(3))])).is_ok());
-        writer.undo_last_with(|_|Ok(())).unwrap();
-        // undo of the rating change above, then of the exclusion
-        writer.undo_last_with(|_|Ok(())).unwrap();
-        assert_eq!(dump(&db),before);
-        assert_eq!(writer.folder_rules().unwrap().len(),1,"the rule is configuration and survives undo");
     }
 
     #[test]
@@ -1233,7 +1150,7 @@ mod tests {
     }
 
     #[test]
-    fn auto_catalog_adds_listed_files_once_and_is_undoable(){
+    fn auto_catalog_adds_listed_files_once(){
         let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let listed=|id:i64,name:&str|ListedAsset{temporary_id:id,name:name.into(),ext:"jpg".into(),size:Some(5.0),file_modified:None,path:format!("F:\\Inbox\\{name}"),folder_path:"F:\\Inbox".into()};
         let remaps=writer.catalog_listed_assets(&[listed(-10,"a.jpg"),listed(-11,"b.jpg")]).unwrap();
@@ -1241,9 +1158,6 @@ mod tests {
         assert!(writer.catalog_listed_assets(&[listed(-12,"a.jpg")]).unwrap().is_empty(),"already catalogued by path");
         let summary:String=db.lock().unwrap().query_row("SELECT summary FROM ddreams_changes ORDER BY id DESC LIMIT 1",[],|r|r.get(0)).unwrap();
         assert_eq!(summary,"Pridané do katalógu: 2 súbory");
-        writer.undo_last_with(|_|Ok(())).unwrap();
-        let count:i64=db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE 'F:\\Inbox%'",[],|r|r.get(0)).unwrap();
-        assert_eq!(count,0);
     }
 
     #[test]
@@ -1258,52 +1172,11 @@ mod tests {
     fn keyword_rows(db:&Db)->Vec<(i64,i64)>{let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT asset_id,keyword_id FROM asset_keywords ORDER BY asset_id,keyword_id").unwrap();stmt.query_map([],|r|Ok((r.get(0)?,r.get(1)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()}
 
     #[test]
-    fn journal_records_change_and_undo_restores_exact_value() {
-        let db=fixture(); let writer=CatalogWriter::new(db.clone(),true);
-        let mut change=writer.begin_change("rating","Set rating");
-        change.record("assets","1","rating",Value::from(2),Value::from(5));
-        let id=writer.commit_change(change).unwrap();
-        assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),5);
-        let recent=writer.recent_changes(5).unwrap(); assert_eq!(recent[0].id,id); assert!(!recent[0].undone);
-        let undone=writer.undo_last().unwrap().unwrap(); assert_eq!(undone.id,id);
-        assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),2);
-        assert!(writer.recent_changes(5).unwrap()[0].undone);
-    }
-
-    #[test]
-    fn color_override_change_is_journaled_and_undo_removes_it() {
+    fn color_override_updates_only_listed_assets() {
         let db=write_fixture();db.lock().unwrap().execute_batch("CREATE TABLE asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL,PRIMARY KEY(asset_id,color));").unwrap();
         let writer=CatalogWriter::new(db.clone(),true);
         assert_eq!(writer.set_asset_colors(&[1,999],"zelená",Some(true),"Farba: zelená").unwrap(),1);
         assert_eq!(db.lock().unwrap().query_row("SELECT state FROM asset_color_overrides WHERE asset_id=1 AND color='zelená'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        writer.undo_last().unwrap();
-        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_color_overrides",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-    }
-
-    #[test]
-    fn relationship_journal_restores_link_existence() {
-        let db=fixture(); db.lock().unwrap().execute("INSERT INTO categories(id,name) VALUES(7,'Test')",[]).unwrap();
-        let writer=CatalogWriter::new(db.clone(),true); let mut change=writer.begin_change("category","Assign category");
-        change.record("asset_categories","1:7","__exists__",Value::Bool(false),Value::Bool(true)); writer.commit_change(change).unwrap();
-        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories",[],|row|row.get::<_,i64>(0)).unwrap(),1);
-        writer.undo_last().unwrap();
-        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories",[],|row|row.get::<_,i64>(0)).unwrap(),0);
-    }
-
-    #[test]
-    fn readonly_writer_refuses_commit_and_undo() {
-        let root=std::env::temp_dir().join(format!("ddreams-readonly-{}-{}",std::process::id(),SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
-        std::fs::create_dir_all(&root).unwrap(); let path=root.join("catalog.sqlite");
-        let conn=Connection::open(&path).unwrap();
-        conn.execute_batch("CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT);INSERT INTO meta VALUES('catalog_modified','0');CREATE TABLE assets(id INTEGER PRIMARY KEY,rating INTEGER);INSERT INTO assets VALUES(1,2);").unwrap(); drop(conn);
-        let db: Db=Arc::new(Mutex::new(crate::db::open_catalog(&path,true).unwrap()));
-        let writer=CatalogWriter::new(db.clone(),false); let mut change=writer.begin_change("rating","Set rating");
-        change.record("assets","1","rating",Value::from(2),Value::from(5));
-        assert!(writer.commit_change(change).unwrap_err().contains("read-only"));
-        assert!(writer.undo_last().unwrap_err().contains("read-only"));
-        assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),2);
-        assert!(db.lock().unwrap().execute("UPDATE assets SET rating=5 WHERE id=1",[]).is_err());
-        drop(db); let _=std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1315,17 +1188,11 @@ mod tests {
         let connection=db.lock().unwrap();
         assert_eq!(connection.query_row("SELECT count(*) FROM ddreams_changes",[],|row|row.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(connection.query_row("SELECT count(*) FROM assets WHERE rating=5 AND label='Blue'",[],|row|row.get::<_,i64>(0)).unwrap(),2);
-        drop(connection);writer.undo_last().unwrap();
-        let connection=db.lock().unwrap();
-        assert_eq!(connection.query_row("SELECT rating||':'||coalesce(label,'NULL') FROM assets WHERE id=1",[],|row|row.get::<_,String>(0)).unwrap(),"2:Red");
-        assert_eq!(connection.query_row("SELECT rating||':'||coalesce(label,'NULL') FROM assets WHERE id=2",[],|row|row.get::<_,String>(0)).unwrap(),"4:NULL");
         drop(connection);
         let single_changes=serde_json::Map::from_iter([("rating".into(),Value::from(1))]);
         let single=writer.set_asset_values(&[1],&[],&single_changes).unwrap();
         assert!(single.summary.contains("1 súbor"));
         assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),1);
-        writer.undo_last().unwrap();
-        assert_eq!(db.lock().unwrap().query_row("SELECT rating FROM assets WHERE id=1",[],|row|row.get::<_,i64>(0)).unwrap(),2);
     }
 
     #[test]
@@ -1339,17 +1206,13 @@ mod tests {
     }
 
     #[test]
-    fn uncatalogued_listed_asset_is_inserted_and_undo_removes_asset_and_created_folders() {
+    fn uncatalogued_listed_asset_is_inserted_with_its_folder() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let candidate=ListedAsset{temporary_id:-10,name:"new.jpg".into(),ext:"jpg".into(),size:Some(789.0),file_modified:Some("2024-03-04T00:00:00Z".into()),path:"G:\\Camera\\new.jpg".into(),folder_path:"G:\\Camera".into()};
         let changes=serde_json::Map::from_iter([("rating".into(),Value::from(3))]);
         let result=writer.set_asset_values(&[-10],&[candidate],&changes).unwrap();let inserted=result.remapped_ids[0].new_id;
         assert_eq!(db.lock().unwrap().query_row("SELECT name||':'||rating FROM assets WHERE id=?1",[inserted],|row|row.get::<_,String>(0)).unwrap(),"new.jpg:3");
-        writer.undo_last().unwrap();
-        let connection=db.lock().unwrap();
-        assert_eq!(connection.query_row("SELECT count(*) FROM assets WHERE id=?1",[inserted],|row|row.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(connection.query_row("SELECT count(*) FROM folders WHERE path='G:\\Camera'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(connection.query_row("SELECT count(*) FROM folder_roots WHERE name='G:'",[],|row|row.get::<_,i64>(0)).unwrap(),0);
+        assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM folders WHERE path=?1", [r"G:\Camera"], |r| r.get::<_, i64>(0)).unwrap(), 1);
     }
 
     #[test]
@@ -1361,7 +1224,7 @@ mod tests {
     }
 
     #[test]
-    fn category_assignment_is_partial_idempotent_and_undo_restores_exact_rows() {
+    fn category_assignment_is_partial_idempotent_and_removable() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
         db.lock().unwrap().execute("INSERT INTO asset_categories VALUES(1,11)",[]).unwrap();
         let assigned=writer.set_asset_categories(&[1,2],&[],11,true).unwrap();
@@ -1370,9 +1233,7 @@ mod tests {
         let journal_count=db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap();
         let no_op=writer.set_asset_categories(&[1,2],&[],11,true).unwrap();assert_eq!(no_op.change_id,None);assert_eq!(no_op.changed_count,0);
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),journal_count);
-        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT group_concat(asset_id,',') FROM asset_categories WHERE category_id=11",[],|r|r.get::<_,String>(0)).unwrap(),"1");
-        let removed=writer.set_asset_categories(&[1,2],&[],11,false).unwrap();assert_eq!(removed.changed_count,1);assert!(removed.summary.contains("Vyradené z Rodina › Deti · 1 súbor"));
-        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories WHERE category_id=11",[],|r|r.get::<_,i64>(0)).unwrap(),1);
+        let removed=writer.set_asset_categories(&[1,2],&[],11,false).unwrap();assert_eq!(removed.changed_count,2);assert!(removed.summary.contains("Vyradené z Rodina › Deti · 2 súbory"));
     }
 
     #[test]
@@ -1381,19 +1242,14 @@ mod tests {
         let result=writer.set_asset_categories(&[1,2],&[],10,true).unwrap();
         assert_eq!(result.summary,"Zaradené do Rodina · 2 súbory");
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),1);
-        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[test]
-    fn category_assignment_of_uncatalogued_file_is_journaled_and_undo_removes_it() {
+    fn category_assignment_of_uncatalogued_file_creates_link() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let candidate=ListedAsset{temporary_id:-10,name:"new.jpg".into(),ext:"jpg".into(),size:Some(789.0),file_modified:None,path:"G:\\Camera\\new.jpg".into(),folder_path:"G:\\Camera".into()};
         let result=writer.set_asset_categories(&[-10],&[candidate],11,true).unwrap();let id=result.remapped_ids[0].new_id;
         assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1 AND category_id=11",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
-        writer.undo_last().unwrap();let conn=db.lock().unwrap();
-        assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
-        assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE path='G:\\Camera'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[test]
@@ -1412,14 +1268,12 @@ mod tests {
     }
 
     #[test]
-    fn create_top_level_and_subcategory_are_journaled_and_undoable() {
+    fn create_top_level_and_subcategory_stores_hierarchy() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let top=writer.create_category(None,"Nové",None).unwrap();let top_id=top.category_id.unwrap();let root_id=top.root_id.unwrap();
         assert_eq!(top.summary,"Nová kategória Nové");assert_eq!(db.lock().unwrap().query_row("SELECT name FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,String>(0)).unwrap(),"Nové");
-        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM category_roots WHERE id=?1",[root_id],|r|r.get::<_,i64>(0)).unwrap(),0);
         let sub=writer.create_category(Some(10)," Vnúčatá ",None).unwrap();let sub_id=sub.category_id.unwrap();
         assert_eq!(sub.summary,"Nová kategória Rodina › Vnúčatá");assert_eq!(sub.root_id,Some(1));assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
-        writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id=?1",[sub_id],|r|r.get::<_,i64>(0)).unwrap(),0);
         assert!(top_id>0);
     }
 
@@ -1435,11 +1289,10 @@ mod tests {
     }
 
     #[test]
-    fn renaming_top_level_keeps_root_pair_consistent_and_undo_restores_both() {
+    fn renaming_top_level_keeps_root_pair_consistent() {
         let db=write_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let result=writer.rename_category(10,"Domov").unwrap();assert_eq!(result.summary,"Premenované Rodina → Domov");
         {let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT name FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"Domov");assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Domov");}
-        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT name FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");
     }
 
     #[test]
@@ -1447,11 +1300,10 @@ mod tests {
         let db=write_fixture();db.lock().unwrap().execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(12,11,1,'Mladí')",[]).unwrap();let writer=CatalogWriter::new(db.clone(),true);
         let result=writer.move_category(11,None).unwrap();let new_root=result.root_id.unwrap();
         let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=11",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),new_root);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,String>(0)).unwrap(),"Deti");drop(conn);
-        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=11",[],|r|r.get::<_,String>(0)).unwrap(),"10:1");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=?1",[new_root],|r|r.get::<_,i64>(0)).unwrap(),0);
     }
 
     #[test]
-    fn deletion_suggestions_are_batched_undoable_and_preserve_keep_decisions() {
+    fn deletion_suggestions_are_batched_and_preserve_keep_decisions() {
         let db = write_fixture();
         db.lock().unwrap().execute("ALTER TABLE assets ADD COLUMN delete_suggestion INTEGER", []).unwrap();
         let writer = CatalogWriter::new(db.clone(), true);
@@ -1461,31 +1313,18 @@ mod tests {
         let folder = r"F:\Photos";
         let batch = [(1, true), (2, true)];
         assert!(writer.suggest_deletions(r"F:\Elsewhere", &batch, &formats).unwrap().change_id.is_none());
-        let change = writer.suggest_deletions(folder, &batch, &formats).unwrap().change_id.unwrap();
+        assert!(writer.suggest_deletions(folder, &batch, &formats).unwrap().change_id.is_some());
         assert_eq!((state(1), state(2)), (Some(1), Some(1)));
-        assert_eq!(writer.undo_last().unwrap().unwrap().id, change);
-        assert_eq!((state(1), state(2)), (None, None));
-        writer.suggest_deletions(folder, &batch, &formats).unwrap();
-
         writer.keep_suggested_assets(Some(&[1])).unwrap();
         assert_eq!((state(1), state(2)), (Some(0), Some(1)));
         assert!(writer.suggest_deletions(folder, &batch, &formats).unwrap().change_id.is_none());
         writer.keep_suggested_assets(None).unwrap();
         assert_eq!((state(1), state(2)), (Some(0), Some(0)));
-        writer.undo_last().unwrap();
-        assert_eq!((state(1), state(2)), (Some(0), Some(1)));
-        writer.undo_last().unwrap();
-        assert_eq!((state(1), state(2)), (Some(1), Some(1)));
-
-        writer.suggest_deletions(folder, &[(1, false)], &formats).unwrap();
-        assert_eq!(state(1), None);
-        writer.undo_last().unwrap();
-        assert_eq!(state(1), Some(1));
         assert!(CatalogWriter::new(db.clone(), false).keep_suggested_assets(None).is_err());
     }
 
     #[test]
-    fn category_icons_undo_to_null_and_restore_the_explicit_key() {
+    fn category_icons_set_clear_and_keep_root_pair() {
         let db = write_fixture();
         let writer = CatalogWriter::new(db.clone(), true);
         let icon = |table: &str, id: i64| {
@@ -1498,23 +1337,14 @@ mod tests {
         assert!(writer.set_category_icon(11, false, Some("camera")).unwrap().change_id.is_none());
         writer.set_category_icon(11, false, None).unwrap();
         assert_eq!(icon("categories", 11), None);
-        writer.undo_last().unwrap();
-        assert_eq!(icon("categories", 11).as_deref(), Some("camera"));
-        writer.undo_last().unwrap();
-        assert_eq!(icon("categories", 11), None);
 
         writer.set_category_icon(1, true, Some("people")).unwrap();
         assert_eq!(icon("category_roots", 1).as_deref(), Some("people"));
         assert_eq!(icon("categories", 10).as_deref(), Some("people"));
-        writer.undo_last().unwrap();
-        assert_eq!(icon("category_roots", 1), None);
-        assert_eq!(icon("categories", 10), None);
 
         db.lock().unwrap().execute("INSERT INTO category_roots(id,name) VALUES(2,'Miesta')", []).unwrap();
         writer.set_category_icon(2, true, Some("places")).unwrap();
         assert_eq!(icon("category_roots", 2).as_deref(), Some("places"));
-        writer.undo_last().unwrap();
-        assert_eq!(icon("category_roots", 2), None);
 
         let readonly = CatalogWriter::new(db.clone(), false);
         assert!(readonly.set_category_icon(11, false, Some("camera")).unwrap_err().contains("read-only"));
@@ -1522,7 +1352,7 @@ mod tests {
     }
 
     #[test]
-    fn category_icon_survives_delete_undo_and_creation_can_be_undone() {
+    fn create_category_stores_icon_and_delete_removes_empty_root() {
         let db = write_fixture();
         let writer = CatalogWriter::new(db.clone(), true);
         let created = writer.create_category(None, "Výlety", Some("travel")).unwrap();
@@ -1533,20 +1363,13 @@ mod tests {
         );
         assert_eq!(root_icon().unwrap(), "travel");
         writer.delete_category(category_id).unwrap();
-        writer.undo_last().unwrap();
-        assert_eq!(root_icon().unwrap(), "travel");
-        assert_eq!(db.lock().unwrap().query_row(
-            "SELECT icon_key FROM categories WHERE id=?1", [category_id], |row| row.get::<_, String>(0),
-        ).unwrap(), "travel");
-        writer.undo_last().unwrap();
         assert!(matches!(root_icon(), Err(rusqlite::Error::QueryReturnedNoRows)));
     }
 
     #[test]
-    fn moving_top_level_under_another_category_removes_empty_root_and_undo_restores_tree() {
+    fn moving_top_level_under_another_category_removes_empty_root() {
         let db=write_fixture();db.lock().unwrap().execute_batch("INSERT INTO category_roots(id,name) VALUES(2,'Priatelia');INSERT INTO categories(id,parent_id,root_id,name) VALUES(20,NULL,2,'Priatelia'),(21,20,2,'Blízki'),(12,11,1,'Mladí');").unwrap();let writer=CatalogWriter::new(db.clone(),true);
         writer.move_category(10,Some(21)).unwrap();{let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id||':'||root_id FROM categories WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"21:2");assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),2);assert_eq!(conn.query_row("SELECT count(*) FROM category_roots WHERE id=1",[],|r|r.get::<_,i64>(0)).unwrap(),0);}
-        writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT parent_id FROM categories WHERE id=10",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=10",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT root_id FROM categories WHERE id=12",[],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(conn.query_row("SELECT name FROM category_roots WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),"Rodina");
     }
 
     #[test]
@@ -1563,11 +1386,9 @@ mod tests {
     }
 
     #[test]
-    fn delete_subtree_and_undo_restores_category_rows_exactly() {
+    fn delete_subtree_keeps_parent_category() {
         let db=write_fixture();db.lock().unwrap().execute("INSERT INTO categories(id,parent_id,root_id,name) VALUES(12,11,1,'Mladí')",[]).unwrap();let writer=CatalogWriter::new(db.clone(),true);
-        let before={let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),coalesce(root_id,-1),name FROM categories WHERE id>=10 ORDER BY id").unwrap();stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()};
         let deleted=writer.delete_category(11).unwrap();assert_eq!(deleted.deleted_category_ids.len(),2);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM categories WHERE id IN (11,12)",[],|r|r.get::<_,i64>(0)).unwrap(),0);
-        writer.undo_last().unwrap();let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),coalesce(root_id,-1),name FROM categories WHERE id>=10 ORDER BY id").unwrap();let after=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,i64>(2)?,r.get::<_,String>(3)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();assert_eq!(before,after);
     }
 
     #[test]
@@ -1578,43 +1399,42 @@ mod tests {
     }
 
     #[test]
-    fn keyword_assignment_partial_unassign_noop_and_undo_are_exact(){
-        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let before=keyword_rows(&db);
+    fn keyword_assignment_partial_unassign_and_noop(){
+        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let added=writer.set_asset_keywords(&[1,2],&[],10,true).unwrap();assert_eq!(added.changed_count,1);assert_eq!(added.summary,"Pridané kľúčové slovo Vianoce · 1 súbor");
         let after=keyword_rows(&db);assert_eq!(after,vec![(1,10),(2,10),(2,12)]);
         let changes=db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap();let noop=writer.set_asset_keywords(&[1,2],&[],10,true).unwrap();assert_eq!(noop.change_id,None);assert_eq!(noop.changed_count,0);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),changes);
-        writer.undo_last().unwrap();assert_eq!(keyword_rows(&db),before);
-        let removed=writer.set_asset_keywords(&[1],&[],10,false).unwrap();assert_eq!(removed.summary,"Odobrané kľúčové slovo Vianoce · 1 súbor");writer.undo_last().unwrap();assert_eq!(keyword_rows(&db),before);
+        let removed=writer.set_asset_keywords(&[1],&[],10,false).unwrap();assert_eq!(removed.summary,"Odobrané kľúčové slovo Vianoce · 1 súbor");assert_eq!(keyword_rows(&db),vec![(2,10),(2,12)]);
         assert_eq!(writer.set_asset_keywords(&[1,2],&[],20,true).unwrap().summary,"Pridané kľúčové slovo Rodina · 2 súbory");
     }
 
     #[test]
-    fn keyword_create_rename_move_collisions_cycles_and_undo(){
+    fn keyword_create_rename_move_collisions_and_cycles(){
         let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);
-        assert_eq!(writer.create_keyword(None," Výlety ").unwrap().summary,"Nové kľúčové slovo Výlety");let created:i64=db.lock().unwrap().query_row("SELECT id FROM keywords WHERE name='Výlety'",[],|r|r.get(0)).unwrap();writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM keywords WHERE id=?1",[created],|r|r.get::<_,i64>(0)).unwrap(),0);
-        let nested=writer.create_keyword(Some(10),"Deti");assert!(nested.is_err());let nested=writer.create_keyword(Some(10),"Oslava").unwrap();let nested_id=nested.keyword_id.unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=?1",[nested_id],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM keywords WHERE id=?1",[nested_id],|r|r.get::<_,i64>(0)).unwrap(),0);
-        let renamed=writer.rename_keyword(10,"Sviatky").unwrap();assert_eq!(renamed.summary,"Premenované Vianoce → Sviatky");writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT name FROM keywords WHERE id=10",[],|r|r.get::<_,String>(0)).unwrap(),"Vianoce");
+        assert_eq!(writer.create_keyword(None," Výlety ").unwrap().summary,"Nové kľúčové slovo Výlety");
+        let nested=writer.create_keyword(Some(10),"Deti");assert!(nested.is_err());let nested=writer.create_keyword(Some(10),"Oslava").unwrap();let nested_id=nested.keyword_id.unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=?1",[nested_id],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
+        let renamed=writer.rename_keyword(10,"Sviatky").unwrap();assert_eq!(renamed.summary,"Premenované Vianoce → Sviatky");
         assert!(writer.create_keyword(None," rodina ").unwrap_err().contains("už existuje kľúčové slovo"));assert!(writer.create_keyword(Some(10)," dEtI ").unwrap_err().contains("už existuje kľúčové slovo"));
         assert!(writer.move_keyword(10,Some(12)).unwrap_err().contains("podriadeného"));
-        writer.move_keyword(11,None).unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
-        writer.move_keyword(20,Some(10)).unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=20",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));writer.undo_last().unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=20",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);
+        writer.move_keyword(11,None).unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=11",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),None);
+        writer.move_keyword(20,Some(10)).unwrap();assert_eq!(db.lock().unwrap().query_row("SELECT parent_id FROM keywords WHERE id=20",[],|r|r.get::<_,Option<i64>>(0)).unwrap(),Some(10));
     }
 
     #[test]
-    fn keyword_delete_refuses_descendant_links_then_subtree_delete_undo_restores_exact_rows(){
+    fn keyword_delete_refuses_descendant_links_then_removes_subtree(){
         let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let info=writer.keyword_delete_info(10).unwrap();assert_eq!(info.assigned_files,2);assert_eq!(info.subkeywords,2);assert!(writer.delete_keyword(10).unwrap_err().contains("obsahuje 2 súbory"));
-        db.lock().unwrap().execute("DELETE FROM asset_keywords",[]).unwrap();let before={let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),name FROM keywords ORDER BY id").unwrap();stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()};
-        let deleted=writer.delete_keyword(10).unwrap();assert_eq!(deleted.deleted_keyword_ids.len(),3);writer.undo_last().unwrap();let conn=db.lock().unwrap();let mut stmt=conn.prepare("SELECT id,coalesce(parent_id,-1),name FROM keywords ORDER BY id").unwrap();let after=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?,r.get::<_,String>(2)?))).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();assert_eq!(before,after);
+        db.lock().unwrap().execute("DELETE FROM asset_keywords",[]).unwrap();
+        let deleted=writer.delete_keyword(10).unwrap();assert_eq!(deleted.deleted_keyword_ids.len(),3);assert_eq!(db.lock().unwrap().query_row("SELECT id FROM keywords", [], |r| r.get::<_, i64>(0)).unwrap(), 20);
     }
 
     #[test]
-    fn create_and_assign_keyword_is_one_change_and_undo_removes_keyword_and_links(){
-        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let before=keyword_rows(&db);let count_before=db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap();let result=writer.create_and_assign_keyword(&[1,2],&[],None,"Rodinné").unwrap();assert!(result.summary.starts_with("Nové kľúčové slovo Rodinné a priradené · 2 súbory"));assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),count_before+1);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_keywords WHERE keyword_id=?1",[result.keyword_id.unwrap()],|r|r.get::<_,i64>(0)).unwrap(),2);writer.undo_last().unwrap();assert_eq!(keyword_rows(&db),before);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM keywords WHERE name='Rodinné'",[],|r|r.get::<_,i64>(0)).unwrap(),0);
+    fn create_and_assign_keyword_is_one_change(){
+        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let count_before=db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap();let result=writer.create_and_assign_keyword(&[1,2],&[],None,"Rodinné").unwrap();assert!(result.summary.starts_with("Nové kľúčové slovo Rodinné a priradené · 2 súbory"));assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM ddreams_changes",[],|r|r.get::<_,i64>(0)).unwrap(),count_before+1);assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_keywords WHERE keyword_id=?1",[result.keyword_id.unwrap()],|r|r.get::<_,i64>(0)).unwrap(),2);
     }
 
     #[test]
-    fn uncatalogued_keyword_assignment_and_undo_removes_asset_folder_and_link(){
-        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let candidate=ListedAsset{temporary_id:-10,name:"new.jpg".into(),ext:"jpg".into(),size:Some(789.0),file_modified:None,path:"G:\\Camera\\new.jpg".into(),folder_path:"G:\\Camera".into()};let result=writer.set_asset_keywords(&[-10],&[candidate],10,true).unwrap();let id=result.remapped_ids[0].new_id;assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_keywords WHERE asset_id=?1 AND keyword_id=10",[id],|r|r.get::<_,i64>(0)).unwrap(),1);writer.undo_last().unwrap();let conn=db.lock().unwrap();assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);assert_eq!(conn.query_row("SELECT count(*) FROM folders WHERE path='G:\\Camera'",[],|r|r.get::<_,i64>(0)).unwrap(),0);assert_eq!(conn.query_row("SELECT count(*) FROM asset_keywords WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),0);
+    fn uncatalogued_keyword_assignment_creates_asset_and_link(){
+        let db=keyword_fixture();let writer=CatalogWriter::new(db.clone(),true);let candidate=ListedAsset{temporary_id:-10,name:"new.jpg".into(),ext:"jpg".into(),size:Some(789.0),file_modified:None,path:"G:\\Camera\\new.jpg".into(),folder_path:"G:\\Camera".into()};let result=writer.set_asset_keywords(&[-10],&[candidate],10,true).unwrap();let id=result.remapped_ids[0].new_id;assert_eq!(db.lock().unwrap().query_row("SELECT count(*) FROM asset_keywords WHERE asset_id=?1 AND keyword_id=10",[id],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 
     #[test]

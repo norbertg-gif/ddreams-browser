@@ -274,9 +274,6 @@ pub fn ai_face_thumbs(ai:State<'_,AiState>,face_ids:Vec<i64>)->Result<Vec<AiFace
 pub fn ai_cluster_ignore(state:State<'_,AiState>,asset_ids:Vec<i64>)->Result<usize,String>{state.0.cluster_ignore(&asset_ids)}
 #[tauri::command(async)]
 pub fn ai_cluster_ignore_reset(state:State<'_,AiState>)->Result<usize,String>{state.0.cluster_ignore_reset()}
-#[tauri::command(async)]
-pub fn ai_sync_labels(state:State<'_,AiState>,kind:String)->Result<(),String>{if kind!="category"&&kind!="keyword"{return Err("Neplatný typ štítku".into())}state.0.sync_labels_debounced(&kind);Ok(())}
-
 #[derive(Serialize,Clone)]
 #[serde(rename_all="camelCase")]
 pub struct ColorCount { pub value:String,pub name:String,pub hex:String,pub count:usize }
@@ -388,11 +385,6 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
     state.0.recent_changes(limit)
 }
 
-#[tauri::command]
-pub async fn undo_last_change(state: State<'_, FileManagerState>,ai:State<'_,AiState>) -> Result<Option<ChangeSummary>, String> {
-    let manager=state.0.clone();let change=tauri::async_runtime::spawn_blocking(move||manager.undo_last_change()).await.map_err(|e|e.to_string())??;if change.as_ref().is_some_and(|item|item.action=="set_asset_colors"||item.action=="import_photosort_colors"){ai.0.learn_colors_debounced();}if change.as_ref().is_some_and(|item|item.action.contains("categor")||item.action.contains("keyword")){ai.0.sync_labels_debounced("category");ai.0.sync_labels_debounced("keyword");}Ok(change)
-}
-
 #[tauri::command(async)]
 pub fn get_file_operation_conflicts(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String)->Result<usize,String>{state.0.preview_conflicts(&asset_ids,&target_folder_path,None)}
 #[tauri::command]
@@ -466,7 +458,7 @@ pub fn get_asset_labels(state: State<'_, DatabaseState>, listing: State<'_, List
 
 #[tauri::command(async)]
 pub fn set_asset_categories(
-    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>, ai:State<'_,AiState>, asset_ids: Vec<i64>, category_id: i64, assign: bool,
+    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, category_id: i64, assign: bool,
 ) -> Result<SetAssetCategoriesResult, String> {
     let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id|*id<0){
@@ -477,7 +469,6 @@ pub fn set_asset_categories(
         candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);
     }
     let result=state.0.set_asset_categories(&file_ids,&candidates,category_id,assign)?;
-    if result.changed_count>0{ai.0.sync_labels_debounced("category");}
     for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}
     for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}
     Ok(result)
@@ -523,10 +514,10 @@ pub fn get_category_delete_info(state:State<'_,CatalogWriterState>,id:i64)->Resu
 pub fn delete_category(state:State<'_,CatalogWriterState>,id:i64)->Result<CategoryMutationResult,String>{state.0.delete_category(id)}
 
 #[tauri::command(async)]
-pub fn set_asset_keywords(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
+pub fn set_asset_keywords(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,keyword_id:i64,assign:bool)->Result<SetAssetKeywordsResult,String>{
     let mut candidates=Vec::new();let mut file_ids=asset_ids.iter().copied().filter(|id|*id>=0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id|*id<0){let Some(asset)=listing.0.asset(id)else{continue};if asset.is_directory||asset.ext.is_empty(){continue;}let path=asset.path.ok_or_else(||format!("Listed file {id} has no resolved path"))?;let folder_path=Path::new(&path).parent().map(|p|p.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;candidates.push(ListedAsset{temporary_id:id,name:asset.name,ext:asset.ext,size:asset.size,file_modified:asset.file_modified,path,folder_path});file_ids.push(id);}
-    let result=state.0.set_asset_keywords(&file_ids,&candidates,keyword_id,assign)?;if result.changed_count>0{ai.0.sync_labels_debounced("keyword");}for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
+    let result=state.0.set_asset_keywords(&file_ids,&candidates,keyword_id,assign)?;for id in file_ids.iter().copied().filter(|id|*id>=0){let _=listing.0.invalidate_asset_parent(id);}for candidate in candidates{let _=listing.0.invalidate_path(&candidate.folder_path);}Ok(result)
 }
 #[tauri::command(async)]
 pub fn create_and_assign_keyword(state:State<'_,CatalogWriterState>,listing:State<'_,ListingState>,asset_ids:Vec<i64>,parent_id:Option<i64>,name:String)->Result<SetAssetKeywordsResult,String>{
@@ -991,10 +982,10 @@ pub fn folder_exists(path:String)->bool{Path::new(path.trim()).is_dir()}
 #[tauri::command(async)]
 pub fn get_delete_info(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,permanent:bool)->Result<crate::file_ops::DeleteInfo,String>{state.0.delete_info(&asset_ids,permanent)}
 
-/// Deletes the selected files (with sidecars): to the Recycle Bin (undoable) or permanently when
-/// `permanent` (Shift+Delete) or the drive has no Recycle Bin.
+/// Deletes the selected files (with sidecars): to the Recycle Bin or permanently when
+/// Shift+Delete is requested or permanent deletion without a Recycle Bin is confirmed.
 #[tauri::command]
-pub async fn delete_files(state:State<'_,FileManagerState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,permanent:Option<bool>)->Result<FileOperationResult,String>{let manager=state.0.clone();let (result,purged)=tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids,permanent.unwrap_or(false))).await.map_err(|e|e.to_string())??;ai.0.forget(purged);Ok(result)}
+pub async fn delete_files(state:State<'_,FileManagerState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,permanent:Option<bool>,confirmed_no_bin_drives:Option<Vec<String>>)->Result<FileOperationResult,String>{let manager=state.0.clone();let (result,purged)=tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids,permanent.unwrap_or(false),&confirmed_no_bin_drives.unwrap_or_default())).await.map_err(|e|e.to_string())??;ai.0.forget(purged);Ok(result)}
 
 #[tauri::command(async)]
 pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::folder_rules::FolderRule>,String>{writer.0.folder_rules()}
@@ -1005,7 +996,7 @@ pub fn get_folder_rule_state(writer:State<'_,CatalogWriterState>,path:String)->R
 #[tauri::command(async)]
 pub fn get_exclusion_impact(writer:State<'_,CatalogWriterState>,path:String)->Result<crate::journal::ExclusionImpact,String>{writer.0.exclusion_impact(&path)}
 
-/// mode: "include" | "exclude" | null (remove the explicit rule). Excluding removes the folder's catalogue rows (undoable).
+/// mode: "include" | "exclude" | null (remove the explicit rule). Excluding removes the folder's catalogue rows.
 #[tauri::command(async)]
 pub fn set_folder_rule(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,listing:State<'_,ListingState>,path:String,mode:Option<String>)->Result<usize,String>{
     let removed=writer.0.set_folder_rule(&path,mode.as_deref())?;

@@ -19,9 +19,7 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
         transaction.execute_batch("CREATE INDEX IF NOT EXISTS idx_assets_listed_exif_date_ext ON assets(is_listed,exif_date,ext_lower);
             CREATE INDEX IF NOT EXISTS idx_assets_listed_acdsee_date_ext ON assets(is_listed,acdsee_date,ext_lower);
             CREATE INDEX IF NOT EXISTS idx_assets_listed_file_modified_ext ON assets(is_listed,file_modified,ext_lower);
-            CREATE TABLE IF NOT EXISTS ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS ddreams_change_items(change_id INTEGER NOT NULL,table_name TEXT NOT NULL,row_key TEXT NOT NULL,column_name TEXT NOT NULL,old_value TEXT,new_value TEXT,FOREIGN KEY(change_id) REFERENCES ddreams_changes(id) ON DELETE CASCADE);
-            CREATE INDEX IF NOT EXISTS idx_ddreams_change_items_change_id ON ddreams_change_items(change_id);").map_err(|e|e.to_string())?;
+            CREATE TABLE IF NOT EXISTS ddreams_changes(id INTEGER PRIMARY KEY,ts TEXT NOT NULL,action TEXT NOT NULL,summary TEXT NOT NULL,undone INTEGER NOT NULL DEFAULT 0);").map_err(|e|e.to_string())?;
         set_meta(&transaction, "created_from", "acdsee_import")?;
         let imported = iso_now();
         set_meta(&transaction, "import_date", &imported)?;
@@ -33,6 +31,7 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
         set_meta_if_absent(&transaction, "import_date", &iso_now())?;
         set_meta_if_absent(&transaction, "schema_version", "1")?;
     }
+    seed_legacy_id_limits(&transaction)?;
     transaction.execute_batch("CREATE INDEX IF NOT EXISTS folders_norm_path ON folders(lower(rtrim(replace(path,'/','\\'),'\\'))); CREATE INDEX IF NOT EXISTS idx_assets_folder_listed ON assets(folder_id,is_listed); CREATE TABLE IF NOT EXISTS asset_color_overrides(asset_id INTEGER NOT NULL,color TEXT NOT NULL,state INTEGER NOT NULL CHECK(state IN (0,1)),PRIMARY KEY(asset_id,color)); CREATE TABLE IF NOT EXISTS ai_suggestion_rejections(asset_id INTEGER NOT NULL,kind TEXT NOT NULL,label_id INTEGER NOT NULL,PRIMARY KEY(asset_id,kind,label_id)); CREATE TABLE IF NOT EXISTS ddreams_folder_rules(path TEXT PRIMARY KEY COLLATE NOCASE,mode TEXT NOT NULL CHECK(mode IN ('include','exclude')),created TEXT NOT NULL);").map_err(|e|e.to_string())?;
     if !crate::incoming::has_deletion_column(&transaction).map_err(|e| e.to_string())? {
         transaction.execute("ALTER TABLE assets ADD COLUMN delete_suggestion INTEGER CHECK(delete_suggestion IN (0,1))", [])
@@ -41,6 +40,32 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
     transaction.execute("CREATE INDEX IF NOT EXISTS idx_assets_delete_suggestion ON assets(id) WHERE is_listed=1 AND delete_suggestion=1", [])
         .map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())
+}
+
+// Older releases reserved IDs found in history. Carry over only the numeric ID limits
+// so that stale AI references cannot point at a newly created asset or label.
+fn seed_legacy_id_limits(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    const KEY: &str = "catalog_id_limits_seeded";
+    let seeded: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM ddreams_meta WHERE key=?1)", [KEY], |r| r.get(0))
+        .map_err(|e| e.to_string())?;
+    if seeded { return Ok(()); }
+    let legacy: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ddreams_change_items')", [], |r| r.get(0),
+    ).map_err(|e| e.to_string())?;
+    if legacy {
+        let mut stmt = tx.prepare(
+            "SELECT table_name, max(CAST(row_key AS INTEGER)) FROM ddreams_change_items
+             WHERE column_name='__snapshot__' AND table_name IN ('assets','folders','folder_roots','categories','category_roots','keywords')
+             GROUP BY table_name"
+        ).map_err(|e| e.to_string())?;
+        let limits = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+            .map_err(|e| e.to_string())?;
+        for row in limits {
+            let (table, id) = row.map_err(|e| e.to_string())?;
+            crate::journal::remember_id(tx, &table, id)?;
+        }
+    }
+    set_meta(tx, KEY, "1")
 }
 
 fn set_meta(transaction: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<(), String> {
@@ -86,7 +111,21 @@ mod tests {
         for index in ["idx_assets_listed_exif_date_ext","idx_assets_listed_acdsee_date_ext","idx_assets_listed_file_modified_ext"] {
             assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",[index],|row|row.get::<_,i64>(0)).unwrap(),1);
         }
-        assert!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ddreams_change_items'",[],|row|row.get::<_,i64>(0)).unwrap()==1);
+        assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ddreams_change_items'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn migration_preserves_legacy_history_and_reserves_old_row_ids() {
+        let mut conn = fixture();
+        conn.execute_batch(
+            "CREATE TABLE ddreams_change_items(table_name TEXT,row_key TEXT,column_name TEXT,old_value TEXT,new_value TEXT);
+             INSERT INTO ddreams_change_items VALUES('assets','900','__snapshot__','legacy','legacy');
+             INSERT INTO ddreams_change_items VALUES('assets','950','rating','legacy','legacy');"
+        ).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        assert_eq!(conn.query_row("SELECT value FROM meta WHERE key='ddreams_last_deleted_assets_id'", [], |r| r.get::<_, String>(0)).unwrap(), "900");
+        assert_eq!(conn.query_row("SELECT count(*) FROM ddreams_change_items WHERE old_value='legacy' AND new_value='legacy'", [], |r| r.get::<_, i64>(0)).unwrap(), 2);
     }
 
     #[test]

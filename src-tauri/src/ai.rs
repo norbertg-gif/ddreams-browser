@@ -58,7 +58,7 @@ struct AiInner {
     auto_index_started: AtomicBool,
     colors_attached: AtomicBool,
     color_learn_generation: AtomicU64,
-    label_generation: AtomicU64,
+    label_generations: [AtomicU64; 2],
     last_stderr: Mutex<String>,
     stderr_reader: Mutex<Option<thread::JoinHandle<()>>>,
     similarity_order_cache: Mutex<HashMap<u64, Vec<i64>>>,
@@ -81,7 +81,7 @@ impl AiService {
             auto_index_started: AtomicBool::new(false), last_stderr: Mutex::new(String::new()), stderr_reader: Mutex::new(None),
             colors_attached: AtomicBool::new(false),
             color_learn_generation: AtomicU64::new(0),
-            label_generation: AtomicU64::new(0),
+            label_generations: [AtomicU64::new(0), AtomicU64::new(0)],
             similarity_order_cache: Mutex::new(HashMap::new()),
         }))
     }
@@ -113,7 +113,20 @@ impl AiService {
         });
     }
 
-    pub fn sync_labels_debounced(&self,kind:&str){let Ok(kind)=valid_label_kind(kind)else{return};let generation=self.0.label_generation.fetch_add(1,Ordering::Relaxed)+1;let service=self.clone();let kind=kind.to_owned();let _=thread::Builder::new().name("ai-label-sync-debounce".into()).spawn(move||{thread::sleep(Duration::from_secs(3));if service.0.label_generation.load(Ordering::Relaxed)!=generation||!service.status().available{return;}let _=service.sync_labels(&kind);});}
+    pub fn sync_labels_debounced(&self, kind: &str) {
+        let Ok(kind) = valid_label_kind(kind) else { return };
+        let index = usize::from(kind == "keyword");
+        let counter = &self.0.label_generations[index];
+        let generation = counter.fetch_add(1, Ordering::Relaxed) + 1;
+        let service = self.clone();
+        let _ = thread::Builder::new().name("ai-label-sync-debounce".into()).spawn(move || {
+            thread::sleep(Duration::from_secs(3));
+            if service.0.label_generations[index].load(Ordering::Relaxed) != generation || !service.status().available {
+                return;
+            }
+            let _ = service.sync_labels(kind);
+        });
+    }
 
     fn sync_labels(&self,kind:&str)->Result<(),String>{
         let (pairs,parents,listed)={let conn=self.0.db.lock().map_err(|e|e.to_string())?;let (relation,label,table)=if kind=="category" {("asset_categories","category_id","categories")}else{("asset_keywords","keyword_id","keywords")};let sql=format!("SELECT rel.asset_id,rel.{label} FROM {relation} rel JOIN assets a ON a.id=rel.asset_id WHERE a.is_listed=1 ORDER BY rel.asset_id,rel.{label}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let pairs=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let sql=format!("SELECT id,parent_id FROM {table}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let rows=stmt.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let mut stmt=conn.prepare("SELECT id FROM assets WHERE is_listed=1 AND id>0").map_err(|e|e.to_string())?;let listed=stmt.query_map([],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<std::collections::HashSet<_>>>().map_err(|e|e.to_string())?;(pairs,rows,listed)};
@@ -362,13 +375,35 @@ impl AiService {
         let response = self.request("suggest", json!({"asset_ids":asset_ids,"kind":kind,"limit":5}), Duration::from_secs(60))?;
         let rows = if combined { response.get("combined").and_then(Value::as_array).cloned().unwrap_or_default() } else { response.get("results").and_then(|v|v.get(asset_ids[0].to_string())).and_then(Value::as_array).cloned().unwrap_or_default() };
         let conn=self.0.db.lock().map_err(|e|e.to_string())?;
+        let (table, column) = if kind == "category" { ("asset_categories", "category_id") } else { ("asset_keywords", "keyword_id") };
+        // AI may still be serving its previous label index while the catalogue resync is pending.
+        let has_rejections = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_suggestion_rejections')",
+            [], |r| r.get::<_, bool>(0),
+        ).map_err(|e| e.to_string())?;
+        let rejected_sql = if has_rejections {
+            " OR EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND label_id=?2 AND kind=?3)"
+        } else {
+            ""
+        };
+        let mut excluded = conn.prepare(&format!(
+            "SELECT EXISTS(SELECT 1 FROM {table} WHERE asset_id=?1 AND {column}=?2){rejected_sql}"
+        )).map_err(|e| e.to_string())?;
+        let kind_arg = has_rejections.then_some(kind);
         let mut out=Vec::new();
         for row in rows {
             let Some(id)=row.get("label_id").and_then(Value::as_i64) else {continue};
             let path=label_path(&conn,kind,id)?;
             let candidates=if combined { asset_ids.iter().copied().filter(|aid|response.get("results").and_then(|v|v.get(aid.to_string())).and_then(Value::as_array).is_some_and(|items|items.iter().any(|item|item.get("label_id").and_then(Value::as_i64)==Some(id)))).collect::<Vec<_>>() } else { asset_ids.clone() };
-            let rejected=candidates.iter().filter_map(|aid|conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND kind=?2 AND label_id=?3)",rusqlite::params![aid,kind,id],|r|r.get::<_,bool>(0)).ok().filter(|rejected|*rejected).map(|_|*aid)).collect::<std::collections::HashSet<_>>();
-            let accepted=filter_suggest_assets(&candidates,&rejected);
+            let mut accepted = Vec::new();
+            for asset_id in candidates {
+                let skip = if let Some(kind) = kind_arg {
+                    excluded.query_row((asset_id, id, kind), |r| r.get::<_, bool>(0))
+                } else {
+                    excluded.query_row((asset_id, id), |r| r.get::<_, bool>(0))
+                }.map_err(|e| e.to_string())?;
+                if !skip { accepted.push(asset_id); }
+            }
             if accepted.is_empty() {continue;}
             let count=if combined {accepted.len() as u64} else {row.get("support").and_then(Value::as_u64).unwrap_or(0)};
             out.push(json!({"labelId":id,"path":path,"score":row.get("score").and_then(Value::as_f64).unwrap_or(0.0),"count":count,"assetIds":accepted}));
@@ -654,9 +689,8 @@ fn sync_catalog_ids(rows: &[(i64, Option<String>)]) -> Result<Vec<i64>, String> 
     Ok(rows.iter().map(|(id, _)| *id).collect())
 }
 
-fn valid_label_kind(kind:&str)->Result<&str,String>{match kind{"category"=>Ok("category"),"keyword"=>Ok("keyword"),_=>Err("Neplatný typ štítku".into())}}
+fn valid_label_kind(kind:&str)->Result<&'static str,String>{match kind{"category"=>Ok("category"),"keyword"=>Ok("keyword"),_=>Err("Neplatný typ štítku".into())}}
 fn filter_unrejected_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{candidates.iter().copied().filter(|id|!rejected.contains(id)).collect()}
-fn filter_suggest_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected)}
 fn filter_group_assets(candidates:&[i64],listed:&std::collections::HashSet<i64>,rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected).into_iter().filter(|id|listed.contains(id)).collect()}
 /// Splits a visually similar group into "same photo" parts. Two photos are the same when they share
 /// the base name (copies, RAW+JPG pair, `tag`/`-1`/` (2)` variants) and their EXIF capture times don't
@@ -710,8 +744,8 @@ mod suggestion_tests {
     #[test]
     fn suggest_rejections_filter_only_rejected_assets(){
         let candidates=[1,2,3];let rejected=std::collections::HashSet::from([2]);
-        assert_eq!(filter_suggest_assets(&candidates,&rejected),vec![1,3]);
-        assert!(filter_suggest_assets(&[2],&rejected).is_empty());
+        assert_eq!(filter_unrejected_assets(&candidates,&rejected),vec![1,3]);
+        assert!(filter_unrejected_assets(&[2],&rejected).is_empty());
     }
 
     #[test]
