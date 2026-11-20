@@ -1,7 +1,7 @@
 # Creates the Python environment used by the AI server and the RAW plugin,
 # both in development and in the portable installation.
 param(
-    [string]$Target = 'G:\DDreams\modules\python',
+    [string]$Target = 'C:\DDreams\modules\python',
     [string]$BasePython = (Join-Path $env:LOCALAPPDATA 'Programs\Python\Python314\python.exe')
 )
 

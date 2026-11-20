@@ -35,10 +35,10 @@ from safetensors.torch import load_file
 
 ROOT = Path(__file__).resolve().parents[1]
 CATALOG = ROOT / ".local" / "catalog.sqlite"
-MODEL_DIR = Path(r"G:\DDreams\modules\ai\model")
+MODEL_DIR = Path(r"C:\DDreams\modules\ai\model")
 FP16_CHECKPOINT = MODEL_DIR / "open_clip_model.fp16.safetensors"
 FP32_CHECKPOINT = Path(r"D:\voicestudio\models\hub\models--timm--ViT-L-16-SigLIP2-256\snapshots\da9426945c7c5acbd3afd0c158c8bb9cfd4d8cc0\open_clip_model.safetensors")
-EXIFTOOL = Path(r"G:\DDreams\modules\exiftool\exiftool.exe")
+EXIFTOOL = Path(r"C:\DDreams\modules\exiftool\exiftool.exe")
 MODEL_NAME = "ViT-L-16-SigLIP2-256"
 SEED = 20261108
 LIMIT = 1000

@@ -3,8 +3,8 @@ use std::{collections::HashMap, env, ffi::OsString, path::{Path, PathBuf}};
 
 const DEV_EXIFTOOL: &str = r"G:\Programovanie\ddreams-browser\tools\exiftool\exiftool.exe";
 const DEV_CACHE: &str = r"G:\ddreams-work\thumb-cache";
-const DEV_AI_PYTHON: &str = r"G:\DDreams\modules\python\Scripts\python.exe";
-const DEV_AI_MODEL: &str = r"G:\DDreams\modules\ai\model";
+const DEV_AI_PYTHON: &str = r"C:\DDreams\modules\python\Scripts\python.exe";
+const DEV_AI_MODEL: &str = r"C:\DDreams\modules\ai\model";
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -105,7 +105,23 @@ fn cwd_repo(catalog: &Path, cwd: &Path) -> PathBuf {
 
 fn read_ai_python(path: &Path) -> Option<PathBuf> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    value.get("python")?.as_str().filter(|value| !value.trim().is_empty()).map(PathBuf::from)
+    let python = PathBuf::from(value.get("python")?.as_str().filter(|value| !value.trim().is_empty())?);
+    // A relative path is resolved against the folder of ai.json, so the installation can be moved.
+    Some(if python.is_relative() { lexically_normalized(&path.parent().unwrap_or(Path::new("")).join(python)) } else { python })
+}
+
+/// Resolves `.` and `..` without touching the disk (Python warns about `..` in its own prefix).
+fn lexically_normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => { if !out.pop() { out.push(".."); } }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 fn display_optional(path: &Option<PathBuf>) -> String {
@@ -185,6 +201,9 @@ mod tests {
         assert_eq!(paths.ai_model, ai_dir.join("model"));
         assert_eq!(paths.ai_python, Some(PathBuf::from(r"C:\python.exe")));
         assert_eq!(paths.ai_db, root.join("catalog/ai.sqlite"));
+        std::fs::write(ai_dir.join("ai.json"), br#"{"python":"..\\python\\Scripts\\python.exe"}"#).unwrap();
+        let moved = Paths::resolve_with(&root.join("ddreams.exe"), &root, &HashMap::new());
+        assert_eq!(moved.ai_python, Some(root.join(r"modules\python\Scripts\python.exe")));
         let _ = std::fs::remove_dir_all(root);
     }
 

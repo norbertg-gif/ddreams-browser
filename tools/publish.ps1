@@ -1,5 +1,6 @@
 param(
     [string]$Catalog,
+    [string]$InstallRoot = 'C:\DDreams',
     [string]$ExifToolSource = (Join-Path (Split-Path -Parent $PSScriptRoot) 'tools\exiftool')
 )
 
@@ -12,7 +13,6 @@ $ExeCandidates = @(
 $ReleaseExe = $ExeCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (-not $ReleaseExe) { throw 'Release exe not found. Build the app first; this script does not build it.' }
 
-$InstallRoot = 'G:\DDreams'
 $InstallExe = Join-Path $InstallRoot 'ddreams-browser.exe'
 $CatalogDir = Join-Path $InstallRoot 'catalog'
 $InstallCatalog = Join-Path $CatalogDir 'catalog.sqlite'
@@ -34,7 +34,7 @@ if (-not $catalogExists) {
 $runningInstall = Get-Process -Name 'ddreams-browser' -ErrorAction SilentlyContinue | Where-Object {
     try { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq [IO.Path]::GetFullPath($InstallExe)) } catch { $false }
 }
-if ($runningInstall) { throw 'Close G:\DDreams\ddreams-browser.exe before publishing.' }
+if ($runningInstall) { throw "Close $InstallExe before publishing." }
 
 foreach ($directory in @($InstallRoot, $CatalogDir, $BackupDir, $CacheDir, $ModulesDir)) {
     New-Item -ItemType Directory -Path $directory -Force | Out-Null
@@ -67,9 +67,11 @@ $AiConfig = Join-Path $InstallAiDir 'ai.json'
 # The Python environment is created by tools\setup-python.ps1. An ai.json that still points
 # outside the installation at the old shared environment is switched over.
 $InstallPython = Join-Path $ModulesDir 'python\Scripts\python.exe'
+# Relative to modules\ai, so the whole installation folder can be moved.
+$RelativePython = '..\python\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $InstallPython -PathType Leaf)) { throw "Python environment not found: $InstallPython. Run tools\setup-python.ps1 first." }
-if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf) -or (Get-Content -LiteralPath $AiConfig -Raw) -match 'photosort') {
-    [IO.File]::WriteAllText($AiConfig, (@{ python = $InstallPython } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
+if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf) -or (Get-Content -LiteralPath $AiConfig -Raw | ConvertFrom-Json).python -ne $RelativePython) {
+    [IO.File]::WriteAllText($AiConfig, (@{ python = $RelativePython } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
     Write-Output "Wrote AI config: $AiConfig"
 }
 
