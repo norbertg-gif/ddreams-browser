@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::{collections::{HashMap, HashSet}, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::{HashMap, HashSet, VecDeque}, path::{Path, PathBuf}, sync::{Arc, Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -18,23 +18,42 @@ pub struct TileExifItem { pub asset_id: i64, #[serde(flatten)] pub values: TileE
 #[serde(rename_all = "camelCase")]
 pub struct CacheEntry { pub loaded: Vec<String>, pub values: TileExifValues }
 
-pub struct DisplayMetadataCache { root: PathBuf, entries: Mutex<HashMap<String, CacheEntry>> }
+const MAX_MEMORY_ENTRIES: usize = 4096;
+
+#[derive(Default)]
+struct MemoryEntries {
+    values: HashMap<String, CacheEntry>,
+    order: VecDeque<String>,
+}
+
+impl MemoryEntries {
+    fn insert(&mut self, key: &str, entry: CacheEntry) {
+        if self.values.insert(key.to_owned(), entry).is_none() {
+            self.order.push_back(key.to_owned());
+            if self.order.len() > MAX_MEMORY_ENTRIES {
+                if let Some(oldest) = self.order.pop_front() { self.values.remove(&oldest); }
+            }
+        }
+    }
+}
+
+pub struct DisplayMetadataCache { root: PathBuf, entries: Mutex<MemoryEntries> }
 
 pub fn cache_key(path: &str, size: u64, modified_ns: u128) -> String {
     Sha256::digest(format!("tile-exif-v1|{path}|{size}|{modified_ns}").as_bytes()).iter().map(|b|format!("{b:02x}")).collect()
 }
 
 impl DisplayMetadataCache {
-    pub fn new(root: PathBuf) -> Arc<Self> { Arc::new(Self { root: root.join("tile-exif"), entries: Mutex::new(HashMap::new()) }) }
+    pub fn new(root: PathBuf) -> Arc<Self> { Arc::new(Self { root: root.join("tile-exif"), entries: Mutex::new(MemoryEntries::default()) }) }
     fn path(&self,key:&str)->PathBuf { self.root.join(format!("{key}.json")) }
     pub fn get(&self,key:&str)->CacheEntry {
-        if let Ok(entries)=self.entries.lock(){if let Some(value)=entries.get(key){return value.clone();}}
+        if let Ok(entries)=self.entries.lock(){if let Some(value)=entries.values.get(key){return value.clone();}}
         let value=std::fs::read(self.path(key)).ok().and_then(|bytes|serde_json::from_slice::<CacheEntry>(&bytes).ok()).unwrap_or_default();
-        if let Ok(mut entries)=self.entries.lock(){entries.insert(key.to_owned(),value.clone());}
+        if let Ok(mut entries)=self.entries.lock(){entries.insert(key,value.clone());}
         value
     }
     pub fn put(&self,key:&str,value:CacheEntry) {
-        if let Ok(mut entries)=self.entries.lock(){entries.insert(key.to_owned(),value.clone());}
+        if let Ok(mut entries)=self.entries.lock(){entries.insert(key,value.clone());}
         if std::fs::create_dir_all(&self.root).is_err(){return;}
         let path=self.path(key); let temp=path.with_extension(format!("{}.tmp",std::process::id()));
         if let Ok(bytes)=serde_json::to_vec(&value){if std::fs::write(&temp,bytes).is_ok(){if path.exists(){let _=std::fs::remove_file(&path);}if std::fs::rename(&temp,&path).is_err(){let _=std::fs::remove_file(&temp);}}}

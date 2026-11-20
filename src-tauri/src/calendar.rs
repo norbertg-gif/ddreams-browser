@@ -32,22 +32,37 @@ pub struct CalendarHour { pub hour: u32, pub count: i64 }
 #[derive(Default)]
 struct MutableDay { count: i64, hours: BTreeMap<u32, i64> }
 
-pub struct CalendarService { db: Db, formats: Arc<FormatTable>, cache: Mutex<HashMap<DateSource, Arc<CalendarAggregate>>> }
+#[derive(Default)]
+struct CalendarCache {
+    revision: Option<(u64, i64)>,
+    entries: HashMap<DateSource, Arc<CalendarAggregate>>,
+}
+
+pub struct CalendarService { db: Db, formats: Arc<FormatTable>, cache: Mutex<CalendarCache> }
 
 impl CalendarService {
-    pub fn new(db: Db, formats: Arc<FormatTable>) -> Arc<Self> { Arc::new(Self { db, formats, cache: Mutex::new(HashMap::new()) }) }
+    pub fn new(db: Db, formats: Arc<FormatTable>) -> Arc<Self> { Arc::new(Self { db, formats, cache: Mutex::new(CalendarCache::default()) }) }
 
     pub fn aggregate(&self, source: DateSource) -> Result<Arc<CalendarAggregate>, String> {
-        if let Some(value) = self.cache.lock().map_err(|_| "calendar cache poisoned")?.get(&source).cloned() { return Ok(value); }
+        let conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let version = conn.query_row("PRAGMA main.data_version", [], |row| row.get(0)).map_err(|e| e.to_string())?;
+        let revision = (conn.total_changes(), version);
+        let mut cache = self.cache.lock().map_err(|_| "calendar cache poisoned")?;
+        if cache.revision != Some(revision) {
+            cache.entries.clear();
+            cache.revision = Some(revision);
+        }
+        if conn.is_autocommit() {
+            if let Some(value) = cache.entries.get(&source) { return Ok(value.clone()); }
+        }
         let column = source.column();
         let index_name = format!("idx_assets_listed_{}_ext", column.strip_prefix("a.").unwrap_or(column));
-        let index_exists: bool = self.db.lock().map_err(|_| "catalog lock poisoned")?.query_row(
+        let index_exists: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name=?1)", [&index_name], |row| row.get(0)
         ).map_err(|e| e.to_string())?;
         let access = if index_exists { format!("INDEXED BY {index_name}") } else { "NOT INDEXED".into() };
         let media = self.formats.sql_in("a.ext_lower", &["image", "raw", "video"]);
         let sql = format!("SELECT {column} FROM assets a {access} WHERE a.is_listed=1 AND {media}");
-        let conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
         let rows = stmt.query_map([], |row| row.get::<_, Option<String>>(0)).map_err(|e| e.to_string())?;
         let mut undated_count = 0;
@@ -80,7 +95,7 @@ impl CalendarService {
             years.push(CalendarYear { year, count: year_count, months: output_months });
         }
         let value = Arc::new(CalendarAggregate { date_source: source.as_str().into(), dated_count, undated_count, years });
-        self.cache.lock().map_err(|_| "calendar cache poisoned")?.insert(source, value.clone());
+        if conn.is_autocommit() { cache.entries.insert(source, value.clone()); }
         Ok(value)
     }
 }
@@ -120,6 +135,26 @@ mod tests {
             assert_eq!(page.total, expected, "{source}");
         }
     }
+    #[test]
+    fn cache_refreshes_after_local_write_and_external_commit() {
+        let path = std::env::temp_dir().join(format!("ddreams-calendar-{}-{:?}.sqlite", std::process::id(), std::thread::current().id()));
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,is_listed INTEGER,ext_lower TEXT,exif_date TEXT);
+                              INSERT INTO assets VALUES(1,1,'jpg','2025-06-01');").unwrap();
+        let reader = Arc::new(Mutex::new(rusqlite::Connection::open(&path).unwrap()));
+        let formats = Arc::new(FormatTable::parse(include_str!("../formats.json")).unwrap());
+        let service = CalendarService::new(reader.clone(), formats);
+        let first = service.aggregate(DateSource::Taken).unwrap();
+        assert_eq!(first.dated_count, 1);
+        assert!(Arc::ptr_eq(&first, &service.aggregate(DateSource::Taken).unwrap()));
+        writer.execute("INSERT INTO assets VALUES(2,1,'jpg','2025-06-02')", []).unwrap();
+        assert_eq!(service.aggregate(DateSource::Taken).unwrap().dated_count, 2);
+        reader.lock().unwrap().execute("UPDATE assets SET is_listed=0", []).unwrap();
+        assert_eq!(service.aggregate(DateSource::Taken).unwrap().dated_count, 0);
+        drop((service, reader, writer));
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn aggregate_counts_month_days_hours_undated_and_excludes_bogus_dates() {
         let (db, formats) = fixture(); let service = CalendarService::new(db, formats);

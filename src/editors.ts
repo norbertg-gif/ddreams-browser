@@ -27,6 +27,11 @@ export function saveEditors(next: Editor[]) {
   revision++; editors = next; suggested = false; notify();
   pending = pending.then(async () => { await initialize(); await invoke("set_editors", { editors: next }); }).catch(error => { window.alert(`Nastavenia editorov sa nepodarilo uložiť: ${String(error)}`); });
 }
+export async function launchEditor(editor: Editor, assetIds: number[]) {
+  await pending;
+  await invoke("open_in_editor", { assetIds, exe: editor.path });
+}
+
 export function useEditors(): Editor[] {
   const [value, setValue] = useState(editors);
   useEffect(() => { const refresh = () => setValue(editors); window.addEventListener(EVENT, refresh); void initialize().catch(error => console.error("Editor settings failed to load", error)); return () => window.removeEventListener(EVENT, refresh); }, []);

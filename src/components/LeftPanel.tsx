@@ -13,9 +13,9 @@ const DEFAULT_SHORTCUTS: Shortcut[] = [
   { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
   { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
 ];
-type Props = { hosts: { folders: HTMLElement; calendar: HTMLElement }; onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction; onToast?:(message:string)=>void; onFolderAction?:(action:"reveal"|"copyPath"|"rename"|"delete"|"cut"|"copy"|"paste",path:string)=>void; clipboardPath?:string|null; clipboardAvailable?:boolean };
+type Props = { hosts: { folders: HTMLElement; calendar: HTMLElement }; onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; calendarRefreshToken:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction; onToast?:(message:string)=>void; onFolderAction?:(action:"reveal"|"copyPath"|"rename"|"delete"|"cut"|"copy"|"paste",path:string)=>void; clipboardPath?:string|null; clipboardAvailable?:boolean };
 
-export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule, onToast, onFolderAction, clipboardPath=null, clipboardAvailable=false }: Props) {
+export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, calendarRefreshToken, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule, onToast, onFolderAction, clipboardPath=null, clipboardAvailable=false }: Props) {
   const folderRules = useFolderRules();
   const [shortcuts, setShortcuts] = useState<Shortcut[]>(() => { const v = readStored<Shortcut[]>("ddreams.shortcuts", DEFAULT_SHORTCUTS); return Array.isArray(v) ? v : DEFAULT_SHORTCUTS; });
   useEffect(() => { writeStored("ddreams.shortcuts", shortcuts);void Promise.all(shortcuts.map(async item=>[item.path,!(await invoke<boolean>("folder_exists",{path:item.path}).catch(()=>false))] as const)).then(rows=>setMissingShortcuts(new Set(rows.filter(row=>row[1]).map(row=>row[0].toLowerCase())))); }, [shortcuts]);
@@ -105,7 +105,7 @@ export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFol
       {error && <div className="inline-error">{error}<button onClick={() => setError("")}>×</button></div>}
       {roots.map(folder => <FolderRow key={folder.id} folder={folder} depth={0} activeIds={activeSet} expanded={expanded} childrenMap={children} loading={loading.has(folder.id)} rowRefs={rowRefs} onToggle={toggle} onNavigate={navigate} onFileDrop={onFileDrop} onCreateFolder={onCreateFolder} onFolderAction={onFolderAction} clipboardPath={clipboardPath} clipboardAvailable={clipboardAvailable} />)}
     </div>
-  </aside>, hosts.folders)}{createPortal(<CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={refreshToken}/>, hosts.calendar)}</FolderRulesContext.Provider>;
+  </aside>, hosts.folders)}{createPortal(<CalendarPane onNavigate={onNavigate} activeView={activeView} refreshToken={calendarRefreshToken}/>, hosts.calendar)}</FolderRulesContext.Provider>;
 }
 
 function FolderRow({ folder, depth, activeIds, expanded, childrenMap, loading, rowRefs, onToggle, onNavigate, onFileDrop, onCreateFolder, onFolderAction, clipboardPath, clipboardAvailable }: { folder: Folder; depth: number; activeIds: Set<number>; expanded: Set<number>; childrenMap: Map<number, Folder[]>; loading: boolean; rowRefs: MutableRefObject<Map<number, HTMLDivElement>>; onToggle: (folder: Folder) => void; onNavigate: (folder: Folder) => void; onFileDrop?: (ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void; onFolderAction?:(action:"reveal"|"copyPath"|"rename"|"delete"|"cut"|"copy"|"paste",path:string)=>void; clipboardPath?:string|null; clipboardAvailable?:boolean }) {

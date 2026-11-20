@@ -571,10 +571,10 @@ pub fn get_assets(
     // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
     if filter.kind == "folder" && filter.offset == 0 { let _ = auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter); }
     if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people" {
-        let mut base=filter.clone();base.sort="name".into();base.descending=false;base.offset=0;base.limit=500;
-        let mut all=Vec::new();let mut offset=0;let mut total=0;let mut total_size=0.0;
-        loop {base.offset=offset;let page=if filter.kind=="folder"{listing.0.page(&base)?}else{db::assets_page(&state.0,&base,&formats.0).map_err(|e|e.to_string())?};total=page.total;total_size=page.total_size;let count=page.items.len();all.extend(page.items);offset+=count as i64;if count<500||offset>=total{break}}
-        let order=if ai.0.status().available{Some(ai.0.order_by_similarity(all.iter().filter(|a|!a.is_directory).map(|a|a.id).collect())?)}else{None};let mut all=apply_similarity_order(all,order.as_deref());let items=all.into_iter().skip(filter.offset.max(0) as usize).take(filter.limit.clamp(1,500) as usize).collect();let mut page=db::AssetPage{items,total,total_size};classify_page(&mut page);return Ok(page);
+        let status = ai.0.status();
+        let mut page = similarity_page(&state.0, &listing.0, &formats.0, &filter, &status, |ids| ai.0.order_by_similarity(ids))?;
+        classify_page(&mut page);
+        return Ok(page);
     }
     if filter.kind == "folder" { let mut page=listing.0.page(&filter)?;classify_page(&mut page);return Ok(page); }
     let mut page=db::assets_page(&state.0,&filter,&formats.0).map_err(|e|e.to_string())?;classify_page(&mut page);Ok(page)
@@ -620,7 +620,7 @@ pub fn asset_action(db: State<'_, DatabaseState>, listing: State<'_, ListingStat
         "open" => { command.arg(&path); }
         "reveal" => {
             use std::os::windows::process::CommandExt;
-            let escaped=path.replace('"',"\"\"");command.raw_arg(format!("/select,\"{escaped}\""));
+            command.raw_arg(crate::file_ops::explorer_select_arg(Path::new(&path)));
         }
         _ => return Err("Neznáma akcia".into()),
     }
@@ -664,6 +664,17 @@ mod editor_tests {
         let json: Value=serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap(); assert_eq!(json["other"],42);
         write_editor_settings(&path,&[]).unwrap(); assert!(read_editor_settings(&path).unwrap().is_empty()); std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    fn editor_lookup_accepts_saved_and_detected_paths_and_rejects_others() {
+        let saved = Editor { name: "Test".into(), path: r"C:\Editory\Úpravy.exe".into(), multi: false };
+        let photoshop = Editor { name: "Adobe Photoshop".into(), path: r"C:\Adobe\Photoshop.exe".into(), multi: true };
+        let detect = || Some(photoshop.clone());
+        assert_eq!(allowed_editor(std::slice::from_ref(&saved), r"c:\editory\úpravy.EXE", || panic!("saved editor should skip detection")).unwrap(), saved);
+        assert_eq!(allowed_editor(&[], r"c:\adobe\photoshop.EXE", detect).unwrap(), photoshop);
+        assert_eq!(allowed_editor(std::slice::from_ref(&saved), r"c:\adobe\photoshop.EXE", detect).unwrap(), photoshop);
+        assert!(allowed_editor(&[saved], r"C:\other.exe", detect).is_err());
+    }
+
     #[test] fn photoshop_fallback_selects_newest_installed() {
         let dir=std::env::temp_dir().join(format!("ddreams-photoshop-{}-{:?}",std::process::id(),std::thread::current().id()));
         let old=dir.join("Adobe Photoshop 2024/Photoshop.exe");let new=dir.join("Adobe Photoshop 2026/Photoshop.exe");let missing=dir.join("Adobe Photoshop 2027/Photoshop.exe");
@@ -672,21 +683,33 @@ mod editor_tests {
     }
 }
 
-/// Opens the given files in an external editor chosen in Settings. `multi` = the program takes all
+fn allowed_editor(editors: &[Editor], requested: &str, detect: impl FnOnce() -> Option<Editor>) -> Result<Editor, String> {
+    let requested = requested.trim().to_lowercase();
+    let matches = |editor: &Editor| editor.path.trim().to_lowercase() == requested;
+    if !requested.is_empty() {
+        if let Some(editor) = editors.iter().find(|editor| matches(editor)).cloned().or_else(|| detect().filter(matches)) {
+            return Ok(editor);
+        }
+    }
+    Err("Editor nie je uložený v nastaveniach ani automaticky zistený".into())
+}
+
+/// Opens the given files in an external editor saved in Settings or detected by DDreams. `multi` = the program takes all
 /// files in one launch; otherwise it is started once per file (at most 20).
 #[tauri::command(async)]
-pub fn open_in_editor(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, asset_ids: Vec<i64>, exe: String, multi: bool) -> Result<usize, String> {
-    let exe = exe.trim();
-    if !Path::new(exe).is_file() { return Err(format!("Program sa nenašiel: {exe}")); }
+pub fn open_in_editor(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, info: State<'_, AppInfoState>, asset_ids: Vec<i64>, exe: String) -> Result<usize, String> {
+    let editor = allowed_editor(&read_editor_settings(Path::new(&info.0.settings))?, &exe, detect_photoshop)?;
+    let exe = std::path::absolute(editor.path.trim()).map_err(|e| e.to_string())?;
+    if !exe.is_file() { return Err(format!("Program sa nenašiel: {}", exe.display())); }
     let paths: Vec<String> = asset_ids.into_iter()
         .filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path)))
         .filter(|p| Path::new(p).is_file()).collect();
     if paths.is_empty() { return Err("Žiadny z vybraných súborov nie je dostupný".into()); }
-    if multi {
-        std::process::Command::new(exe).args(&paths).spawn().map_err(|e| e.to_string())?;
+    if editor.multi {
+        std::process::Command::new(&exe).args(&paths).spawn().map_err(|e| e.to_string())?;
     } else {
         if paths.len() > 20 { return Err("Tento program berie súbory po jednom – vyber najviac 20 súborov".into()); }
-        for path in &paths { std::process::Command::new(exe).arg(path).spawn().map_err(|e| e.to_string())?; }
+        for path in &paths { std::process::Command::new(&exe).arg(path).spawn().map_err(|e| e.to_string())?; }
     }
     Ok(paths.len())
 }
@@ -859,19 +882,148 @@ fn db_tags(data: &AssetMetadata) -> Vec<metadata_view::RawTag> {
     tags
 }
 
-fn apply_similarity_order(mut assets:Vec<db::Asset>,order:Option<&[i64]>)->Vec<db::Asset>{
-    let mut dirs=assets.iter().filter(|a|a.is_directory).cloned().collect::<Vec<_>>();let mut files=assets.drain(..).filter(|a|!a.is_directory).collect::<Vec<_>>();dirs.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    if let Some(order)=order{let positions=order.iter().enumerate().map(|(i,id)|(*id,i)).collect::<std::collections::HashMap<_,_>>();files.sort_by_key(|a|positions.get(&a.id).copied().unwrap_or(usize::MAX));}else{files.sort_by(|a,b|a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));}
-    dirs.extend(files);dirs
+struct SimilarityOrder {
+    ids: Vec<i64>,
+    total_size: f64,
+    folder: Option<(Arc<Vec<db::Asset>>, std::collections::HashMap<i64, usize>)>,
+}
+
+struct SimilarityEntry {
+    owner: std::sync::Weak<std::sync::Mutex<rusqlite::Connection>>,
+    filter: String,
+    revision: (u64, i64, i64, i64, u64, bool, u64, u64),
+    at: std::time::Instant,
+    order: Arc<SimilarityOrder>,
+}
+
+fn similarity_page(db: &Db, listing: &ListingService, formats: &crate::formats::FormatTable, filter: &AssetFilter, status: &crate::ai::AiStatus, rank: impl FnOnce(Vec<i64>) -> Result<Vec<i64>, String>) -> Result<db::AssetPage, String> {
+    static CACHE: std::sync::Mutex<Vec<SimilarityEntry>> = std::sync::Mutex::new(Vec::new());
+    let mut base = filter.clone();
+    base.sort = "name".into();
+    base.descending = false;
+    base.offset = 0;
+    base.limit = 0;
+    base.include_categories = false;
+    base.include_keywords = false;
+    let key = serde_json::to_string(&base).map_err(|e| e.to_string())?;
+    let revision = {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        let version = |sql| conn.query_row(sql, [], |row| row.get::<_, i64>(0)).unwrap_or(-1);
+        (conn.total_changes(), version("PRAGMA main.data_version"),
+         version("PRAGMA ai.data_version"), version("PRAGMA auto_exif.data_version"),
+         if base.kind == "folder" { listing.revision() } else { 0 }, status.available, status.indexed, status.done)
+    };
+    let cached = {
+        let mut cache = CACHE.lock().map_err(|e| e.to_string())?;
+        cache.retain(|entry| entry.owner.strong_count() > 0 && entry.at.elapsed().as_secs() < 8);
+        cache.iter().position(|entry| entry.owner.ptr_eq(&Arc::downgrade(db)) && entry.filter == key && entry.revision == revision)
+            .map(|pos| { let entry = cache.remove(pos); let order = entry.order.clone(); cache.push(entry); order })
+    };
+    let order = if let Some(order) = cached { order } else {
+        let (mut ids, total_size, folder, directories) = if base.kind == "folder" {
+            let (rows, total_size) = listing.ordered_rows(&base)?;
+            let positions = rows.iter().enumerate().map(|(i, asset)| (asset.id, i)).collect();
+            let ids = rows.iter().map(|asset| asset.id).collect::<Vec<_>>();
+            let directories = rows.iter().take_while(|asset| asset.is_directory).count();
+            (ids, total_size, Some((rows, positions)), directories)
+        } else {
+            let conn = db.lock().map_err(|e| e.to_string())?;
+            let (ids, total_size) = db::catalog_ordered_ids(db, &conn, &base, formats).map_err(|e| e.to_string())?;
+            (ids.as_ref().clone(), total_size, None, 0)
+        };
+        if status.available && directories < ids.len() {
+            let ranked = rank(ids[directories..].to_vec())?;
+            rank_similarity_ids(&mut ids[directories..], &ranked);
+        }
+        let order = Arc::new(SimilarityOrder { ids, total_size, folder });
+        let mut cache = CACHE.lock().map_err(|e| e.to_string())?;
+        cache.retain(|entry| !(entry.owner.ptr_eq(&Arc::downgrade(db)) && entry.filter == key));
+        if cache.len() >= 2 { cache.remove(0); }
+        cache.push(SimilarityEntry { owner: Arc::downgrade(db), filter: key, revision, at: std::time::Instant::now(), order: order.clone() });
+        order
+    };
+    let ids = &order.ids;
+    let start = (filter.offset.max(0) as usize).min(ids.len());
+    let end = (start + filter.limit.clamp(1,500) as usize).min(ids.len());
+    let ids_page = &ids[start..end];
+    let items = if let Some((rows, positions)) = &order.folder {
+        let mut items = ids_page.iter().filter_map(|id| positions.get(id).map(|&position| rows[position].clone())).collect::<Vec<_>>();
+        db::attach_display_values(db, &mut items, filter.include_categories, filter.include_keywords).map_err(|e| e.to_string())?;
+        items
+    } else {
+        let conn = db.lock().map_err(|e| e.to_string())?;
+        db::hydrate_asset_ids(&conn, ids_page, filter).map_err(|e| e.to_string())?
+    };
+    Ok(db::AssetPage { items, total: ids.len() as i64, total_size: order.total_size })
+}
+
+fn rank_similarity_ids(ids: &mut [i64], ranked: &[i64]) {
+    let positions = ranked.iter().enumerate().map(|(i, id)| (*id, i)).collect::<std::collections::HashMap<_,_>>();
+    ids.sort_by_key(|id| positions.get(id).copied().unwrap_or(usize::MAX));
 }
 
 #[cfg(test)]
-mod similarity_order_tests{
-    use super::*;
-    fn asset(id:i64,name:&str)->db::Asset{db::Asset{id,folder_id:None,name:name.into(),ext:"jpg".into(),size:None,width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None}}
-    #[test]fn similarity_order_pages_from_cached_ids(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ordered=apply_similarity_order(all,Some(&[3,1,2]));let ids=ordered.into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(&ids[0..2],&[3,1]);assert_eq!(&ids[2..3],&[2]);}
-    #[test]fn unavailable_ai_falls_back_to_name_order(){let all=vec![asset(1,"c"),asset(2,"a"),asset(3,"b")];let ids=apply_similarity_order(all,None).into_iter().map(|a|a.id).collect::<Vec<_>>();assert_eq!(ids,vec![2,3,1]);}
+#[test]
+fn similarity_order_preserves_unranked_ids_and_directory_prefix() {
+    let mut ids = [-1, 2, 3, 1, 4];
+    rank_similarity_ids(&mut ids[1..], &[3, 4]);
+    assert_eq!(ids, [-1, 3, 4, 2, 1]);
 }
+
+#[cfg(test)]
+#[test]
+fn similarity_cache_reuses_order_and_invalidates_when_rows_change() {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);
+                              CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER);
+                              CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER);
+                              CREATE TABLE categories(id INTEGER PRIMARY KEY,name TEXT);
+                              CREATE TABLE keywords(id INTEGER PRIMARY KEY,name TEXT);").unwrap();
+    let measure = std::env::var_os("DDREAMS_BENCH_SIMILARITY_SYNTHETIC").is_some();
+    let count = if measure { 71_000 } else { 1_200 };
+    connection.execute("WITH RECURSIVE n(id) AS (SELECT 1 UNION ALL SELECT id+1 FROM n WHERE id<?)
+                        INSERT INTO assets(id,name,ext,ext_lower,is_listed,size) SELECT id,printf('%06d.jpg',id),'jpg','jpg',1,100 FROM n", [count]).unwrap();
+    let db = Arc::new(std::sync::Mutex::new(connection));
+    let formats = crate::formats::FormatTable::load_selected(None);
+    let listing = ListingService::new(db.clone(), formats.clone());
+    let filter: AssetFilter = serde_json::from_value(serde_json::json!({"kind":"special","value":"all_photos","sort":"similarity","descending":false,"offset":0,"limit":120})).unwrap();
+    let status: crate::ai::AiStatus = crate::ai::AiStatus {
+        available:true, reason:None, state:"ready".into(), model_state:"ready".into(), waiting:0, indexed:count as u64,
+        queued:0, done:0, failed:0, offline:0, total:count as u64, rate_per_s:0.0, eta_s:None, last_error:None,
+    };
+    let ranks = std::cell::Cell::new(0);
+    let rank = |mut ids: Vec<i64>| { ranks.set(ranks.get()+1); ids.reverse(); Ok(ids) };
+    let first = similarity_page(&db, &listing, &formats, &filter, &status, rank).unwrap();
+    assert_eq!(first.items[0].id, count);
+    let mut next = filter.clone();
+    next.offset = 120;
+    let after_start = std::time::Instant::now();
+    let second = similarity_page(&db, &listing, &formats, &next, &status, rank).unwrap();
+    let after = after_start.elapsed();
+    assert_eq!(second.items[0].id, count-120);
+    assert_eq!(ranks.get(), 1);
+    if measure {
+        // Old warm-page path: read every Asset row, then apply the cached AI order to all rows.
+        let mut base = filter.clone();
+        base.sort = "name".into();
+        base.limit = 500;
+        let before_start = std::time::Instant::now();
+        let mut all = Vec::new();
+        for offset in (0..count).step_by(500) {
+            base.offset = offset;
+            all.extend(db::assets_page(&db, &base, &formats).unwrap().items);
+        }
+        let positions: std::collections::HashMap<_,_> = (1..=count).rev().enumerate().map(|(position, id)| (id, position)).collect();
+        all.sort_by_key(|asset| positions[&asset.id]);
+        assert_eq!(all[120].id, second.items[0].id);
+        eprintln!("similarity synthetic warm page: old {:.2?}, new {:.2?}, assets {count}", before_start.elapsed(), after);
+    }
+    db.lock().unwrap().execute("UPDATE assets SET is_listed=0 WHERE id=?", [count]).unwrap();
+    let refreshed = similarity_page(&db, &listing, &formats, &filter, &status, rank).unwrap();
+    assert_eq!(refreshed.items[0].id, count-1);
+    assert_eq!(ranks.get(), 2);
+}
+
 fn live_rows(json: Value, view: &MetadataView, data: Option<&AssetMetadata>) -> Vec<MetadataRow> {
     let Some(obj) = json.as_object() else { return Vec::new(); };
     let tags = metadata_view::raw_tags(obj);

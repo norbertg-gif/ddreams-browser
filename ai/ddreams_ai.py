@@ -436,18 +436,21 @@ class SiglipEmbedder:
 
     def encode_images(self, images: list[Any]) -> np.ndarray:
         torch = self.torch
-        batch = torch.stack([self.preprocess(image) for image in images]).to("cuda", non_blocking=True)
-        with torch.inference_mode(), torch.autocast("cuda"):
-            features = self.model.encode_image(batch)
-            features = features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        return features.float().cpu().numpy()
+        batch = torch.stack([self.preprocess(image) for image in images])
+        with self._lock:
+            batch = batch.to("cuda", non_blocking=True)
+            with torch.inference_mode(), torch.autocast("cuda"):
+                features = self.model.encode_image(batch)
+                features = features / features.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            return features.float().cpu().numpy()
 
     def _text_vector(self, query: str):
-        tokens = self.tokenizer([query]).to("cuda")
-        with self.torch.inference_mode(), self.torch.autocast("cuda"):
-            vector = self.model.encode_text(tokens)
-            vector = vector / vector.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-        return vector.to(dtype=self.torch.float16)
+        with self._lock:
+            tokens = self.tokenizer([query]).to("cuda")
+            with self.torch.inference_mode(), self.torch.autocast("cuda"):
+                vector = self.model.encode_text(tokens)
+                vector = vector / vector.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            return vector.to(dtype=self.torch.float16)
 
     def search_text(self, query: str, limit: int, index) -> dict[str, Any]:
         ids, matrix, _ = index
@@ -470,14 +473,15 @@ class SiglipEmbedder:
 
     def similar(self, asset_id: int, limit: int, index) -> dict[str, Any]:
         ids, matrix, positions = index
-        pos = positions[asset_id]
-        scores = matrix @ matrix[pos]
-        scores[pos] = -2.0
-        probs = self.torch.sigmoid(self._logit_scale * scores.float() + self._logit_bias)
-        values, chosen = self.torch.topk(scores, min(limit, max(0, len(ids) - 1)))
-        result = [{"asset_id": ids[i], "score": score, "prob": float(probs[i].item())}
-                  for score, i in zip(values.cpu().tolist(), chosen.cpu().tolist()) if score >= SIMILARITY_COSINE_FLOOR]
-        return {"results": result, "searched": len(ids)}
+        with self._lock:
+            pos = positions[asset_id]
+            scores = matrix @ matrix[pos]
+            scores[pos] = -2.0
+            probs = self.torch.sigmoid(self._logit_scale * scores.float() + self._logit_bias)
+            values, chosen = self.torch.topk(scores, min(limit, max(0, len(ids) - 1)))
+            result = [{"asset_id": ids[i], "score": score, "prob": float(probs[i].item())}
+                      for score, i in zip(values.cpu().tolist(), chosen.cpu().tolist()) if score >= SIMILARITY_COSINE_FLOOR]
+            return {"results": result, "searched": len(ids)}
 
 
 class VectorIndex:
@@ -497,12 +501,10 @@ class VectorIndex:
     def snapshot(self):
         return self.ids, self.matrix[:self.count], self.positions
 
-    def cuda_snapshot(self, torch):
-        if self._device_matrix is None:
-            device_matrix = torch.empty(self.matrix.shape, device="cuda", dtype=torch.float16)
-            device_matrix[:self.count].copy_(torch.from_numpy(self.matrix[:self.count]))
-            self._torch, self._device_matrix = torch, device_matrix
-        return self.ids, self._device_matrix[:self.count], self.positions
+    def cuda_snapshot(self):
+        if self._device_matrix is not None:
+            return self.ids, self._device_matrix[:self.count], self.positions
+        return None
 
     def upsert(self, ids: list[int], vectors: np.ndarray) -> None:
         missing = sum(int(aid) not in self.positions for aid in ids)
@@ -629,6 +631,9 @@ class AIService:
         self._model_started = False
         self._vectors: VectorIndex | None = None
         self._cuda_torch = None
+        self._vector_build_lock = threading.Lock()
+        self._vector_cuda_lock = threading.Lock()
+        self._vector_upload_lock = threading.Lock()
         self._folder_cuda_pending = False
         self._folder_catalog_lock = threading.Lock()
         self._folder_catalog = None
@@ -843,15 +848,11 @@ class AIService:
         with self.db_lock:
             removed = 0
             if prune:
-                current = {int(row[0]) for row in self.db.execute("SELECT asset_id FROM embeddings")} | {int(row[0]) for row in self.db.execute("SELECT asset_id FROM failures")} | {int(row[0]) for row in self.db.execute("SELECT asset_id FROM quality")}
+                current = {int(row[0]) for table in ("embeddings", "failures", "colors", "quality")
+                           for row in self.db.execute(f"SELECT asset_id FROM {table}")}
                 remove = current - ids
                 removed = len(remove)
-                if remove:
-                    marks = ",".join("?" for _ in remove)
-                    self.db.execute(f"DELETE FROM embeddings WHERE asset_id IN ({marks})", tuple(remove))
-                    self.db.execute(f"DELETE FROM failures WHERE asset_id IN ({marks})", tuple(remove))
-                    self.db.execute(f"DELETE FROM colors WHERE asset_id IN ({marks})", tuple(remove))
-                    self.db.execute(f"DELETE FROM quality WHERE asset_id IN ({marks})", tuple(remove))
+                self._delete_index_rows(remove)
                 self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
             old = {int(a): (str(m), int(s), int(t)) for a, m, s, t in self.db.execute("SELECT asset_id,model,size,mtime_ns FROM embeddings")}
             failed_old = {int(a): (int(s), int(t)) for a, s, t in self.db.execute("SELECT asset_id,size,mtime_ns FROM failures")}
@@ -984,6 +985,14 @@ class AIService:
             self._condition.notify_all()
         return {"forgotten": len(known)}
 
+    def _delete_index_rows(self, ids: set[int]) -> None:
+        ids = list(ids)
+        for start in range(0, len(ids), 500):
+            chunk = ids[start:start + 500]
+            marks = ",".join("?" for _ in chunk)
+            for table in ("embeddings", "failures", "colors", "quality"):
+                self.db.execute(f"DELETE FROM {table} WHERE asset_id IN ({marks})", chunk)
+
     def _light_sync(self, request: dict[str, Any]) -> dict[str, Any]:
         asset_ids = request.get("asset_ids")
         if not isinstance(asset_ids, list) or not asset_ids or any(isinstance(a, bool) or not isinstance(a, int) or a <= 0 for a in asset_ids):
@@ -1003,13 +1012,8 @@ class AIService:
                 scanned = {int(r[0]) for r in self.faces_db.execute("SELECT asset_id FROM face_scan WHERE version=?", (FACE_VERSION,))}
         vanished = known - listed
         if vanished:
-            vanished_ids = list(vanished)
             with self.db_lock:
-                for start in range(0, len(vanished_ids), 500):
-                    chunk = vanished_ids[start:start + 500]
-                    marks = ",".join("?" for _ in chunk)
-                    for table in ("embeddings", "failures", "colors", "quality"):
-                        self.db.execute(f"DELETE FROM {table} WHERE asset_id IN ({marks})", chunk)
+                self._delete_index_rows(vanished)
                 self.db.commit()
                 self.indexed_count = int(self.db.execute("SELECT count(*) FROM embeddings WHERE model=?", (self.model_name,)).fetchone()[0])
                 if self._vectors is not None:
@@ -1696,13 +1700,23 @@ class AIService:
             self._parents[kind] = parents
         return {"assets": len(labels), "assignments": sum(map(len, labels.values())), "labels": len(parents)}
 
-    def _ensure_vector_index(self) -> VectorIndex:
-        if self._vectors is None:
-            rows = self.db.execute("SELECT asset_id,vector FROM embeddings WHERE model=? AND dim=? ORDER BY asset_id", (self.model_name, DIMENSION)).fetchall()
-            values = np.empty((len(rows), DIMENSION), dtype=np.float16)
-            for i, (_, blob) in enumerate(rows): values[i] = np.frombuffer(blob, dtype=np.float16)
-            self._vectors = VectorIndex([int(aid) for aid, _ in rows], values)
-        return self._vectors
+    def _ensure_vector_index(self) -> None:
+        with self._vector_build_lock:
+            while True:
+                with self.db_lock:
+                    if self._vectors is not None:
+                        return
+                    revision = self.db.total_changes
+                    rows = self.db.execute("SELECT asset_id,vector FROM embeddings WHERE model=? AND dim=? ORDER BY asset_id",
+                                           (self.model_name, DIMENSION)).fetchall()
+                values = np.empty((len(rows), DIMENSION), dtype=np.float16)
+                for i, (_, blob) in enumerate(rows):
+                    values[i] = np.frombuffer(blob, dtype=np.float16)
+                index = VectorIndex([int(aid) for aid, _ in rows], values)
+                with self.db_lock:
+                    if revision == self.db.total_changes:
+                        self._vectors = index
+                        return
 
     @staticmethod
     def _load_vector_cuda():
@@ -1713,10 +1727,9 @@ class AIService:
             return False
 
     def _warm_folder_cuda(self) -> None:
-        backend = self._load_vector_cuda()
-        with self.db_lock:
+        with self._vector_cuda_lock:
             if self._cuda_torch is None:
-                self._cuda_torch = backend
+                self._cuda_torch = self._load_vector_cuda()
 
     def _folder_vector_snapshot(self):
         # A small selection can be ranked immediately while Torch and CUDA initialize.
@@ -1727,14 +1740,35 @@ class AIService:
         return self._index_snapshot(use_cuda=self._cuda_torch is not None)
 
     def _index_snapshot(self, *, use_cuda: bool = False) -> tuple[list[int], Any, dict[int, int]]:
+        if self._vectors is None:
+            self._ensure_vector_index()
         with self.db_lock:
-            index = self._ensure_vector_index()
-            if use_cuda and index.count:
-                if self._cuda_torch is None:
-                    self._cuda_torch = self._load_vector_cuda()
-                if self._cuda_torch:
-                    return index.cuda_snapshot(self._cuda_torch)
-            return index.snapshot()
+            index = self._vectors
+            if not use_cuda or not index.count or self._cuda_torch is False:
+                return index.snapshot()
+            cached = index.cuda_snapshot()
+            if cached is not None:
+                return cached
+        self._warm_folder_cuda()
+        torch = self._cuda_torch
+        with self._vector_upload_lock:
+            while True:
+                with self.db_lock:
+                    if not torch or not index.count:
+                        return index.snapshot()
+                    cached = index.cuda_snapshot()
+                    if cached is not None:
+                        return cached
+                    ids, vectors, _ = index.snapshot()
+                    shape = index.matrix.shape
+                device_matrix = torch.empty(shape, device="cuda", dtype=torch.float16)
+                device_matrix[:len(ids)].copy_(torch.from_numpy(vectors))
+                with self.db_lock:
+                    # Every upsert or removal replaces ids. Publish only a matching GPU copy.
+                    if index.ids is ids:
+                        index._torch, index._device_matrix = torch, device_matrix
+                        return index.cuda_snapshot()
+                del device_matrix
 
     def _similar_probability(self, score: float) -> float | None:
         if not self._similar_logits_checked:

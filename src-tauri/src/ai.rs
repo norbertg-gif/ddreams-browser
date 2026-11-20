@@ -61,7 +61,6 @@ struct AiInner {
     label_generations: [AtomicU64; 2],
     last_stderr: Mutex<String>,
     stderr_reader: Mutex<Option<thread::JoinHandle<()>>>,
-    similarity_order_cache: Mutex<HashMap<u64, Vec<i64>>>,
 }
 
 #[derive(Clone)]
@@ -82,7 +81,6 @@ impl AiService {
             colors_attached: AtomicBool::new(false),
             color_learn_generation: AtomicU64::new(0),
             label_generations: [AtomicU64::new(0), AtomicU64::new(0)],
-            similarity_order_cache: Mutex::new(HashMap::new()),
         }))
     }
 
@@ -93,8 +91,7 @@ impl AiService {
     pub fn ensure_colors_attached(&self) -> bool {
         if self.0.colors_attached.load(Ordering::Relaxed) { return self.has_colors_table(); }
         if !self.0.paths.ai_db.is_file() { return false; }
-        let path=self.0.paths.ai_db.to_string_lossy().replace('\\',"/").replace(' ',"%20");
-        let uri=format!("file:{path}?mode=ro");
+        let uri = readonly_sqlite_uri(&self.0.paths.ai_db);
         let Ok(conn)=self.0.db.lock() else{return false};
         if conn.execute("ATTACH DATABASE ?1 AS ai",[uri]).is_ok() { self.0.colors_attached.store(true,Ordering::Relaxed);drop(conn);self.has_colors_table() } else { false }
     }
@@ -362,10 +359,9 @@ impl AiService {
     }
 
     pub fn order_by_similarity(&self,asset_ids:Vec<i64>)->Result<Vec<i64>,String>{
-        use std::hash::{Hash,Hasher};let mut hasher=std::collections::hash_map::DefaultHasher::new();asset_ids.hash(&mut hasher);let key=hasher.finish();
-        if let Some(ids)=self.0.similarity_order_cache.lock().map_err(|e|e.to_string())?.get(&key).cloned(){return Ok(ids)}
-        let result=self.request("order_by_similarity",json!({"asset_ids":asset_ids}),Duration::from_secs(300))?;let ids=result.get("asset_ids").and_then(Value::as_array).ok_or("AI vrátilo neplatné poradie")?.iter().filter_map(Value::as_i64).collect::<Vec<_>>();
-        let mut cache=self.0.similarity_order_cache.lock().map_err(|e|e.to_string())?;if cache.len()>128{cache.clear()}cache.insert(key,ids.clone());Ok(ids)
+        let result = self.request("order_by_similarity", json!({"asset_ids":asset_ids}), Duration::from_secs(300))?;
+        let ids = result.get("asset_ids").and_then(Value::as_array).ok_or("AI vrátilo neplatné poradie")?;
+        Ok(ids.iter().filter_map(Value::as_i64).collect())
     }
 
     pub fn suggest(&self, asset_ids: Vec<i64>, kind: &str) -> Result<Value, String> {
@@ -416,7 +412,23 @@ impl AiService {
         for id in asset_ids { n+=conn.execute("INSERT OR IGNORE INTO ai_suggestion_rejections(asset_id,kind,label_id) SELECT ?1,?2,?3 WHERE EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",rusqlite::params![id,kind,label_id]).map_err(|e|e.to_string())?; } Ok(n)
     }
 
-    pub fn suggestion_groups(&self,kind:&str)->Result<Value,String>{let kind=valid_label_kind(kind)?;let result=self.request("suggest_batch",json!({"kind":kind,"asset_ids":"unlabeled"}),Duration::from_secs(300))?;let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();let conn=self.0.db.lock().map_err(|e|e.to_string())?;let mut out=Vec::new();for group in groups{let Some(label_id)=group.get("label_id").and_then(Value::as_i64)else{continue};let ids=group.get("asset_ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect::<Vec<_>>();let mut listed=std::collections::HashSet::new();let mut rejected=std::collections::HashSet::new();for id in &ids{if conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1)",[id],|r|r.get::<_,bool>(0)).unwrap_or(false){listed.insert(*id);}if conn.query_row("SELECT EXISTS(SELECT 1 FROM ai_suggestion_rejections WHERE asset_id=?1 AND kind=?2 AND label_id=?3)",rusqlite::params![id,kind,label_id],|r|r.get::<_,bool>(0)).unwrap_or(false){rejected.insert(*id);}}let accepted=filter_group_assets(&ids,&listed,&rejected);if !accepted.is_empty(){out.push(json!({"labelId":label_id,"path":label_path(&conn,kind,label_id)?,"count":accepted.len(),"assetIds":accepted}));}}out.sort_by(|a,b|b["count"].as_u64().cmp(&a["count"].as_u64()));Ok(Value::Array(out))}
+    pub fn suggestion_groups(&self, kind: &str) -> Result<Value, String> {
+        let kind = valid_label_kind(kind)?;
+        let result = self.request("suggest_batch", json!({"kind":kind,"asset_ids":"unlabeled"}), Duration::from_secs(300))?;
+        let conn = self.0.db.lock().map_err(|e| e.to_string())?;
+        let has_rejections = conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_suggestion_rejections')", [], |r| r.get::<_, bool>(0)).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for group in result.get("groups").and_then(Value::as_array).into_iter().flatten() {
+            let Some(label_id) = group.get("label_id").and_then(Value::as_i64) else { continue };
+            let ids = group_ids(group, "asset_ids");
+            let accepted = eligible_group_ids(&conn, ids, false, has_rejections.then_some((kind, label_id)))?;
+            if !accepted.is_empty() {
+                out.push(json!({"labelId":label_id,"path":label_path(&conn,kind,label_id)?,"count":accepted.len(),"assetIds":accepted}));
+            }
+        }
+        out.sort_by(|a,b| b["count"].as_u64().cmp(&a["count"].as_u64()));
+        Ok(Value::Array(out))
+    }
 
     pub fn unsorted_clusters(&self,min_size:Option<u32>)->Result<Value,String>{
         let mut args=json!({"limit":30});if let Some(value)=min_size{args["min_size"]=json!(value);}
@@ -424,9 +436,8 @@ impl AiService {
         let groups=result.get("groups").and_then(Value::as_array).cloned().unwrap_or_default();
         let conn=self.0.db.lock().map_err(|e|e.to_string())?;let mut out=Vec::new();
         for group in groups{
-            let ids=group.get("ids").and_then(Value::as_array).cloned().unwrap_or_default().into_iter().filter_map(|v|v.as_i64()).collect::<Vec<_>>();
-            let mut listed=std::collections::HashSet::new();for id in &ids{if conn.query_row("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND is_listed=1 AND ext_lower<>'')",[id],|r|r.get::<_,bool>(0)).unwrap_or(false){listed.insert(*id);}}
-            let accepted=ids.into_iter().filter(|id|listed.contains(id)).collect::<Vec<_>>();if accepted.is_empty(){continue;}
+            let accepted = eligible_group_ids(&conn, group_ids(&group, "ids"), true, None)?;
+            if accepted.is_empty() { continue; }
             let label_id=group.get("label_id").and_then(Value::as_i64);let label_path=label_id.map(|id|label_path(&conn,"category",id)).transpose()?;
             out.push(json!({"ids":accepted,"total":group.get("total").and_then(Value::as_u64).unwrap_or(0),"cohesion":group.get("cohesion").and_then(Value::as_f64).unwrap_or(0.0),"labelId":label_id,"labelPath":label_path,"name":group.get("name").and_then(Value::as_str),"labelScore":group.get("label_score").and_then(Value::as_f64)}));
         }
@@ -689,9 +700,56 @@ fn sync_catalog_ids(rows: &[(i64, Option<String>)]) -> Result<Vec<i64>, String> 
     Ok(rows.iter().map(|(id, _)| *id).collect())
 }
 
+fn readonly_sqlite_uri(path: &std::path::Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/")
+        .replace('%', "%25").replace('?', "%3F").replace('#', "%23").replace(' ', "%20");
+    format!("file:{path}?mode=ro")
+}
+
+#[test]
+fn readonly_sqlite_uri_encodes_path_delimiters_once() {
+    assert_eq!(readonly_sqlite_uri(std::path::Path::new(r"G:\Foto #2\%20 ?.sqlite")),
+        "file:G:/Foto%20%232/%2520%20%3F.sqlite?mode=ro");
+}
+
+#[test]
+fn sqlite_attaches_read_only_database_with_literal_percent_and_hash() {
+    let path = std::env::temp_dir().join(format!("ddreams-ai %20 #-{}-{:?}.sqlite", std::process::id(), std::thread::current().id()));
+    let disk = rusqlite::Connection::open(&path).unwrap();
+    disk.execute_batch("CREATE TABLE colors(asset_id INTEGER); INSERT INTO colors VALUES(42);").unwrap();
+    drop(disk);
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute("ATTACH DATABASE ?1 AS ai", [readonly_sqlite_uri(&path)]).unwrap();
+    assert_eq!(conn.query_row("SELECT asset_id FROM ai.colors", [], |r| r.get::<_, i64>(0)).unwrap(), 42);
+    assert!(conn.execute("DELETE FROM ai.colors", []).is_err());
+    drop(conn);
+    std::fs::remove_file(path).unwrap();
+}
+
 fn valid_label_kind(kind:&str)->Result<&'static str,String>{match kind{"category"=>Ok("category"),"keyword"=>Ok("keyword"),_=>Err("Neplatný typ štítku".into())}}
-fn filter_unrejected_assets(candidates:&[i64],rejected:&std::collections::HashSet<i64>)->Vec<i64>{candidates.iter().copied().filter(|id|!rejected.contains(id)).collect()}
-fn filter_group_assets(candidates:&[i64],listed:&std::collections::HashSet<i64>,rejected:&std::collections::HashSet<i64>)->Vec<i64>{filter_unrejected_assets(candidates,rejected).into_iter().filter(|id|listed.contains(id)).collect()}
+fn group_ids(group: &Value, field: &str) -> Vec<i64> {
+    group.get(field).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_i64).collect()
+}
+
+fn eligible_group_ids(conn: &rusqlite::Connection, ids: Vec<i64>, files_only: bool, rejection: Option<(&str, i64)>) -> Result<Vec<i64>, String> {
+    let mut accepted = std::collections::HashSet::new();
+    for chunk in ids.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let extension = if files_only { " AND a.ext_lower<>''" } else { "" };
+        let excluded = if rejection.is_some() {
+            " AND NOT EXISTS(SELECT 1 FROM ai_suggestion_rejections r WHERE r.asset_id=a.id AND r.kind=? AND r.label_id=?)"
+        } else { "" };
+        let mut args = chunk.iter().copied().map(rusqlite::types::Value::from).collect::<Vec<_>>();
+        if let Some((kind, label)) = rejection { args.extend([kind.to_owned().into(), label.into()]); }
+        let mut stmt = conn.prepare_cached(&format!("SELECT a.id FROM assets a WHERE a.id IN ({marks}) AND a.is_listed=1{extension}{excluded}"))
+            .map_err(|e| e.to_string())?;
+        for id in stmt.query_map(rusqlite::params_from_iter(args), |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())? {
+            accepted.insert(id.map_err(|e| e.to_string())?);
+        }
+    }
+    Ok(ids.into_iter().filter(|id| accepted.contains(id)).collect())
+}
+
 /// Splits a visually similar group into "same photo" parts. Two photos are the same when they share
 /// the base name (copies, RAW+JPG pair, `tag`/`-1`/` (2)` variants) and their EXIF capture times don't
 /// differ. File size is no evidence: uncompressed Sony RAW files of a burst have identical sizes.
@@ -742,16 +800,16 @@ mod suggestion_tests {
     }
 
     #[test]
-    fn suggest_rejections_filter_only_rejected_assets(){
-        let candidates=[1,2,3];let rejected=std::collections::HashSet::from([2]);
-        assert_eq!(filter_unrejected_assets(&candidates,&rejected),vec![1,3]);
-        assert!(filter_unrejected_assets(&[2],&rejected).is_empty());
-    }
-
-    #[test]
-    fn group_rejections_and_unlisted_assets_are_filtered(){
-        let candidates=[1,2,3];let listed=std::collections::HashSet::from([1,2]);let rejected=std::collections::HashSet::from([2]);
-        assert_eq!(filter_group_assets(&candidates,&listed,&rejected),vec![1]);
+    fn batched_group_checks_preserve_order_and_filter_rejections() {
+        let db = rusqlite::Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,is_listed INTEGER,ext_lower TEXT);
+            CREATE TABLE ai_suggestion_rejections(asset_id INTEGER,kind TEXT,label_id INTEGER,PRIMARY KEY(asset_id,kind,label_id));
+            INSERT INTO assets VALUES(1,1,'jpg'),(2,1,'jpg'),(3,0,'jpg'),(4,1,'');
+            INSERT INTO ai_suggestion_rejections VALUES(2,'keyword',20);").unwrap();
+        let mut ids = vec![900; 510];
+        ids.extend([4,3,2,1,2]);
+        assert_eq!(eligible_group_ids(&db,ids.clone(),false,Some(("keyword",20))).unwrap(), [4,1]);
+        assert_eq!(eligible_group_ids(&db,ids,true,None).unwrap(), [2,1,2]);
     }
 
     #[test]

@@ -164,12 +164,22 @@ impl CatalogWriter {
         let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let ids=assets_under(&conn,path)?;
         let mut impact=ExclusionImpact{files:ids.len(),..Default::default()};
-        for id in ids {
-            let has=|sql:&str|conn.query_row(sql,[id],|r|r.get::<_,bool>(0)).map_err(|e|e.to_string());
-            if has("SELECT EXISTS(SELECT 1 FROM asset_categories WHERE asset_id=?1)")? {impact.with_categories+=1;}
-            if has("SELECT EXISTS(SELECT 1 FROM asset_keywords WHERE asset_id=?1)")? {impact.with_keywords+=1;}
-            if has("SELECT EXISTS(SELECT 1 FROM assets WHERE id=?1 AND (coalesce(rating,0)<>0 OR coalesce(label,'')<>'' OR coalesce(tagged,0)<>0))")? {impact.with_rating_label_tagged+=1;}
-            if has("SELECT EXISTS(SELECT 1 FROM asset_color_overrides WHERE asset_id=?1)")? {impact.with_color_overrides+=1;}
+        for chunk in ids.chunks(500) {
+            let marks = vec!["?"; chunk.len()].join(",");
+            let mut stmt = conn.prepare_cached(&format!(
+                "SELECT coalesce(sum(EXISTS(SELECT 1 FROM asset_categories c WHERE c.asset_id=a.id)),0),
+                        coalesce(sum(EXISTS(SELECT 1 FROM asset_keywords k WHERE k.asset_id=a.id)),0),
+                        coalesce(sum(coalesce(a.rating,0)<>0 OR coalesce(a.label,'')<>'' OR coalesce(a.tagged,0)<>0),0),
+                        coalesce(sum(EXISTS(SELECT 1 FROM asset_color_overrides c WHERE c.asset_id=a.id)),0)
+                 FROM assets a WHERE a.id IN ({marks})"
+            )).map_err(|e| e.to_string())?;
+            let (categories, keywords, values, colors) = stmt.query_row(rusqlite::params_from_iter(chunk),
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?)))
+                .map_err(|e| e.to_string())?;
+            impact.with_categories += categories as usize;
+            impact.with_keywords += keywords as usize;
+            impact.with_rating_label_tagged += values as usize;
+            impact.with_color_overrides += colors as usize;
         }
         Ok(impact)
     }

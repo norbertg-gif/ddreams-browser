@@ -591,7 +591,18 @@ fn catalog_asset_filter(conn: &Connection, filter: &AssetFilter, formats: &Forma
 pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
     if filter.kind == "ai" || filter.kind == "series" || filter.kind == "people" { return ai_assets_page(db, filter, formats); }
     let conn = db.lock().unwrap();
-    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let (ids, total_size) = catalog_ordered_ids(db, &conn, filter, formats)?;
+    let total = ids.len() as i64;
+    let start = (filter.offset.max(0) as u64).min(ids.len() as u64) as usize;
+    let end = start.saturating_add(filter.limit.clamp(1, 500) as usize).min(ids.len());
+    let items = hydrate_asset_ids(&conn, &ids[start..end], filter)?;
+    Ok(AssetPage { items, total, total_size })
+}
+
+pub(crate) fn catalog_ordered_ids(db: &Db, conn: &Connection, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<(Arc<Vec<i64>>, f64)> {
+    if filter.kind == "ai" {
+        return collect_ordered_ids(conn, ai_asset_filter(filter, formats)?, "r.ord");
+    }
     let CatalogAssetFilter { with_sql, from_sql, where_sql, args } = catalog_asset_filter(&conn, filter, formats)?;
     let order = order_clause(&filter.sort, filter.descending);
     let cacheable = conn.is_autocommit() && !matches!(filter.kind.as_str(), "auto" | "color" | "quality")
@@ -621,16 +632,7 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
     let (ids, total_size) = match cached {
         Some(result) => result,
         None => {
-            let sql = format!("{with_sql} SELECT a.id,a.size FROM {from_sql} WHERE {where_sql} ORDER BY {order}");
-            let mut stmt = conn.prepare(&sql)?;
-            let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
-            let mut ids = Vec::new();
-            let mut total_size = 0.0;
-            while let Some(row) = rows.next()? {
-                ids.push(row.get(0)?);
-                total_size += row.get::<_, Option<f64>>(1)?.unwrap_or(0.0);
-            }
-            let ids = Arc::new(ids);
+            let (ids, total_size) = collect_ordered_ids(conn, CatalogAssetFilter { with_sql, from_sql, where_sql, args }, &order)?;
             if cacheable {
                 let mut cache = CACHE.lock().unwrap();
                 cache.retain(|entry| entry.key != key && entry.db.strong_count() > 0 && entry.at.elapsed().as_secs() < 60);
@@ -640,10 +642,25 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
             (ids, total_size)
         }
     };
-    let total = ids.len() as i64;
-    let start = (filter.offset.max(0) as u64).min(ids.len() as u64) as usize;
-    let end = start.saturating_add(filter.limit.clamp(1, 500) as usize).min(ids.len());
-    let page_ids = &ids[start..end];
+    Ok((ids, total_size))
+}
+
+fn collect_ordered_ids(conn: &Connection, filter: CatalogAssetFilter, order: &str) -> rusqlite::Result<(Arc<Vec<i64>>, f64)> {
+    let CatalogAssetFilter { with_sql, from_sql, where_sql, args } = filter;
+    let sql = format!("{with_sql} SELECT a.id,a.size FROM {from_sql} WHERE {where_sql} ORDER BY {order}");
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(args.iter()))?;
+    let mut ids = Vec::new();
+    let mut total_size = 0.0;
+    while let Some(row) = rows.next()? {
+        ids.push(row.get(0)?);
+        total_size += row.get::<_, Option<f64>>(1)?.unwrap_or(0.0);
+    }
+    Ok((Arc::new(ids), total_size))
+}
+
+pub(crate) fn hydrate_asset_ids(conn: &Connection, page_ids: &[i64], filter: &AssetFilter) -> rusqlite::Result<Vec<Asset>> {
+    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
     let mut items = Vec::with_capacity(page_ids.len());
     if !page_ids.is_empty() {
         let sql = format!("SELECT {selected_cols} FROM assets a WHERE a.id IN ({})", vec!["?"; page_ids.len()].join(","));
@@ -652,19 +669,17 @@ pub fn assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusq
         let mut by_id = rows.map(|row| row.map(|asset| (asset.id, asset))).collect::<rusqlite::Result<HashMap<_, _>>>()?;
         for id in page_ids { if let Some(asset) = by_id.remove(id) { items.push(asset); } }
     }
-    Ok(AssetPage { items, total, total_size })
+    Ok(items)
 }
 
-fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
+fn ai_asset_filter(filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<CatalogAssetFilter> {
     let mut seen = HashSet::new();
-    let cap=match filter.kind.as_str(){"series"=>20_000,"people"=>50_000,_=>500};
+    let cap = if filter.kind == "series" { 20_000 } else { 50_000 };
     let ids = filter.ids.as_deref().unwrap_or_default().iter().copied().filter(|id| *id > 0 && seen.insert(*id)).take(cap).collect::<Vec<_>>();
-    if ids.is_empty() { return Ok(AssetPage { items: Vec::new(), total: 0, total_size: 0.0 }); }
-    let requested = ids.iter().enumerate().map(|(index, _)| format!("(?{}, {})", index + 1, index)).collect::<Vec<_>>().join(",");
-    let with_sql = if filter.kind=="people" { "WITH requested(id,ord) AS MATERIALIZED (SELECT CAST(value AS INTEGER),CAST(key AS INTEGER) FROM json_each(?))".to_owned() } else { format!("WITH requested(id,ord) AS (VALUES {requested})") };
+    let with_sql = "WITH requested(id,ord) AS MATERIALIZED (SELECT CAST(value AS INTEGER),CAST(key AS INTEGER) FROM json_each(?))";
     let from_sql = "requested r CROSS JOIN assets a ON a.id=r.id";
     let mut where_sql = format!("a.id>0 AND a.is_listed=1 AND {}", formats.sql_not_in("a.ext_lower", &formats.hidden_extensions()));
-    let mut args = if filter.kind=="people" { vec![serde_json::to_string(&ids).unwrap_or_else(|_|"[]".into()).into()] } else { ids.iter().copied().map(Into::into).collect::<Vec<rusqlite::types::Value>>() };
+    let mut args = vec![serde_json::to_string(&ids).map_err(|err| rusqlite::Error::ToSqlConversionFailure(Box::new(err)))?.into()];
     if let Some(q) = filter.query.as_ref().filter(|q| !q.trim().is_empty()) {
         where_sql.push_str(" AND (a.name LIKE ? ESCAPE '\\' OR coalesce(a.caption,'') LIKE ? ESCAPE '\\' OR coalesce(a.notes,'') LIKE ? ESCAPE '\\')");
         let escaped = q.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_");
@@ -674,6 +689,11 @@ fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusql
         add_date_filter(&mut where_sql, &mut args, filter, formats);
     }
     add_view_filters(&mut where_sql, &mut args, filter, formats);
+    Ok(CatalogAssetFilter { with_sql: with_sql.into(), from_sql: from_sql.into(), where_sql, args })
+}
+
+fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusqlite::Result<AssetPage> {
+    let CatalogAssetFilter { with_sql, from_sql, where_sql, mut args } = ai_asset_filter(filter, formats)?;
     let conn = db.lock().unwrap();
     let count_sql = format!("{with_sql} SELECT count(*),coalesce(sum(a.size),0) FROM {from_sql} WHERE {where_sql}");
     let (total,total_size):(i64,f64)=conn.query_row(&count_sql,rusqlite::params_from_iter(args.iter()),|row|Ok((row.get(0)?,row.get(1)?)))?;
@@ -925,6 +945,10 @@ pub fn nodes_page(
     }
 }
 
+fn escape_like(query: &str) -> String {
+    query.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
+
 pub fn keyword_search_page(
     db: &Db,
     query: &str,
@@ -932,10 +956,10 @@ pub fn keyword_search_page(
     limit: i64,
 ) -> rusqlite::Result<Vec<CatalogNode>> {
     let conn = db.lock().unwrap();
-    let mut stmt=conn.prepare("SELECT k.id,k.parent_id,NULL,k.name,(SELECT count(*) FROM asset_keywords ak WHERE ak.keyword_id=k.id) FROM keywords k WHERE k.name LIKE ? COLLATE NOCASE ORDER BY k.name COLLATE NOCASE,k.id LIMIT ? OFFSET ?")?;
+    let mut stmt=conn.prepare("SELECT k.id,k.parent_id,NULL,k.name,(SELECT count(*) FROM asset_keywords ak WHERE ak.keyword_id=k.id) FROM keywords k WHERE k.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY k.name COLLATE NOCASE,k.id LIMIT ? OFFSET ?")?;
     stmt.query_map(
         params![
-            format!("%{}%", query.replace('%', "\\%").replace('_', "\\_")),
+            format!("%{}%", escape_like(query)),
             limit.clamp(1, 500),
             offset.max(0)
         ],
@@ -958,17 +982,17 @@ pub fn catalog_tree_search(db:&Db, kind:&str, query:&str, offset:i64, limit:i64,
     let conn=db.lock().unwrap();
     let sql=if kind=="category" {
         if include_children {
-            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM categories UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=closure.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,t.root_id,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM categories UNION SELECT closure.ancestor_id,c.id FROM closure JOIN categories c ON c.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ac.asset_id) n FROM closure CROSS JOIN asset_categories ac INDEXED BY idx_asset_categories_category_asset CROSS JOIN assets a WHERE ac.category_id=closure.id AND a.id=ac.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,t.root_id,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
         } else {
-            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,t.root_id,t.path,(SELECT count(DISTINCT ac.asset_id) FROM asset_categories ac JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 WHERE ac.category_id=t.id) FROM t WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+            "WITH RECURSIVE t(id,parent_id,root_id,name,path,ancestry) AS (SELECT c.id,c.parent_id,c.root_id,c.name,coalesce((SELECT r.name FROM category_roots r WHERE r.id=c.root_id)||' > ','')||c.name,','||c.id||',' FROM categories c WHERE c.parent_id IS NULL OR c.parent_id=0 UNION SELECT n.id,n.parent_id,n.root_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM categories n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,t.root_id,t.path,(SELECT count(DISTINCT ac.asset_id) FROM asset_categories ac JOIN assets a ON a.id=ac.asset_id AND a.is_listed=1 WHERE ac.category_id=t.id) FROM t WHERE t.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
         }
     } else if include_children {
-        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure CROSS JOIN asset_keywords ak INDEXED BY idx_asset_keywords_keyword_asset CROSS JOIN assets a WHERE ak.keyword_id=closure.id AND a.id=ak.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,NULL,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0), closure(ancestor_id,id) AS (SELECT id,id FROM keywords UNION SELECT closure.ancestor_id,k.id FROM closure JOIN keywords k ON k.parent_id=closure.id), counts AS (SELECT closure.ancestor_id,count(DISTINCT ak.asset_id) n FROM closure CROSS JOIN asset_keywords ak INDEXED BY idx_asset_keywords_keyword_asset CROSS JOIN assets a WHERE ak.keyword_id=closure.id AND a.id=ak.asset_id AND a.is_listed=1 GROUP BY closure.ancestor_id) SELECT t.id,t.parent_id,NULL,t.path,coalesce(counts.n,0) FROM t LEFT JOIN counts ON counts.ancestor_id=t.id WHERE t.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
     } else {
-        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,NULL,t.path,(SELECT count(DISTINCT ak.asset_id) FROM asset_keywords ak JOIN assets a ON a.id=ak.asset_id AND a.is_listed=1 WHERE ak.keyword_id=t.id) FROM t WHERE t.name LIKE ? COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
+        "WITH RECURSIVE t(id,parent_id,name,path,ancestry) AS (SELECT id,parent_id,name,name,','||id||',' FROM keywords WHERE parent_id IS NULL OR parent_id=0 UNION SELECT n.id,n.parent_id,n.name,t.path||' > '||n.name,t.ancestry||n.id||',' FROM keywords n JOIN t ON n.parent_id=t.id WHERE instr(t.ancestry,','||n.id||',')=0) SELECT t.id,t.parent_id,NULL,t.path,(SELECT count(DISTINCT ak.asset_id) FROM asset_keywords ak JOIN assets a ON a.id=ak.asset_id AND a.is_listed=1 WHERE ak.keyword_id=t.id) FROM t WHERE t.name LIKE ? ESCAPE '\\' COLLATE NOCASE ORDER BY t.path COLLATE NOCASE LIMIT ? OFFSET ?"
     };
     let mut stmt=conn.prepare(sql)?;
-    let mut nodes=stmt.query_map(params![format!("%{}%",query.replace('%',"\\%").replace('_',"\\_")),limit.clamp(1,500),offset.max(0)],|r|Ok(CatalogNode{id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,count:r.get(4)?,has_children:false,icon_key:None}))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut nodes=stmt.query_map(params![format!("%{}%",escape_like(query)),limit.clamp(1,500),offset.max(0)],|r|Ok(CatalogNode{id:r.get(0)?,parent_id:r.get(1)?,root_id:r.get(2)?,name:r.get(3)?,count:r.get(4)?,has_children:false,icon_key:None}))?.collect::<rusqlite::Result<Vec<_>>>()?;
     if kind=="category" {
         for node in &mut nodes {
             let mut parts=node.name.split(" > ").collect::<Vec<_>>();
@@ -1109,6 +1133,42 @@ mod feature_tests {
         assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
+    #[test]
+    fn catalogue_search_treats_sql_wildcards_and_backslash_as_literals() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch(
+            "INSERT INTO keywords VALUES(1,NULL,'A%_\\B'),(2,NULL,'Axx\\B');
+             INSERT INTO categories VALUES(1,NULL,NULL,'A%_\\B'),(2,NULL,NULL,'Axx\\B');"
+        ).unwrap();
+        for query in ["%", "_", r"%_\"] {
+            assert_eq!(keyword_search_page(&db, query, 0, 20).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [1]);
+            for kind in ["category", "keyword"] {
+                for children in [false, true] {
+                    assert_eq!(catalog_tree_search(&db, kind, query, 0, 20, children).unwrap().iter().map(|n| n.id).collect::<Vec<_>>(), [1]);
+                }
+            }
+        }
+        assert_eq!(keyword_search_page(&db, r"\", 0, 20).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn ai_view_pages_past_500_ids_in_requested_order() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch(
+            "WITH RECURSIVE n(id) AS (VALUES(1) UNION ALL SELECT id+1 FROM n WHERE id<620)
+             INSERT INTO assets(id,name,ext,ext_lower,is_listed,size) SELECT id,'a.jpg','jpg','jpg',1,1 FROM n;"
+        ).unwrap();
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let mut filter = test_filter("ai", "");
+        filter.ids = Some((1..=620).rev().collect());
+        filter.offset = 500;
+        filter.limit = 4;
+        let page = assets_page(&db, &filter, &formats).unwrap();
+        assert_eq!((page.total, page.total_size), (620, 620.0));
+        assert_eq!(page.items.iter().map(|a| a.id).collect::<Vec<_>>(), [120,119,118,117]);
+        assert_eq!(asset_ids_page(&db, &filter, &formats, 500, 4).unwrap(), [120,119,118,117]);
+    }
+
     #[test]
     fn asset_id_pages_match_grid_for_every_view_kind() {
         let db = test_db();

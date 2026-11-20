@@ -1,5 +1,5 @@
 import builtins
-from contextlib import closing
+from contextlib import closing, nullcontext
 import io
 import json
 import os
@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 from PIL import Image, ImageFilter
 
-from ddreams_ai import AIService, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
+from ddreams_ai import AIService, SiglipEmbedder, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
 from ddreams_ai import DECODER_VERSION, RAW_EXTENSIONS, decode_photo
 from faces_schema import ensure_faces_schema
 from import_acdsee_faces import import_acdsee_faces
@@ -28,6 +28,33 @@ class FakePhoto:
 
 def set_vectors(service, vectors):
     service._vectors = VectorIndex(list(vectors), np.stack(list(vectors.values())))
+
+class SiglipLockTests(unittest.TestCase):
+    def test_preprocessing_is_unlocked_but_model_and_tokenizer_are_serialized(self):
+        embedder = SiglipEmbedder.__new__(SiglipEmbedder)
+        embedder._lock = threading.RLock()
+        calls = []
+        tensor = MagicMock()
+        tensor.to.return_value = tensor
+        tensor.__truediv__.return_value = tensor
+
+        def stage(name, locked):
+            def call(*args):
+                self.assertEqual(embedder._lock._is_owned(), locked, name)
+                calls.append(name)
+                return tensor
+            return call
+
+        embedder.torch = SimpleNamespace(stack=stage("stack", False), inference_mode=nullcontext,
+                                         autocast=nullcontext, float16="fp16")
+        embedder.preprocess = stage("preprocess", False)
+        embedder.tokenizer = stage("tokenizer", True)
+        embedder.model = SimpleNamespace(encode_image=stage("encode_image", True),
+                                         encode_text=stage("encode_text", True))
+        embedder.encode_images([object()])
+        embedder._text_vector("demo")
+        self.assertEqual(calls, ["preprocess", "stack", "encode_image", "tokenizer", "encode_text"])
+
 
 class RawDecodeTests(unittest.TestCase):
     def test_all_catalogue_raw_extensions_are_recognized(self):
@@ -807,6 +834,60 @@ class ServerTests(unittest.TestCase):
 
     def index(self, items, prune=False):
         return self.service.execute({"cmd": "index", "items": items, "prune": prune})
+
+    def test_prune_chunks_ids_and_includes_colors_only(self):
+        with self.service.db_lock:
+            self.service.db.executemany("INSERT INTO failures VALUES(?,?,?,?,?)",
+                                       [(aid, 1, 2, "synthetic", 0.0) for aid in range(1, 700)])
+            self.service.db.executemany("INSERT INTO colors VALUES(?,?,?,?,?,?)",
+                                       [(aid, 1, 2, "{}", "[]", COLOR_VERSION) for aid in range(700, 1101)])
+            self.service.db.commit()
+            previous_limit = self.service.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 600)
+        try:
+            self.assertEqual(self.index([], prune=True)["pruned"], 1100)
+            with self.service.db_lock:
+                self.assertEqual(self.service.db.execute("SELECT count(*) FROM colors").fetchone()[0], 0)
+                self.assertEqual(self.service.db.execute("SELECT count(*) FROM failures").fetchone()[0], 0)
+        finally:
+            with self.service.db_lock:
+                self.service.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, previous_limit)
+
+    def test_cuda_upload_does_not_hold_db_lock_and_retries_after_mutation(self):
+        started, released = threading.Event(), threading.Event()
+        uploads, output = [], []
+
+        class DeviceArray(np.ndarray):
+            def copy_(self, values):
+                self[...] = values
+
+        def empty(shape, **kwargs):
+            uploads.append(shape)
+            if len(uploads) == 1:
+                started.set()
+                if not released.wait(5):
+                    raise RuntimeError("upload was not released")
+            return np.empty(shape, dtype=np.float16).view(DeviceArray)
+
+        with self.service.db_lock:
+            set_vectors(self.service, {1: np.ones(4, dtype=np.float16)})
+            self.service._cuda_torch = SimpleNamespace(empty=empty, from_numpy=lambda array: array, float16=np.float16)
+        worker = threading.Thread(target=lambda: output.append(self.service._index_snapshot(use_cuda=True)))
+        worker.start()
+        try:
+            self.assertTrue(started.wait(5))
+            acquired = self.service.db_lock.acquire(timeout=1)
+            self.assertTrue(acquired)
+            try:
+                self.service._vectors.upsert([2], np.full((1, 4), 2, dtype=np.float16))
+            finally:
+                self.service.db_lock.release()
+        finally:
+            released.set()
+            worker.join(5)
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(len(uploads), 2)
+        self.assertEqual(output[0][0], [1, 2])
+        np.testing.assert_array_equal(output[0][1], [[1]*4, [2]*4])
 
     def test_protocol_happy_path_and_search_ordering(self):
         east1 = self.make_file("east-1.jpg")

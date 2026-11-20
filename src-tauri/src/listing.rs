@@ -1,18 +1,46 @@
 use crate::{db::{self, Asset, AssetFilter, AssetPage, Db}, formats::FormatTable};
-use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, Ordering}, mpsc}, time::Duration};
+use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}, mpsc}, time::Duration};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFLINE_RETRY: Duration = Duration::from_secs(8);
+const MAX_LISTINGS: usize = 32;
+const MAX_LISTING_ROWS: usize = 125_000;
+const MAX_TEMPORARY_ENTRIES: usize = 125_000;
+
+#[derive(Default)]
+struct TemporaryEntries {
+    entries: BTreeMap<i64, Asset>,
+    parents: HashMap<i64, i64>,
+    paths: HashMap<String, i64>,
+}
+
+impl TemporaryEntries {
+    fn insert(&mut self, asset: Asset, parent: Option<i64>) {
+        let id = asset.id;
+        if asset.is_directory {
+            if let Some(parent) = parent { self.parents.insert(id, parent); }
+            if let Some(path) = asset.path.as_deref() { self.paths.insert(normalize(path), id); }
+        }
+        self.entries.insert(id, asset);
+        while self.entries.len() > MAX_TEMPORARY_ENTRIES {
+            let Some((id, entry)) = self.entries.pop_last() else { break };
+            self.parents.remove(&id);
+            if let Some(path) = entry.path.as_deref().filter(|_| entry.is_directory) {
+                let key = normalize(path);
+                if self.paths.get(&key) == Some(&id) { self.paths.remove(&key); }
+            }
+        }
+    }
+}
 
 pub struct ListingService {
     db: Db,
     formats: std::sync::Arc<FormatTable>,
-    entries: std::sync::Mutex<HashMap<i64, Asset>>,
-    directory_parents: std::sync::Mutex<HashMap<i64, i64>>,
-    path_ids: std::sync::Mutex<HashMap<String,i64>>,
+    temporary: std::sync::Mutex<TemporaryEntries>,
     listings: std::sync::Mutex<HashMap<String, (std::time::Instant, Arc<Vec<Asset>>)>>,
     prepared: std::sync::Mutex<Option<PreparedListing>>,
     next_id: AtomicI64,
+    revision: AtomicU64,
 }
 
 struct PreparedListing {
@@ -24,7 +52,7 @@ struct PreparedListing {
 
 impl ListingService {
     pub fn new(db: Db, formats: std::sync::Arc<FormatTable>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db, formats, entries: std::sync::Mutex::new(HashMap::new()), directory_parents: std::sync::Mutex::new(HashMap::new()), path_ids:std::sync::Mutex::new(HashMap::new()), listings: std::sync::Mutex::new(HashMap::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000) })
+        std::sync::Arc::new(Self { db, formats, temporary: std::sync::Mutex::new(TemporaryEntries::default()), listings: std::sync::Mutex::new(HashMap::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000), revision: AtomicU64::new(0) })
     }
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
@@ -35,9 +63,12 @@ impl ListingService {
         Ok(())
     }
 
+    pub(crate) fn revision(&self) -> u64 { self.revision.load(Ordering::Relaxed) }
+
     pub fn invalidate_path(&self, path: &str) -> Result<(), String> {
         self.listings.lock().map_err(|_| "listing cache poisoned")?.remove(&normalize(path));
         *self.prepared.lock().map_err(|_| "prepared listing cache poisoned")? = None;
+        self.revision.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -48,6 +79,18 @@ impl ListingService {
         if path.is_empty() { return Err("asset path unavailable".into()); }
         let parent = Path::new(&path).parent().ok_or("asset parent unavailable")?.to_string_lossy().to_string();
         self.invalidate_path(&parent)
+    }
+
+    fn remember_listing(&self, key: String, rows: Arc<Vec<Asset>>) {
+        if let Ok(mut cache) = self.listings.lock() {
+            cache.remove(&key);
+            let mut count = rows.len() + cache.values().map(|(_, rows)| rows.len()).sum::<usize>();
+            while !cache.is_empty() && (cache.len() >= MAX_LISTINGS || count > MAX_LISTING_ROWS) {
+                let oldest = cache.iter().min_by_key(|(_, (when, _))| *when).map(|(key, _)| key.clone()).unwrap();
+                if let Some((_, old)) = cache.remove(&oldest) { count -= old.len(); }
+            }
+            cache.insert(key, (std::time::Instant::now(), rows));
+        }
     }
 
     fn list(&self, path: &str, folder_ids: &[i64]) -> (Arc<Vec<Asset>>, bool) {
@@ -77,7 +120,7 @@ impl ListingService {
                 for (_, _, assets) in context { rows.extend(assets.into_iter().filter(|a| !a.ext.is_empty() && !self.formats.is_hidden(&a.ext)).map(|mut a| { a.offline = true; a })); }
             }
             let rows = Arc::new(rows);
-            if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
+            self.remember_listing(key, rows.clone());
             return (rows, true);
         }};
         let parent_folder_id = db::folder_by_path(&self.db, path).ok().flatten().map(|folder| folder.id)
@@ -109,16 +152,14 @@ impl ListingService {
             asset.path = Some(full.to_string_lossy().to_string());
             asset.is_directory = is_dir;
             asset.offline = false;
-            if asset.id <= -10_000_000 { if let Ok(mut entries) = self.entries.lock() { entries.insert(asset.id, asset.clone()); } }
-            if is_dir {
-                if let (Some(parent),Ok(mut parents))=(folder_ids.first(),self.directory_parents.lock()) { parents.insert(asset.id,*parent); }
-                if let Ok(mut paths)=self.path_ids.lock(){paths.insert(normalize(&full.to_string_lossy()),asset.id);}
+            if asset.id <= -10_000_000 {
+                if let Ok(mut entries) = self.temporary.lock() { entries.insert(asset.clone(), folder_ids.first().copied()); }
             }
             rows.push(asset);
         }
         rows.sort_by(|a,b| a.is_directory.cmp(&b.is_directory).reverse().then_with(||a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.id.cmp(&b.id)));
         let rows = Arc::new(rows);
-        if let Ok(mut cache) = self.listings.lock() { cache.insert(key, (std::time::Instant::now(), rows.clone())); }
+        self.remember_listing(key, rows.clone());
         (rows, false)
     }
 
@@ -141,7 +182,7 @@ impl ListingService {
         Ok((path, rows.iter().filter(|a| !a.is_directory && a.id < 0 && !a.ext.is_empty() && a.path.is_some()).cloned().collect()))
     }
 
-    pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
+    pub(crate) fn ordered_rows(&self, filter: &AssetFilter) -> Result<(Arc<Vec<Asset>>, f64), String> {
         let (path, ids) = self.folder_of_filter(filter)?;
         let (source, _) = self.list(&path, &ids);
         // Pagination and display-only fields do not change the filtered order.
@@ -169,6 +210,11 @@ impl ListingService {
         *self.prepared.lock().map_err(|_| "prepared listing cache poisoned")? = Some(PreparedListing { source, key, rows: rows.clone(), total_size });
         (rows, total_size)
         };
+        Ok((rows, total_size))
+    }
+
+    pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
+        let (rows, total_size) = self.ordered_rows(filter)?;
         let total = rows.len() as i64;
         let offset=filter.offset.max(0) as usize; let limit=filter.limit.clamp(1,500) as usize;
         let start=offset.min(rows.len());
@@ -178,33 +224,36 @@ impl ListingService {
         Ok(AssetPage { items, total, total_size })
     }
 
-    pub fn asset(&self, id: i64) -> Option<Asset> { self.entries.lock().ok()?.get(&id).cloned() }
+    pub fn asset(&self, id: i64) -> Option<Asset> { {
+        if let Some(asset) = self.temporary.lock().ok()?.entries.get(&id).cloned() { return Some(asset); }
+        if id > -10_000_000 { return None; }
+        self.listings.lock().ok()?.values().find_map(|(_, rows)| rows.iter().find(|a| a.id == id).cloned())
+    } }
     #[cfg(test)]
-    pub fn insert_test_asset(&self, asset:Asset){if let Ok(mut entries)=self.entries.lock(){entries.insert(asset.id,asset);}}
+    pub fn insert_test_asset(&self, asset:Asset){if let Ok(mut entries)=self.temporary.lock(){entries.insert(asset,None);}}
 
     pub fn resolve_folder(&self,path:&str)->Result<Option<db::Folder>,String>{
         if let Some(folder)=db::folder_by_path(&self.db,path).map_err(|e|e.to_string())? { return Ok(Some(folder)); }
         let path_buf=PathBuf::from(path);
         if !path_buf.is_dir(){return Ok(None)}
         let key=normalize(path);
-        if let Some(id)=self.path_ids.lock().map_err(|_|"path map poisoned")?.get(&key).copied(){
-            if let Some(asset)=self.asset(id){let parent=self.directory_parents.lock().ok().and_then(|p|p.get(&id).copied());return Ok(Some(db::Folder{id,parent_id:parent,root_id:parent.and_then(|p|self.asset(p)).and_then(|a|a.folder_id).or_else(||parent.and_then(|p|db::folder_ancestors(&self.db,p).ok()?.last()?.root_id)),name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}));}
+        let cached_id = self.temporary.lock().map_err(|_|"path map poisoned")?.paths.get(&key).copied();
+        if let Some(id)=cached_id{
+            if let Some(asset)=self.asset(id){let parent=self.temporary.lock().ok().and_then(|p|p.parents.get(&id).copied());return Ok(Some(db::Folder{id,parent_id:parent,root_id:parent.and_then(|p|self.asset(p)).and_then(|a|a.folder_id).or_else(||parent.and_then(|p|db::folder_ancestors(&self.db,p).ok()?.last()?.root_id)),name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}));}
         }
         let parent_path=path_buf.parent().map(|p|p.to_string_lossy().to_string());
         let parent=if let Some(parent_path)=parent_path.filter(|p|!p.is_empty()&&normalize(p)!=key){self.resolve_folder(&parent_path)?}else{None};
         let name=path_buf.file_name().map(|n|n.to_string_lossy().to_string()).unwrap_or_else(||path.to_string());
         let id=self.id(); let parent_id=parent.as_ref().map(|p|p.id); let root_id=parent.as_ref().and_then(|p|p.root_id);
         let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None};
-        self.entries.lock().map_err(|_|"entry map poisoned")?.insert(id,asset);
-        if let Some(parent_id)=parent_id{self.directory_parents.lock().map_err(|_|"folder map poisoned")?.insert(id,parent_id);}
-        self.path_ids.lock().map_err(|_|"path map poisoned")?.insert(key,id);
+        self.temporary.lock().map_err(|_|"entry map poisoned")?.insert(asset, parent_id);
         Ok(Some(db::Folder{id,parent_id,root_id,name,path:Some(path_buf.to_string_lossy().to_string()),count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}))
     }
 
     pub fn folder_ancestors(&self, id:i64) -> Result<Vec<db::Folder>,String> {
         let Some(asset)=self.asset(id).filter(|a|a.is_directory) else { return db::folder_ancestors(&self.db,id).map_err(|e|e.to_string()) };
         if let Some(catalog_id)=asset.folder_id { return db::folder_ancestors(&self.db,catalog_id).map_err(|e|e.to_string()); }
-        let parent=self.directory_parents.lock().map_err(|_|"folder map poisoned")?.get(&id).copied().ok_or("folder parent not found")?;
+        let parent=self.temporary.lock().map_err(|_|"folder map poisoned")?.parents.get(&id).copied().ok_or("folder parent not found")?;
         let mut chain=if parent <= -10_000_000 { self.folder_ancestors(parent)? } else { db::folder_ancestors(&self.db,parent).map_err(|e|e.to_string())? };
         let root_id=chain.last().and_then(|f|f.root_id);
         chain.push(db::Folder{id,parent_id:Some(parent),root_id,name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false});
