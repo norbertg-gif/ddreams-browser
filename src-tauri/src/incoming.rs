@@ -27,11 +27,20 @@ pub(crate) fn read_settings(path: &Path) -> Result<Map<String, Value>, String> {
 }
 
 pub(crate) fn write_setting(path: &Path, key: &str, value: Value) -> Result<(), String> {
+    update_settings(path, |settings| {
+        settings.insert(key.to_owned(), value);
+        Ok(true)
+    })
+}
+
+pub(crate) fn update_settings(path: &Path, update: impl FnOnce(&mut Map<String, Value>) -> Result<bool, String>) -> Result<(), String> {
     let _lock = SETTINGS_LOCK.lock().map_err(|e| e.to_string())?;
     let mut settings = read_settings(path)?;
-    settings.insert(key.to_owned(), value);
-    std::fs::write(path, serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())
+    if update(&mut settings)? {
+        std::fs::write(path, serde_json::to_vec_pretty(&settings).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
 }
 
 fn normalized(path: &str) -> String {
@@ -103,14 +112,24 @@ pub fn get_incoming_folder(state: State<'_, AiState>) -> Result<String, String> 
 }
 
 #[tauri::command(async)]
-pub fn set_incoming_folder(info: State<'_, AppInfoState>, path: String) -> Result<String, String> {
+pub fn set_incoming_folder(info: State<'_, AppInfoState>, manager: State<'_, crate::commands::FileManagerState>, path: String) -> Result<String, String> {
     if info.0.readonly { return Err("Katalóg je iba na čítanie".into()); }
+    let _operation = manager.0.lock_operation()?;
     let path = path.trim();
     if !path.is_empty() && !Path::new(path).is_dir() {
         return Err("Priečinok neexistuje alebo nie je dostupný.".into());
     }
     let value = if path.is_empty() { Value::Null } else { Value::String(path.to_owned()) };
-    write_setting(Path::new(&info.0.settings), "incomingFolder", value)?;
+    update_settings(Path::new(&info.0.settings), |settings| {
+        crate::quarantine::validate_incoming_setting(settings, path)?;
+        let old_incoming = settings.get("incomingFolder").and_then(Value::as_str).unwrap_or_default();
+        let old = crate::quarantine::quarantine_path(settings, old_incoming);
+        let new = crate::quarantine::quarantine_path(settings, path);
+        manager.0.check_quarantine_relocation(&old, &new)?;
+        settings.insert("incomingFolder".into(), value);
+        Ok(true)
+    })?;
+    manager.0.sync_incoming(path)?;
     Ok(path.to_owned())
 }
 

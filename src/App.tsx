@@ -10,6 +10,7 @@ import LeftPanel from "./components/LeftPanel";
 import RightPanel from "./components/RightPanel";
 import ThumbnailInfoDialog from "./components/ThumbnailInfoDialog";
 import SettingsDialog from "./components/SettingsDialog";
+import QuarantineReview, { type QuarantineOutcome, type QuarantineSettings, type Review } from "./components/QuarantineReview";
 import IncomingTools, { type DeletionSuggestionChange } from "./components/IncomingTools";
 import HelpDialog from "./components/HelpDialog";
 import BackupReminder from "./components/BackupReminder";
@@ -96,7 +97,14 @@ export default function App() {
       setIncomingFolder("");
     });
   }, []);
-  const [deleteConfirm,setDeleteConfirm]=useState<{ids:number[];name:string|null;permanent:boolean;info:{count:number;names:string[];sidecars:number;permanentCount:number;noBinDrives:string[]}|null}|null>(null);
+  const [deleteConfirm,setDeleteConfirm]=useState<{ids:number[];name:string|null;permanent:boolean;quarantine?:boolean;info:{count:number;names:string[];sidecars:number;permanentCount:number;noBinDrives:string[]}|null}|null>(null);
+  const [quarantineSettings, setQuarantineSettings] = useState<QuarantineSettings | null>(null);
+  const [quarantineReview, setQuarantineReview] = useState<Review | null>(null);
+  const [reviewInGrid, setReviewInGrid] = useState(false);
+  const [quarantineBusy, setQuarantineBusy] = useState(false);
+  const quarantineRunning = useRef(false);
+  const [quarantineConfirm, setQuarantineConfirm] = useState<{ ids: number[]; action: "move" | "restore"; suggestionsOnly?: boolean } | null>(null);
+  const [quarantineFailures, setQuarantineFailures] = useState<string[]>([]);
   const [excludeConfirm,setExcludeConfirm]=useState<{path:string;impact:ExclusionImpact}|null>(null);
   const [removeCatalogConfirm,setRemoveCatalogConfirm]=useState<{path:string;info:RemoveCatalogInfo}|null>(null);
   const [includeChildren, setIncludeChildren] = useState<boolean>(()=>readStored("ddreams.includeChildren",true));
@@ -189,6 +197,22 @@ export default function App() {
   const assetFilter = useMemo(() => buildAssetFilter(view, queryDebounced, sort, descending, queryFilters, includeChildren),
     [view, queryDebounced, sort, descending, queryFilters, includeChildren]);
   const [ready, setReady] = useState(false);
+  useEffect(() => {
+    if (!ready || !appInfo) return;
+    let active = true;
+    const showError = (error: unknown) => {
+      if (active) setToast(String(error));
+    };
+    void invoke<QuarantineSettings>("get_quarantine_settings").then(settings => {
+      if (active) setQuarantineSettings(settings);
+    }).catch(showError);
+    if (!appInfo.readonly) {
+      void invoke<Review>("preview_quarantine_review").then(review => {
+        if (active && (review.moves.ids.length || review.deletes.ids.length)) setQuarantineReview(review);
+      }).catch(showError);
+    }
+    return () => { active = false; };
+  }, [ready, appInfo]);
   const viewResolved = useRef(0);
   const markReady = useCallback((why: string) => { setReady(was => { if (!was) void invoke("startup_mark", { label: `ready (${why})` }).catch(() => {}); return true; }); }, []);
   const counts = useCallback((n: number, size: number) => { setTotal(n); setTotalSize(size); if (viewResolved.current) markReady("first page"); }, [markReady]);
@@ -307,6 +331,56 @@ export default function App() {
   },[assetFilter]);
   const copyCurrentResult=useCallback(async()=>{let lines:string[]=[];for(let offset=0;offset<total;offset+=500){const p=await invoke<Page>("get_assets",{filter:{...assetFilter,offset,limit:500}});for(const a of p.items)if(!a.isDirectory)lines.push([a.name,a.size??"",a.ext,a.fileModified??"",a.width&&a.height?`${a.width} × ${a.height}`:"",a.caption??"",a.rating??""].join("\t"));if(p.items.length<500)break;}await navigator.clipboard.writeText(lines.join("\n"));setToast(`Skopírované: ${slovakItems(lines.length)}`);window.setTimeout(()=>setToast(""),1600);},[assetFilter,total]);
   const folderActionRef=useRef<((action:"rename"|"delete",path:string)=>Promise<void>)|null>(null);
+  const runQuarantine = async (command: string, args: Record<string, unknown>) => {
+    if (quarantineRunning.current) return;
+    quarantineRunning.current = true;
+    setQuarantineBusy(true);
+    setOperationProgress("Spracúvam karanténu…");
+    try {
+      const result = await invoke<QuarantineOutcome>(command, args);
+      const summary = [
+        result.moved && `Presunuté do karantény: ${result.moved}`,
+        result.restored && `Vrátené: ${result.restored}`,
+        result.deleted && `Odstránené: ${result.deleted}`,
+        result.failures.length && `Nedokončené položky: ${result.failures.length}`,
+      ].filter(Boolean).join(" · ");
+      setToast(summary || "Karanténa bez zmien");
+      if (result.affectedFolderPaths.length) {
+        setSelectedIds(new Set());
+        setPrimaryId(null);
+        setPrimaryAsset(null);
+        refreshAfterWrite(true, result.affectedFolderPaths);
+      }
+      setQuarantineFailures(result.failures);
+      window.setTimeout(() => setToast(""), 8000);
+    } catch (error) {
+      setToast(String(error));
+      setQuarantineFailures([String(error)]);
+    } finally {
+      if (command === "execute_quarantine_review") {
+        setQuarantineReview(null);
+        setReviewInGrid(false);
+      }
+      setOperationProgress("");
+      quarantineRunning.current = false;
+      setQuarantineBusy(false);
+    }
+  };
+
+  const requestQuarantineDelete = async (ids: number[]) => {
+    if (!ids.length || quarantineBusy) return;
+    try {
+      const info = await invoke<NonNullable<NonNullable<typeof deleteConfirm>["info"]>>("get_quarantine_delete_info", { assetIds: ids });
+      setDeleteConfirm({ ids, name: null, permanent: false, quarantine: true, info });
+    } catch (error) { setToast(String(error)); }
+  };
+
+  const inspectQuarantineReview = (ids: number[], title: string) => {
+    setCenterMode("grid");
+    setViewer(null);
+    navigate({ kind: "quarantine_review", ids, title });
+    setReviewInGrid(true);
+  };
   const beginFileOperation=useCallback((ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",tileAsset?:Asset)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}{const target=tileAsset??(ids.length===1&&primaryAsset?.id===ids[0]?primaryAsset:null);if(target?.isDirectory&&target.path&&(mode==="delete"||mode==="rename")){void folderActionRef.current?.(mode,target.path);return;}if(target?.isDirectory&&mode==="delete-permanent"){setToast("Priečinky sa dajú odstrániť len do Koša");window.setTimeout(()=>setToast(""),3000);return;}}if(mode==="delete"||mode==="delete-permanent"){if(!ids.length)return;const permanent=mode==="delete-permanent";void invoke<{count:number;names:string[];sidecars:number;permanentCount:number;noBinDrives:string[]}>("get_delete_info",{assetIds:ids,permanent}).then(info=>setDeleteConfirm({ids,name:ids.length===1?(tileAsset??primaryAsset)?.name??null:null,permanent,info})).catch(error=>{setToast(String(error));window.setTimeout(()=>setToast(""),4000)});return;}if(mode==="rename"){const asset=tileAsset??primaryAsset;if(!asset)return;const old=asset.name;const base=asset.ext&&old.toLowerCase().endsWith(`.${asset.ext.toLowerCase()}`)?old.slice(0,-asset.ext.length-1):old;setNameOp({kind:"rename",assetId:ids[0],name:base,extension:asset.ext});return;}setFileOp({ids,mode});},[appInfo,primaryAsset]);
   const runFileOperation=useCallback(async(ids:number[],mode:"move"|"copy",path:string,conflict:"skip"|"keep_both"|"cancel",confirmed=false)=>{
     try {
@@ -432,13 +506,28 @@ export default function App() {
                 {view.kind==="series"&&view.seriesInfo&&<div className="selection-bar ai-review-actions series-review-actions"><strong>{view.seriesInfo.count} sérií · {view.ids?.length??0} fotiek</strong><button disabled={!!appInfo?.readonly||!selectedIds.size} onClick={()=>{const selectedGroups=new Set((view.groups??[]).filter((_,index)=>selectedIds.has(view.ids?.[index]??-1)));const rejected=(view.ids??[]).filter((id,index)=>selectedGroups.has(view.groups?.[index]??-1)&&!selectedIds.has(id));if(rejected.length)void setAssetValues(rejected,{label:"Gray"})}}>Ponechať vybrané, zvyšok série vyradiť</button><button disabled={!!appInfo?.readonly} onClick={()=>{const best=new Set(view.bestIds??[]);const rejected=(view.ids??[]).filter(id=>!best.has(id));if(rejected.length&&window.confirm(`Vyradiť ${rejected.length} fotiek a ponechať najlepšiu z každej série?`))void setAssetValues(rejected,{label:"Gray"})}}>Vyradiť všetko okrem najlepších</button><small>X = vyradiť / vrátiť vybrané</small></div>}
         {(selectedList.some(id=>deletionSuggestions.has(id)) || (view.kind==="special"&&view.value==="delete_suggested")) &&
           <div className="selection-bar ai-review-actions">
+            <button disabled={!!appInfo?.readonly || quarantineBusy || !deletionSuggestions.size} onClick={() => setQuarantineConfirm({
+              ids: selectedList.some(id => deletionSuggestions.has(id))
+                ? selectedList.filter(id => deletionSuggestions.has(id)) : [...deletionSuggestions],
+              action: "move", suggestionsOnly: true,
+            })}>Presunúť návrhy do karantény</button>
             {selectedList.some(id=>deletionSuggestions.has(id))&&<button disabled={!!appInfo?.readonly}
               onClick={()=>void runDeletionAction("keep_suggested_assets", selectedList.filter(id=>deletionSuggestions.has(id)))}>Odmietnuť návrh na vymazanie</button>}
             {view.kind==="special"&&view.value==="delete_suggested"&&<button disabled={!!appInfo?.readonly||!deletionSuggestions.size}
               onClick={()=>void runDeletionAction("keep_suggested_assets")}>Zrušiť všetky návrhy</button>}
           </div>}
+        {view.kind === "special" && view.value === "quarantine" && <div className="selection-bar ai-review-actions">
+          <button disabled={!!appInfo?.readonly || quarantineBusy || !selectedList.length}
+            onClick={() => setQuarantineConfirm({ ids: selectedList, action: "restore" })}>Vrátiť späť</button>
+          <button disabled={!!appInfo?.readonly || quarantineBusy || !selectedList.length}
+            onClick={() => void requestQuarantineDelete(selectedList)}>Zmazať teraz</button>
+        </div>}
+        {quarantineReview && reviewInGrid && <div className="selection-bar ai-review-actions">
+          <button onClick={() => setReviewInGrid(false)}>Späť ku kontrole importu a karantény</button>
+          <button onClick={() => { setQuarantineReview(null); setReviewInGrid(false); }}>Teraz nie</button>
+        </div>}
         {centerMode==="map"?<MapView epoch={epoch} selectedIds={selectedIds} onSelect={select} onNavigate={(ids,title)=>navigate({kind:"people",ids,title})} onGrid={()=>setCenterMode("grid")} onOpenNeighborhood={ids=>void openMapNeighborhood(ids)}/>:<>
-        <AssetGrid view={view} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} uiScale={uiScale} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
+        <AssetGrid view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={ids => { if (!quarantineBusy) setQuarantineConfirm({ ids, action: "move" }); }} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} uiScale={uiScale} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
         </>}
         {operationProgress&&<div className="grid-footer"><span>{operationProgress}</span></div>}
         {viewer && <div className="viewer-overlay"><div className="viewer-bar"><button onClick={()=>setViewer(null)}>‹ Zavrieť</button>{deletionSuggestions.has(viewer.asset.id)&&<>
@@ -472,9 +561,41 @@ export default function App() {
     {fileConflict&&<div className="modal-backdrop"><section className="file-op-dialog conflict-dialog"><header>Konflikt názvov</header><p>V cieli už existuje {fileConflict.count} {fileConflict.count===1?"súbor":fileConflict.count<5?"súbory":"súborov"} s rovnakým názvom.</p><footer><button onClick={()=>{void runFileOperation(fileConflict.ids,fileConflict.mode,fileConflict.path,"skip");setFileConflict(null)}}>Preskočiť</button><button onClick={()=>{void runFileOperation(fileConflict.ids,fileConflict.mode,fileConflict.path,"keep_both");setFileConflict(null)}}>Ponechať oba (pridať číslo)</button><button onClick={()=>setFileConflict(null)}>Zrušiť</button></footer></section></div>}
     {folderRenameOp&&<FileNameDialog title="Premenovať priečinok" label="Nový názov priečinka" initialName={folderRenameOp.name} onSubmit={submitFolderRename} onClose={()=>setFolderRenameOp(null)}/>}{nameOp&&<FileNameDialog title={nameOp.kind==="rename"?"Premenovať súbor":"Nový priečinok"} label={nameOp.kind==="rename"?"Nový názov":"Názov priečinka"} initialName={nameOp.kind==="rename"?nameOp.name:""} extension={nameOp.kind==="rename"?nameOp.extension:undefined} onSubmit={submitName} onClose={()=>setNameOp(null)}/>}
     {toast&&<div className="app-toast">{toast}</div>}
+    {quarantineReview && !reviewInGrid && <QuarantineReview review={quarantineReview} busy={quarantineBusy} progress={operationProgress}
+      onShow={inspectQuarantineReview} onClose={() => setQuarantineReview(null)}
+      onExecute={confirmedNoBinDrives => void runQuarantine("execute_quarantine_review", { confirmedNoBinDrives })} />}
+    {quarantineConfirm && <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true"
+      onKeyDown={event => { if (event.key === "Escape") { event.stopPropagation(); setQuarantineConfirm(null); } }}>
+      <b>{quarantineConfirm.action === "restore" ? "Vrátiť fotky z karantény?" : "Presunúť fotky do karantény?"}</b>
+      <p>{slovakItems(quarantineConfirm.ids.length)} vrátane príslušných XMP.</p>
+      <p className="confirm-path">{quarantineConfirm.action === "restore" ? "Do pôvodných priečinkov. Pri kolízii názvov zostanú oba súbory."
+        : quarantineSettings?.quarantineFolder || "Priečinok karantény vyberiete v nastaveniach."}</p>
+      <div className="confirm-actions">
+        <button autoFocus onClick={() => setQuarantineConfirm(null)}>Zrušiť</button>
+        {quarantineConfirm.action === "restore" ? <button onClick={() => {
+          setQuarantineConfirm(null);
+          void runQuarantine("restore_from_quarantine", { assetIds: quarantineConfirm.ids });
+        }}>Vrátiť späť</button> : ([[ "skip", "Presunúť, kolízie preskočiť" ], [ "keep_both", "Presunúť, ponechať oba" ]] as const)
+          .map(([conflict, label]) => <button key={conflict} onClick={() => {
+            setQuarantineConfirm(null);
+            void runQuarantine("move_to_quarantine", { assetIds: quarantineConfirm.ids, conflict,
+              suggestionsOnly: !!quarantineConfirm.suggestionsOnly });
+          }}>{label}</button>)}
+      </div>
+    </div></div>}
+    {!!quarantineFailures.length && <div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog" aria-modal="true">
+      <b>Nedokončené operácie karantény</b>
+      <ul className="quarantine-failures">{quarantineFailures.map((failure, index) => <li key={index}>{failure}</li>)}</ul>
+      <div className="confirm-actions"><button autoFocus onClick={() => setQuarantineFailures([])}>Zavrieť</button></div>
+    </div></div>}
   {helpOpen&&<HelpDialog onClose={()=>setHelpOpen(false)}/>}
     {settingsOpen&&<SettingsDialog incomingFolder={incomingFolder??""} readOnly={!!appInfo?.readonly}
-       onIncomingFolderChange={async path=>setIncomingFolder(await invoke<string>("set_incoming_folder",{path}))} onClose={()=>setSettingsOpen(false)} onRule={(path,mode)=>void changeFolderRule(path,mode)} showOtherFiles={showOtherFiles} onShowOtherFiles={setShowOtherFiles} aiEnabled={aiEnabled} aiLoadModelAtStart={aiLoadModelAtStart} onAiLoadModelAtStart={setAiLoadModelAtStart} aiAvailable={aiStatus.available} aiStatusText={aiChipText} onToggleAi={()=>void toggleAi()} uiScale={uiScale} onUiScale={setUiScale} onRemoveSource={path=>void requestRemoveCatalog(path)}/>}
+       quarantineSettings={quarantineSettings}
+       onQuarantineSettingsChange={async preferences => setQuarantineSettings(await invoke<QuarantineSettings>("set_quarantine_settings", { preferences }))}
+       onIncomingFolderChange={async path => {
+         setIncomingFolder(await invoke<string>("set_incoming_folder", { path }));
+         setQuarantineSettings(await invoke<QuarantineSettings>("get_quarantine_settings"));
+       }} onClose={()=>setSettingsOpen(false)} onRule={(path,mode)=>void changeFolderRule(path,mode)} showOtherFiles={showOtherFiles} onShowOtherFiles={setShowOtherFiles} aiEnabled={aiEnabled} aiLoadModelAtStart={aiLoadModelAtStart} onAiLoadModelAtStart={setAiLoadModelAtStart} aiAvailable={aiStatus.available} aiStatusText={aiChipText} onToggleAi={()=>void toggleAi()} uiScale={uiScale} onUiScale={setUiScale} onRemoveSource={path=>void requestRemoveCatalog(path)}/>}
     {removeCatalogConfirm&&<div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog"><b>Odstrániť zdroj z katalógu?</b><p>Z katalógu sa odstráni <b>{removeCatalogConfirm.info.assets.toLocaleString("sk-SK")}</b> záznamov o súboroch a <b>{removeCatalogConfirm.info.folders.toLocaleString("sk-SK")}</b> priečinkov z „{removeCatalogConfirm.path}“.</p><p>Súbory sa nemažú – {removeCatalogConfirm.info.offline?"disk nie je pripojený":"priečinok už neexistuje"}. Kategórie, hodnotenia, kľúčové slová a osoby týchto fotiek sa z katalógu stratia. Pred odstránením sa vytvorí záloha katalógu.</p><div className="confirm-actions"><button onClick={()=>setRemoveCatalogConfirm(null)}>Zrušiť</button><button className="danger" autoFocus onClick={()=>void removeCatalogSource()}>Odstrániť z katalógu</button></div></div></div>}
     {excludeConfirm&&<div className="modal-backdrop"><div className="confirm-dialog" role="alertdialog">
       <b>Vylúčiť priečinok z katalógu?</b>
@@ -488,7 +609,12 @@ export default function App() {
       {(info?.names??(deleteConfirm.name?[deleteConfirm.name]:[])).length>0&&<p className="confirm-path">{(info?.names??[deleteConfirm.name]).join(", ")}{n>(info?.names.length??1)?` a ďalších ${n-(info?.names.length??1)}`:""}</p>}
       {perm>0&&<p className="delete-warning">{allPerm?"Súbory sa zmažú natrvalo.":`${perm} z ${n} sa zmaže natrvalo, ostatné pôjdu do Koša.`}{info&&info.noBinDrives.length>0?` Disk ${info.noBinDrives.join(", ")} nemá Kôš (USB alebo sieťový disk).`:deleteConfirm.permanent?" (Shift+Delete)":""}</p>}
       <p>{info&&info.sidecars>0?`Spolu s nimi sa zmaže ${info.sidecars} ${files(info.sidecars)} .xmp. `:"Sprievodné súbory (.xmp) sa zmažú s nimi. "}Ich údaje sa odstránia z katalógu.</p>
-      <div className="confirm-actions"><button autoFocus={allPerm} onClick={()=>setDeleteConfirm(null)}>Zrušiť</button><button className="danger" autoFocus={!allPerm} onClick={()=>void runDelete(deleteConfirm.ids,deleteConfirm.permanent,info?.noBinDrives??[])}>{allPerm?"Zmazať natrvalo":perm>0?"Zmazať":"Presunúť do Koša"}</button></div>
+      <div className="confirm-actions"><button autoFocus={allPerm} onClick={()=>setDeleteConfirm(null)}>Zrušiť</button><button className="danger" autoFocus={!allPerm} onClick={()=>{
+        if (deleteConfirm.quarantine) {
+          setDeleteConfirm(null);
+          void runQuarantine("delete_from_quarantine", { assetIds: deleteConfirm.ids, confirmedNoBinDrives: info?.noBinDrives ?? [] });
+        } else void runDelete(deleteConfirm.ids,deleteConfirm.permanent,info?.noBinDrives??[]);
+      }}>{allPerm?"Zmazať natrvalo":perm>0?"Zmazať":"Presunúť do Koša"}</button></div>
     </div></div>})()}
     <BackupReminder/>
     </main>;

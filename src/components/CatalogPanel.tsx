@@ -389,7 +389,7 @@ function SpecialSection(): ReactElement {
   const {
     isCollapsed, onNavigate, special,
   } = useRightSectionData("catalog");
-  return <DockSection id="catalog.special"><section className="catalog-section"><SectionHeading id="catalog.special" title="Špeciálne položky"/>{!isCollapsed("catalog.special")&&[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["tagged","Označené"],["delete_suggested","Návrh na vymazanie"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section></DockSection>;
+  return <DockSection id="catalog.special"><section className="catalog-section"><SectionHeading id="catalog.special" title="Špeciálne položky"/>{!isCollapsed("catalog.special")&&[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["quarantine","Karanténa"],["tagged","Označené"],["delete_suggested","Návrh na vymazanie"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section></DockSection>;
 }
 
 function PeopleSection(): ReactElement {

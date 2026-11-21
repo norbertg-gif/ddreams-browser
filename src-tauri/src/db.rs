@@ -116,6 +116,8 @@ pub struct Asset {
     pub display_categories: Option<String>,
     #[serde(default)]
     pub display_keywords: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quarantined_at: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -279,6 +281,7 @@ fn map_asset(row: &rusqlite::Row<'_>, include_categories: bool, include_keywords
         has_categories: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
         display_categories: if include_categories { row.get(21)? } else { None },
         display_keywords: if include_keywords { row.get(if include_categories { 22 } else { 21 })? } else { None },
+        quarantined_at: None,
     })
 }
 
@@ -565,8 +568,15 @@ fn catalog_asset_filter(conn: &Connection, filter: &AssetFilter, formats: &Forma
             "unkeyworded" => where_sql.push_str(&format!(" AND {} AND NOT EXISTS(SELECT 1 FROM asset_keywords akx WHERE akx.asset_id=a.id)", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "tagged" => where_sql.push_str(&format!(" AND {} AND coalesce(a.tagged,0)<>0", formats.sql_in("a.ext_lower", &["image", "raw"]))),
             "delete_suggested" if crate::incoming::has_deletion_column(conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
+            "quarantine" if crate::schema::has_asset_column(conn, "quarantined_at")? =>
+                where_sql.push_str(" AND a.quarantined_at IS NOT NULL AND a.quarantine_origin IS NOT NULL"),
             _ => where_sql.push_str(" AND 0"),
         },
+        "quarantine_review" => {
+            where_sql.push_str(" AND a.id IN (SELECT value FROM json_each(?))");
+            args.push(serde_json::to_string(&filter.ids.as_deref().unwrap_or_default())
+                .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?.into());
+        }
         "date" => add_date_filter(&mut where_sql,&mut args,filter,formats),
         _ => {
             where_sql.push_str(" AND 0");
@@ -660,12 +670,19 @@ fn collect_ordered_ids(conn: &Connection, filter: CatalogAssetFilter, order: &st
 }
 
 pub(crate) fn hydrate_asset_ids(conn: &Connection, page_ids: &[i64], filter: &AssetFilter) -> rusqlite::Result<Vec<Asset>> {
-    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let mut selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let quarantine = filter.kind == "quarantine_review" || (filter.kind == "special" && filter.value.as_deref() == Some("quarantine"));
+    let quarantine = quarantine && crate::schema::has_asset_column(conn, "quarantined_at")?;
+    if quarantine { selected_cols.push_str(",a.quarantined_at"); }
     let mut items = Vec::with_capacity(page_ids.len());
     if !page_ids.is_empty() {
         let sql = format!("SELECT {selected_cols} FROM assets a WHERE a.id IN ({})", vec!["?"; page_ids.len()].join(","));
         let mut stmt = conn.prepare(&sql)?;
-        let rows = stmt.query_map(rusqlite::params_from_iter(page_ids.iter()), |r| map_asset(r, filter.include_categories, filter.include_keywords))?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(page_ids.iter()), |r| {
+            let mut asset = map_asset(r, filter.include_categories, filter.include_keywords)?;
+            if quarantine { asset.quarantined_at = r.get("quarantined_at")?; }
+            Ok(asset)
+        })?;
         let mut by_id = rows.map(|row| row.map(|asset| (asset.id, asset))).collect::<rusqlite::Result<HashMap<_, _>>>()?;
         for id in page_ids { if let Some(asset) = by_id.remove(id) { items.push(asset); } }
     }
@@ -1023,7 +1040,10 @@ pub fn values_page(
             let suggested = if crate::incoming::has_deletion_column(&conn)? {
                 format!(" UNION ALL SELECT 'delete_suggested' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND a.delete_suggestion=1")
             } else { String::new() };
-            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0{suggested}) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
+            let quarantine = if crate::schema::has_asset_column(&conn, "quarantined_at")? {
+                format!(" UNION ALL SELECT 'quarantine' FROM assets a WHERE is_listed=1 AND {hidden} AND a.quarantined_at IS NOT NULL AND a.quarantine_origin IS NOT NULL")
+            } else { String::new() };
+            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0{suggested}{quarantine}) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
             let mut stmt=conn.prepare(&sql)?;
             return stmt.query_map(params![limit.clamp(1,500),offset.max(0)],|r|Ok(ValueCount{value:r.get(0)?,count:r.get(1)?}))?.collect();
         }
@@ -1102,7 +1122,7 @@ pub fn keyword_options(db:&Db,query:&str)->rusqlite::Result<Vec<KeywordOption>>{
 mod feature_tests {
     use super::*;
     use std::cmp::Ordering;
-    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None} }
+    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None} }
     #[test]
     fn filter_logic_supports_modes_and_groups() {
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();

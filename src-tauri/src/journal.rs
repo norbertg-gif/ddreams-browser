@@ -1,7 +1,7 @@
 use rusqlite::{OptionalExtension, Transaction, TransactionBehavior, types::Value as SqlValue};
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, path::PathBuf, sync::{Arc,Mutex}, time::{SystemTime, UNIX_EPOCH}};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::{Arc,Mutex}, time::{SystemTime, UNIX_EPOCH}};
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -115,10 +115,38 @@ pub struct KeywordDeleteInfo { pub id: i64, pub name: String, pub assigned_files
 
 type ChangeHook = Arc<dyn Fn(&[&str]) + Send + Sync>;
 
-pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>>, rules: crate::folder_rules::FolderRules }
+pub struct CatalogWriter { db: Arc<Mutex<rusqlite::Connection>>, writable: bool, change_hook: Mutex<Option<ChangeHook>>, rules: crate::folder_rules::FolderRules, incoming: Mutex<String> }
 
 impl CatalogWriter {
-    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None), rules: crate::folder_rules::FolderRules::default() } }
+    pub fn new(db: Arc<Mutex<rusqlite::Connection>>, writable: bool) -> Self { Self { db, writable, change_hook: Mutex::new(None), rules: crate::folder_rules::FolderRules::default(), incoming: Mutex::new(String::new()) } }
+
+    pub(crate) fn sync_incoming(&self, folder: &str) -> Result<(), String> {
+        self.require_write()?;
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let mut incoming = self.incoming.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        reconcile_incoming(&tx, folder, None)?;
+        tx.commit().map_err(|e| e.to_string())?;
+        *incoming = folder.to_owned();
+        Ok(())
+    }
+
+    pub(crate) fn observe_incoming_folder(&self, folder: &str) -> Result<(), String> {
+        if !self.writable { return Ok(()); }
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let incoming = self.incoming.lock().map_err(|e| e.to_string())?;
+        if !crate::incoming::contains_folder(folder, &incoming) || !Path::new(folder).is_dir() {
+            return Ok(());
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        reconcile_incoming(&tx, &incoming, Some(folder))?;
+        tx.commit().map_err(|e| e.to_string())
+    }
+
+    fn track_incoming(&self, tx: &Transaction<'_>, id: i64, path: &str) -> Result<(), String> {
+        let folder = self.incoming.lock().map_err(|e| e.to_string())?;
+        track_incoming(tx, id, path, &folder)
+    }
     pub fn set_change_hook(&self, hook: ChangeHook) {
         *self.change_hook.lock().unwrap() = Some(hook);
     }
@@ -154,6 +182,7 @@ impl CatalogWriter {
             let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots)?;
             let id=next_id(&tx,"assets")?;
             insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false})?;
+            self.track_incoming(&tx, id, &candidate.path)?;
 
             remaps.push(AssetIdRemap{old_id:candidate.temporary_id,new_id:id});
         }
@@ -268,7 +297,7 @@ impl CatalogWriter {
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         self.rules.guard(&tx, asset_ids, listed_assets)?;
-        let (mut targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, true, true)?;
+        let (mut targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, true, true, |tx, id, path| self.track_incoming(tx, id, path))?;
         if targets.is_empty() { return Err("No files were selected".into()); }
         let toggle_tagged_to = if updates.tagged_toggle { Some(targets.iter().any(|asset| !asset.tagged)) } else { updates.tagged };
         let mut changed = inserted > 0;
@@ -302,7 +331,7 @@ impl CatalogWriter {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         let category_path = category_path(&tx, category_id)?;
         self.rules.guard(&tx, asset_ids, listed_assets)?;
-        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false)?;
+        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false, |tx, id, path| self.track_incoming(tx, id, path))?;
         let changed = set_asset_links(&tx, "asset_categories", "category_id", &targets, category_id, assign)?;
         if changed < inserted { return Err("New catalog asset did not receive its category".into()); }
         let summary = if changed == 0 {
@@ -433,7 +462,7 @@ impl CatalogWriter {
         self.rules.guard(&tx, asset_ids, listed_assets)?;
         let (name, parent_id): (String, Option<i64>) = tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1", [keyword_id], |r| Ok((r.get(0)?, r.get(1)?)))
             .optional().map_err(|e| e.to_string())?.ok_or("Kľúčové slovo neexistuje")?;
-        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false)?;
+        let (targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, assign, false, |tx, id, path| self.track_incoming(tx, id, path))?;
         let changed = set_asset_links(&tx, "asset_keywords", "keyword_id", &targets, keyword_id, assign)?;
         if changed < inserted { return Err("Nový súbor sa nepodarilo priradiť ku kľúčovému slovu".into()); }
         let summary = if changed == 0 {
@@ -469,7 +498,7 @@ impl CatalogWriter {
         self.rules.guard(&tx, asset_ids, listed_assets)?;
         let keyword_id = next_id(&tx, "keywords")?;
         tx.execute("INSERT INTO keywords(id,parent_id,name) VALUES(?1,?2,?3)", (keyword_id, parent_id, &name)).map_err(|e| e.to_string())?;
-        let (targets, remapped_ids, _) = resolve_write_assets(&tx, asset_ids, listed_assets, true, false)?;
+        let (targets, remapped_ids, _) = resolve_write_assets(&tx, asset_ids, listed_assets, true, false, |tx, id, path| self.track_incoming(tx, id, path))?;
         let changed = set_asset_links(&tx, "asset_keywords", "keyword_id", &targets, keyword_id, true)?;
         if changed == 0 { return Err("Nie je možné vytvoriť kľúčové slovo bez platných súborov".into()); }
         let ancestor_ids = keyword_ancestor_ids(&tx, keyword_id)?;
@@ -491,17 +520,57 @@ impl CatalogWriter {
     pub fn delete_keyword(&self,id:i64)->Result<KeywordMutationResult,String>{self.require_write()?;let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;let info=keyword_delete_info(&tx,id)?;if info.assigned_files>0{return Err(format!("Kľúčové slovo {} nie je možné zmazať, obsahuje {} {} (vrátane podriadených slov). Najprv z neho súbory odoberte.",info.name,info.assigned_files,slovak_count(info.assigned_files,"súbor","súbory","súborov")));}let ancestors=keyword_ancestor_ids(&tx,id)?;let ids=keyword_subtree(&tx,id)?;for keyword_id in ids.iter().rev().copied(){delete_row(&tx,"keywords",keyword_id)?;}let summary=format!("Zmazané kľúčové slovo {}",info.name);let change_id=record_change(&tx, "delete_keyword", &summary)?;tx.commit().map_err(|e|e.to_string())?; self.notify_labels_changed(&["keyword"]);Ok(KeywordMutationResult{change_id,summary,keyword_id:None,parent_id:None,ancestor_ids:ancestors,deleted_keyword_ids:ids})}
 
     pub fn record_file_change(&self, action:&str, summary:&str, moved:&[FileCatalogMove], copied:&[FileCatalogCopy], created_folders:&[String])->Result<(Option<i64>,Vec<AssetIdRemap>),String>{
+        self.record_file_transfer(action, summary, moved, copied, created_folders, None)
+    }
+
+    pub(crate) fn record_quarantine_move(&self, summary: &str, moved: &FileCatalogMove, source: &str, entering: bool) -> Result<Option<i64>, String> {
+        let action = if entering { "move_to_quarantine" } else { "restore_from_quarantine" };
+        self.record_file_transfer(action, summary, std::slice::from_ref(moved), &[], &[], Some((source, entering))).map(|r| r.0)
+    }
+
+    fn record_file_transfer(&self, action: &str, summary: &str, moved: &[FileCatalogMove], copied: &[FileCatalogCopy], created_folders: &[String], quarantine: Option<(&str, bool)>) -> Result<(Option<i64>, Vec<AssetIdRemap>), String> {
         self.require_write()?;
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let mut paths=load_folder_paths(&tx)?;let mut roots=load_folder_roots(&tx)?;let mut remapped=Vec::new();
+        let regular_move = action == "move_files"
+            && crate::schema::has_asset_column(&tx, "quarantined_at").map_err(|e| e.to_string())?;
         for item in moved {
-            if read_asset_values(&tx, item.asset_id)?.is_none() {
-                return Err(format!("Súbor katalógu {} sa nenašiel", item.asset_id));
+            if let Some((source, _)) = quarantine {
+                let expected = (item.asset_id > 0).then_some(item.asset_id);
+                if find_asset_by_path(&tx, source)? != expected {
+                    return Err("Zdrojová cesta v katalógu sa zmenila".into());
+                }
+                if find_asset_by_path(&tx, &item.target_path)?.is_some() {
+                    return Err(format!("Cieľová cesta už existuje v katalógu: {}", item.target_path));
+                }
             }
             let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots)?;
-            for (column,value) in [("folder_id",SqlValue::Integer(folder)),("path",SqlValue::Text(item.target_path.clone())),("name",SqlValue::Text(item.name.clone())),("ext",SqlValue::Text(item.ext.clone())),("ext_lower",SqlValue::Text(item.ext.to_ascii_lowercase())),("size",SqlValue::Real(item.size)),("file_modified",item.file_modified.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null))] {
-                update_column(&tx, "assets", item.asset_id,column,value)?;
+            let id = if item.asset_id < 0 && matches!(quarantine, Some((_, true))) {
+                let id = next_id(&tx, "assets")?;
+                insert_asset(&tx, &NewCatalogAsset {
+                    id, folder_id: folder, name: item.name.clone(), ext: item.ext.clone(), size: Some(item.size),
+                    file_modified: item.file_modified.clone(), path: item.target_path.clone(),
+                    rating: None, label: None, tagged: false,
+                })?;
+                id
+            } else {
+                if read_asset_values(&tx, item.asset_id)?.is_none() {
+                    return Err(format!("Súbor katalógu {} sa nenašiel", item.asset_id));
+                }
+                if regular_move {
+                    tx.execute("UPDATE assets SET quarantined_at=NULL,quarantine_origin=NULL WHERE id=?1 AND quarantined_at IS NOT NULL",
+                        [item.asset_id]).map_err(|e| e.to_string())?;
+                }
+                for (column,value) in [("folder_id",SqlValue::Integer(folder)),("path",SqlValue::Text(item.target_path.clone())),("name",SqlValue::Text(item.name.clone())),("ext",SqlValue::Text(item.ext.clone())),("ext_lower",SqlValue::Text(item.ext.to_ascii_lowercase())),("size",SqlValue::Real(item.size)),("file_modified",item.file_modified.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null))] {
+                    update_column(&tx, "assets", item.asset_id,column,value)?;
+                }
+                item.asset_id
+            };
+            self.track_incoming(&tx, id, &item.target_path)?;
+            if let Some((source, entering)) = quarantine {
+                tx.execute("UPDATE assets SET quarantined_at=?2,quarantine_origin=?3,delete_suggestion=0 WHERE id=?1",
+                    (id, entering.then(crate::quarantine::now), entering.then_some(source))).map_err(|e| e.to_string())?;
             }
         }
         for item in copied {
@@ -510,6 +579,7 @@ impl CatalogWriter {
             if !source_exists { continue; }
             let id=next_id(&tx,"assets")?;
             tx.execute("INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) SELECT ?1,?2,?3,?4,lower(?4),is_listed,?5,width,height,bpp,caption,notes,author,rating,tagged,label,?6,exif_date,acdsee_date,md_dirty,is_orphan,?7 FROM assets WHERE id=?8",(id,folder,&item.name,&item.ext,item.size,&item.file_modified,&item.target_path,item.source_asset_id)).map_err(|e|e.to_string())?;
+            self.track_incoming(&tx, id, &item.target_path)?;
             remapped.push(AssetIdRemap{old_id:item.source_asset_id,new_id:id});
             for (table, column) in [("asset_categories", "category_id"), ("asset_keywords", "keyword_id")] {
                 tx.execute(&format!("INSERT OR IGNORE INTO {table}(asset_id,{column}) SELECT ?1,{column} FROM {table} WHERE asset_id=?2"),
@@ -536,7 +606,8 @@ impl CatalogWriter {
             for (id, path) in rows {
                 if let Some(suffix) = matched_path_suffix(&path, &old) {
                     let target = format!("{new}{}", suffix.replace('/', "\\"));
-                    update_column(&tx, table, id, "path", target)?;
+                    update_column(&tx, table, id, "path", &target)?;
+                    if table == "assets" { self.track_incoming(&tx, id, &target)?; }
                     if table == "folders" && suffix.is_empty() {
                         update_column(&tx, table, id, "name", new.rsplit('\\').next().unwrap_or(&new))?;
                     }
@@ -593,14 +664,26 @@ impl CatalogWriter {
     }
 
     pub fn record_file_delete(&self, asset_ids: &[i64], summary: &str) -> Result<Option<i64>, String> {
+        self.record_named_file_delete(asset_ids, "delete_files", summary)
+    }
+
+    pub(crate) fn record_named_file_delete(&self, asset_ids: &[i64], action: &str, summary: &str) -> Result<Option<i64>, String> {
         self.require_write()?;
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         remove_asset_rows(&tx, asset_ids, true)?;
-        let change_id = record_change(&tx, "delete_files", summary)?;
+        let change_id = record_change(&tx, action, summary)?;
         tx.commit().map_err(|e| e.to_string())?;
         if !asset_ids.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
         Ok(change_id)
+    }
+
+    pub(crate) fn record_file_intent(&self, action: &str, summary: &str) -> Result<(), String> {
+        self.require_write()?;
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        record_change(&tx, action, summary)?;
+        tx.commit().map_err(|e| e.to_string())
     }
 
     pub fn suggest_deletions(&self, incoming: &str, suggestions: &[(i64, bool)], formats: &crate::formats::FormatTable) -> Result<DeletionSuggestionChange, String> {
@@ -813,6 +896,56 @@ fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Resul
     Ok(())
 }
 
+fn track_incoming(tx: &Transaction<'_>, id: i64, path: &str, folder: &str) -> Result<(), String> {
+    if folder.is_empty() { return Ok(()); }
+    if crate::incoming::is_inside(path, folder) {
+        tx.execute("UPDATE assets SET incoming_seen_at=?2 WHERE id=?1 AND incoming_seen_at IS NULL",
+            (id, crate::quarantine::now())).map_err(|e| e.to_string())?;
+    } else {
+        tx.execute("UPDATE assets SET incoming_seen_at=NULL WHERE id=?1 AND incoming_seen_at IS NOT NULL",
+            [id]).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn reconcile_incoming(tx: &Transaction<'_>, root: &str, scanned_folder: Option<&str>) -> Result<(), String> {
+    let available = Path::new(root).is_dir();
+    let now = crate::quarantine::now();
+    let filter = if scanned_folder.is_some() {
+        "folder_id IN (SELECT id FROM folders WHERE lower(rtrim(replace(path,'/','\\'),'\\'))=?1)"
+    } else {
+        "(incoming_seen_at IS NOT NULL OR (is_listed=1 AND path IS NOT NULL))"
+    };
+    let mut select = tx.prepare(&format!(
+        "SELECT id,coalesce(path,''),incoming_seen_at,is_listed=1 FROM assets WHERE {filter} ORDER BY id"
+    )).map_err(|e| e.to_string())?;
+    let mut update = tx.prepare("UPDATE assets SET incoming_seen_at=?2 WHERE id=?1").map_err(|e| e.to_string())?;
+    if let Some(folder) = scanned_folder {
+        select.raw_bind_parameter(1, normalize_fs_path(folder)).map_err(|e| e.to_string())?;
+    }
+    let mut rows = select.raw_query();
+    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+        let id: i64 = row.get(0).map_err(|e| e.to_string())?;
+        let path: String = row.get(1).map_err(|e| e.to_string())?;
+        let seen: Option<i64> = row.get(2).map_err(|e| e.to_string())?;
+        let listed: Option<bool> = row.get(3).map_err(|e| e.to_string())?;
+        let next = if listed != Some(true) || !crate::incoming::is_inside(&path, root) {
+            None
+        } else if !available {
+            seen
+        } else {
+            match std::fs::metadata(&path) {
+                Ok(info) if info.is_file() => seen.or(Some(now)),
+                Ok(_) => None,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(_) => seen,
+            }
+        };
+        if next != seen { update.execute((id, next)).map_err(|e| e.to_string())?; }
+    }
+    Ok(())
+}
+
 fn load_folder_paths(transaction: &Transaction<'_>) -> Result<HashMap<String, i64>, String> {
     let mut statement = transaction.prepare("SELECT id,path FROM folders WHERE path IS NOT NULL").map_err(|e| e.to_string())?;
     let rows = statement.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))).map_err(|e| e.to_string())?;
@@ -900,6 +1033,7 @@ fn matched_path_suffix<'a>(path: &'a str, old_normalized: &str) -> Option<&'a st
 
 fn resolve_write_assets(
     tx: &Transaction<'_>, asset_ids: &[i64], listed: &[ListedAsset], insert_missing: bool, require_temporary_id: bool,
+    track: impl Fn(&Transaction<'_>, i64, &str) -> Result<(), String>,
 ) -> Result<(Vec<AssetValueState>, Vec<AssetIdRemap>, usize), String> {
     let mut ids = asset_ids.to_vec();
     ids.sort_unstable();
@@ -936,6 +1070,7 @@ fn resolve_write_assets(
                         file_modified: candidate.file_modified.clone(), path: candidate.path.clone(),
                         rating: None, label: None, tagged: false,
                     })?;
+                    track(tx, id, &candidate.path)?;
                     inserted += 1;
                     id
                 }

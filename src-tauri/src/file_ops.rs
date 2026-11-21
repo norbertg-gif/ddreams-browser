@@ -1,6 +1,7 @@
 use crate::{db::Db, journal::{AssetIdRemap, CatalogWriter, FileCatalogCopy, FileCatalogMove}, listing::ListingService};
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, MutexGuard};
 use std::{collections::HashSet, fs::{self, File, FileTimes, OpenOptions}, io, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::SystemTime};
 #[cfg(test)] use std::sync::atomic::AtomicI64;
 
@@ -151,11 +152,21 @@ fn recycle_windows(paths:&[PathBuf])->Result<(),String>{
 #[cfg(not(windows))]
 fn recycle_windows(_paths:&[PathBuf])->Result<(),String>{Err("Kôš je dostupný iba vo Windows".into())}
 
-pub struct FileManager { db:Db, listing:Arc<ListingService>, writer:Arc<CatalogWriter>, readonly:bool, fs:Arc<dyn FileSystemOps> }
+mod quarantine_ops;
+
+pub struct FileManager { db:Db, listing:Arc<ListingService>, writer:Arc<CatalogWriter>, readonly:bool, fs:Arc<dyn FileSystemOps>, operation: Mutex<()>, review: Mutex<Option<crate::quarantine::Review>>, quarantine_delete: Mutex<Vec<crate::quarantine::Snapshot>> }
 impl FileManager {
-    pub fn new(db:Db,listing:Arc<ListingService>,writer:Arc<CatalogWriter>,readonly:bool)->Arc<Self>{Arc::new(Self{db,listing,writer,readonly,fs:Arc::new(NativeFileSystem)})}
-    #[cfg(test)] fn with_fs(db:Db,listing:Arc<ListingService>,writer:Arc<CatalogWriter>,readonly:bool,fs:Arc<dyn FileSystemOps>)->Self{Self{db,listing,writer,readonly,fs}}
+    pub fn new(db:Db,listing:Arc<ListingService>,writer:Arc<CatalogWriter>,readonly:bool)->Arc<Self>{Arc::new(Self{db,listing,writer,readonly,fs:Arc::new(NativeFileSystem),operation:Mutex::new(()),review:Mutex::new(None),quarantine_delete:Mutex::default()})}
+    #[cfg(test)] fn with_fs(db:Db,listing:Arc<ListingService>,writer:Arc<CatalogWriter>,readonly:bool,fs:Arc<dyn FileSystemOps>)->Self{Self{db,listing,writer,readonly,fs,operation:Mutex::new(()),review:Mutex::new(None),quarantine_delete:Mutex::default()}}
     fn writable(&self)->Result<(),String>{if self.readonly{Err("Katalóg je iba na čítanie".into())}else{Ok(())}}
+
+    pub(crate) fn lock_operation(&self) -> Result<MutexGuard<'_, ()>, String> {
+        self.operation.lock().map_err(|e| e.to_string())
+    }
+
+    pub(crate) fn sync_incoming(&self, path: &str) -> Result<(), String> {
+        self.writer.sync_incoming(path)
+    }
 
     pub fn preview_conflicts(&self,ids:&[i64],target:&str,rename_base:Option<&str>)->Result<usize,String>{let folder=self.validate_folder(target)?;let sources=self.resolve_sources(ids)?;let plans=self.plan(&sources,&folder,rename_base)?;Ok(plans.iter().filter(|p|!path_eq(p.source.path.parent().unwrap_or(Path::new("")),&folder)&&p.conflict).count())}
 
@@ -192,6 +203,7 @@ impl FileManager {
     pub fn copy_files<F>(&self,ids:&[i64],target:&str,policy:ConflictPolicy,mut progress:F)->Result<FileOperationResult,String> where F:FnMut(usize,usize){self.run_copy_move(ids,target,policy,true,&mut progress)}
 
     fn run_copy_move<F>(&self,ids:&[i64],target:&str,policy:ConflictPolicy,copy:bool,progress:&mut F)->Result<FileOperationResult,String> where F:FnMut(usize,usize){
+        let _operation = self.lock_operation()?;
         self.writable()?;let folder=self.validate_folder(target)?;let sources=self.resolve_sources(ids)?;if sources.is_empty(){return Err("Nie sú vybrané žiadne súbory".into())}let mut plans=self.plan(&sources,&folder,None)?;let same_folder_count=plans.iter().filter(|plan|path_eq(plan.source.path.parent().unwrap_or(Path::new("")),&folder)).count();plans.retain(|plan|!path_eq(plan.source.path.parent().unwrap_or(Path::new("")),&folder));if same_folder_count==sources.len(){return Ok(FileOperationResult{change_id:None,summary:"Súbory už sú v tomto priečinku".into(),changed_count:0,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:Vec::new()});}
         let conflicts=plans.iter().filter(|p|p.conflict).count();if conflicts>0&&policy==ConflictPolicy::Cancel{return Err("Operácia bola zrušená".into())}
         let mut skipped=0usize;let mut reserved=HashSet::new();let mut selected=Vec::new();
@@ -214,6 +226,7 @@ impl FileManager {
     }
 
     pub fn rename_file<F>(&self,id:i64,new_base_name:&str,mut progress:F)->Result<FileOperationResult,String> where F:FnMut(usize,usize){
+        let _operation = self.lock_operation()?;
         self.writable()?;let base=validate_windows_name(new_base_name)?;let mut sources=self.resolve_sources(&[id])?;let source=sources.pop().ok_or("Súbor sa nenašiel")?;let parent=source.path.parent().ok_or("Priečinok súboru sa nenašiel")?;let ext=source.path.extension().map(|x|x.to_string_lossy().to_string());let file_name=ext.as_ref().map(|e|format!("{base}.{e}")).unwrap_or_else(||base.clone());let target=parent.join(file_name);let mut pairs=sidecar_pairs(&source.path,&target)?;
         if pairs.iter().any(|p|self.fs.exists(&p.to)&&!path_eq(&p.from,&p.to)){return Err(format!("V priečinku už existuje súbor: {}",target.display()));}if pairs.iter().all(|p|p.from==p.to){return Ok(self.no_change_result(0,"Premenovanie"));}
         progress(1,1);let applied=move_transfers(self.fs.as_ref(),&pairs)?;pairs.clear();let name=target.file_name().unwrap().to_string_lossy().to_string();let catalog_move=if source.id>0{vec![FileCatalogMove{asset_id:source.id,target_path:target.to_string_lossy().to_string(),target_folder_path:parent.to_string_lossy().to_string(),name:name.clone(),ext:target.extension().unwrap_or_default().to_string_lossy().to_string(),size:source.size as f64,file_modified:Some(crate::listing::system_time_iso(source.modified))}]}else{Vec::new()};let summary=format!("Premenované {} → {name}",source.path.file_name().unwrap_or_default().to_string_lossy());
@@ -222,16 +235,16 @@ impl FileManager {
     }
 
     pub fn reveal_in_explorer(&self,path:&str)->Result<(),String>{let target=PathBuf::from(path);if !self.fs.exists(&target){return Err("Priečinok neexistuje".into())}#[cfg(windows)]{use std::{os::windows::process::CommandExt,process::Command};Command::new("explorer.exe").raw_arg(explorer_select_arg(&target)).spawn().map_err(|e|e.to_string())?;}Ok(())}
-    pub fn rename_folder(&self,path:&str,new_name:&str)->Result<FileOperationResult,String>{self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno premenovať".into())}let source=self.validate_folder(path)?;if source.parent().is_none()||source.parent()==Some(source.as_path()){return Err("Diskovú koreňovú zložku nemožno premenovať".into())}let name=validate_folder_name(new_name)?;if name=="."||name==".."{return Err("Neplatný názov priečinka".into())}let target=source.parent().unwrap().join(name);let case_only=path_eq(&source,&target)&&source!=target;if self.fs.exists(&target)&&!case_only{return Err(format!("Cieľ už existuje: {}",target.display()))}if source==target{return Ok(self.no_change_result(0,"Premenovanie priečinka"))}move_case_safe(self.fs.as_ref(),&source,&target).map_err(|e|e.to_string())?;let summary=format!("Premenovaný priečinok: {}",target.display());match self.writer.rewrite_folder_paths(&source.to_string_lossy(),&target.to_string_lossy(),"rename_folder",&summary){Ok(change_id)=>{if let Some(parent)=source.parent(){let _=self.listing.invalidate_path(&parent.to_string_lossy());}Ok(FileOperationResult{change_id,summary,changed_count:1,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![source.to_string_lossy().to_string(),target.to_string_lossy().to_string()]})},Err(error)=>{let rollback=move_case_safe(self.fs.as_ref(),&target,&source).map_err(|e|e.to_string());Err(combine_error(error,rollback))}}
+    pub fn rename_folder(&self,path:&str,new_name:&str)->Result<FileOperationResult,String>{let _operation=self.lock_operation()?;self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno premenovať".into())}let source=self.validate_folder(path)?;if source.parent().is_none()||source.parent()==Some(source.as_path()){return Err("Diskovú koreňovú zložku nemožno premenovať".into())}let name=validate_folder_name(new_name)?;if name=="."||name==".."{return Err("Neplatný názov priečinka".into())}let target=source.parent().unwrap().join(name);let case_only=path_eq(&source,&target)&&source!=target;if self.fs.exists(&target)&&!case_only{return Err(format!("Cieľ už existuje: {}",target.display()))}if source==target{return Ok(self.no_change_result(0,"Premenovanie priečinka"))}move_case_safe(self.fs.as_ref(),&source,&target).map_err(|e|e.to_string())?;let summary=format!("Premenovaný priečinok: {}",target.display());match self.writer.rewrite_folder_paths(&source.to_string_lossy(),&target.to_string_lossy(),"rename_folder",&summary){Ok(change_id)=>{if let Some(parent)=source.parent(){let _=self.listing.invalidate_path(&parent.to_string_lossy());}Ok(FileOperationResult{change_id,summary,changed_count:1,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![source.to_string_lossy().to_string(),target.to_string_lossy().to_string()]})},Err(error)=>{let rollback=move_case_safe(self.fs.as_ref(),&target,&source).map_err(|e|e.to_string());Err(combine_error(error,rollback))}}
     }
     pub fn delete_folder_info(&self,path:&str)->Result<DeleteFolderInfo,String>{if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno odstrániť".into())}let root=self.validate_folder(path)?;let mut files=0usize;let mut folders=0usize;let mut bytes=0u64;fn walk(fs:&dyn FileSystemOps,p:&Path,files:&mut usize,folders:&mut usize,bytes:&mut u64)->Result<(),String>{*folders+=1;for item in fs.read_dir(p).map_err(|e|e.to_string())?{if fs.is_symlink(&item){return Err(format!("Odkaz mimo priečinok nemožno bezpečne spracovať: {}",item.display()))}else if fs.is_dir(&item){walk(fs,&item,files,folders,bytes)?}else{*files+=1;*bytes=bytes.saturating_add(fs.metadata(&item).map_err(|e|e.to_string())?.len())}}Ok(())}walk(self.fs.as_ref(),&root,&mut files,&mut folders,&mut bytes)?;let catalogued={let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?;let norm=crate::journal::normalize_fs_path(&root.to_string_lossy());let prefix=format!("{norm}\\");let mut stmt=conn.prepare("SELECT path FROM assets WHERE path IS NOT NULL").map_err(|e|e.to_string())?;let paths=stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;paths.iter().filter(|p|{let p=crate::journal::normalize_fs_path(p);p==norm||p.starts_with(&prefix)}).count()};Ok(DeleteFolderInfo{files,folders,catalogued,bytes,recycle_available:self.fs.has_recycle_bin(&root)})}
-    pub fn delete_folder(&self,path:&str)->Result<FileOperationResult,String>{self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno odstrániť".into())}let root=self.validate_folder(path)?;if root.parent().is_none()||root.parent()==Some(root.as_path()){return Err("Diskovú koreňovú zložku nemožno odstrániť".into())}if !self.fs.has_recycle_bin(&root){return Err("Na tomto disku nie je dostupný Kôš; priečinok nemožno bezpečne odstrániť.".into())}let info=self.delete_folder_info(path)?;self.fs.recycle_delete(&[root.clone()])?;let summary=format!("Priečinok presunutý do Koša: {}",root.file_name().unwrap_or_default().to_string_lossy());let change_id=match self.writer.record_folder_delete(&root.to_string_lossy(),&summary){Ok(id)=>id,Err(e)=>{let rollback=self.fs.restore_recycled(&root);return Err(combine_error(e,rollback))}};if let Some(parent)=root.parent(){let _=self.listing.invalidate_path(&parent.to_string_lossy());}Ok(FileOperationResult{change_id,summary,changed_count:info.files,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![root.to_string_lossy().to_string()]})}
+    pub fn delete_folder(&self,path:&str)->Result<FileOperationResult,String>{let _operation=self.lock_operation()?;self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno odstrániť".into())}let root=self.validate_folder(path)?;if root.parent().is_none()||root.parent()==Some(root.as_path()){return Err("Diskovú koreňovú zložku nemožno odstrániť".into())}if !self.fs.has_recycle_bin(&root){return Err("Na tomto disku nie je dostupný Kôš; priečinok nemožno bezpečne odstrániť.".into())}let info=self.delete_folder_info(path)?;self.fs.recycle_delete(&[root.clone()])?;let summary=format!("Priečinok presunutý do Koša: {}",root.file_name().unwrap_or_default().to_string_lossy());let change_id=match self.writer.record_folder_delete(&root.to_string_lossy(),&summary){Ok(id)=>id,Err(e)=>{let rollback=self.fs.restore_recycled(&root);return Err(combine_error(e,rollback))}};if let Some(parent)=root.parent(){let _=self.listing.invalidate_path(&parent.to_string_lossy());}Ok(FileOperationResult{change_id,summary,changed_count:info.files,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![root.to_string_lossy().to_string()]})}
     pub fn move_folder(&self,path:&str,target:&str)->Result<FileOperationResult,String>{self.transfer_folder(path,target,false,&mut|_,_|{})}
     pub fn move_folder_with_progress<F>(&self,path:&str,target:&str,mut progress:F)->Result<FileOperationResult,String>where F:FnMut(usize,usize){self.transfer_folder(path,target,false,&mut progress)}
     pub fn copy_folder(&self,path:&str,target:&str)->Result<FileOperationResult,String>{self.transfer_folder(path,target,true,&mut|_,_|{})}
     pub fn copy_folder_with_progress<F>(&self,path:&str,target:&str,mut progress:F)->Result<FileOperationResult,String>where F:FnMut(usize,usize){self.transfer_folder(path,target,true,&mut progress)}
-    fn transfer_folder<F>(&self,path:&str,target:&str,copy:bool,progress:&mut F)->Result<FileOperationResult,String>where F:FnMut(usize,usize){self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno presúvať".into())}let source=self.validate_folder(path)?;let parent=self.validate_folder(target)?;if source.parent().is_none()||source.parent()==Some(source.as_path()){return Err("Diskovú koreňovú zložku nemožno presúvať".into())}let skey=key(&source);let tkey=key(&parent);if tkey==skey||tkey.starts_with(&(skey+"\\")){return Err("Priečinok nemožno vložiť do seba ani do jeho podpriečinka".into())}let dest=parent.join(source.file_name().ok_or("Názov priečinka chýba")?);if self.fs.exists(&dest){return Err(format!("V cieli už existuje priečinok „{}“",dest.file_name().unwrap().to_string_lossy()))}let cross_volume=!self.fs.same_volume(&source,&dest);let count=count_folder_files(self.fs.as_ref(),&source)?;let mut copied=Vec::new();if copy||cross_volume{if let Err(error)=copy_folder_tree(self.fs.as_ref(),&source,&dest,&mut copied,progress,count){let _=remove_tree(self.fs.as_ref(),&dest);return Err(error)}}else{progress(1,1);move_case_safe(self.fs.as_ref(),&source,&dest).map_err(|e|e.to_string())?;}if !copy&&cross_volume{if let Err(error)=self.fs.recycle_delete(&[source.clone()]){let _=remove_tree(self.fs.as_ref(),&dest);return Err(error)}}let summary=if copy{format!("Skopírované: {count} súborov (do katalógu sa pridajú pri otvorení priečinka)")}else{format!("Presunutý priečinok: {}",dest.display())};let recorded=if copy{self.writer.record_file_change("copy_folder",&summary,&[],&[],&[]).map(|x|x.0)}else{self.writer.rewrite_folder_paths(&source.to_string_lossy(),&dest.to_string_lossy(),"move_folder",&summary)};let change_id=match recorded{Ok(id)=>id,Err(e)=>{if copy{let _=self.fs.recycle_files(&[dest.clone()]);}else if cross_volume{let _=self.fs.restore_recycled(&source);let _=self.fs.recycle_files(&[dest.clone()]);}else{let _=move_case_safe(self.fs.as_ref(),&dest,&source);}return Err(e)}};let mut affected=vec![source.to_string_lossy().to_string(),dest.to_string_lossy().to_string(),parent.to_string_lossy().to_string()];if let Some(old_parent)=source.parent(){affected.push(old_parent.to_string_lossy().to_string());}for p in &affected{let _=self.listing.invalidate_path(p);}Ok(FileOperationResult{change_id,summary,changed_count:count,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:affected})}
-    pub fn create_folder(&self,parent:&str,name:&str)->Result<FileOperationResult,String>{self.writable()?;let folder=self.validate_folder(parent)?;let name=validate_windows_name(name)?;let target=folder.join(name);if self.fs.exists(&target){return Err(format!("Priečinok už existuje: {}",target.display()))}self.fs.create_dir(&target).map_err(|e|format!("Nepodarilo sa vytvoriť priečinok {}: {e}",target.display()))?;let summary=format!("Vytvorený priečinok {}",target.file_name().unwrap_or_default().to_string_lossy());match self.writer.record_file_change("create_folder",&summary,&[],&[],&[target.to_string_lossy().to_string()]){Ok((change_id,_))=>{self.listing.invalidate_path(parent).ok();Ok(FileOperationResult{change_id,summary,changed_count:1,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![parent.to_string()]})},Err(error)=>{let rollback=self.fs.remove_dir(&target).map_err(|e|format!("Nepodarilo sa vrátiť priečinok {}: {e}",target.display()));Err(combine_error(error,rollback))}}
+    fn transfer_folder<F>(&self,path:&str,target:&str,copy:bool,progress:&mut F)->Result<FileOperationResult,String>where F:FnMut(usize,usize){let _operation=self.lock_operation()?;self.writable()?;if is_volume_root(path){return Err("Diskovú koreňovú zložku nemožno presúvať".into())}let source=self.validate_folder(path)?;let parent=self.validate_folder(target)?;if source.parent().is_none()||source.parent()==Some(source.as_path()){return Err("Diskovú koreňovú zložku nemožno presúvať".into())}let skey=key(&source);let tkey=key(&parent);if tkey==skey||tkey.starts_with(&(skey+"\\")){return Err("Priečinok nemožno vložiť do seba ani do jeho podpriečinka".into())}let dest=parent.join(source.file_name().ok_or("Názov priečinka chýba")?);if self.fs.exists(&dest){return Err(format!("V cieli už existuje priečinok „{}“",dest.file_name().unwrap().to_string_lossy()))}let cross_volume=!self.fs.same_volume(&source,&dest);let count=count_folder_files(self.fs.as_ref(),&source)?;let mut copied=Vec::new();if copy||cross_volume{if let Err(error)=copy_folder_tree(self.fs.as_ref(),&source,&dest,&mut copied,progress,count){let _=remove_tree(self.fs.as_ref(),&dest);return Err(error)}}else{progress(1,1);move_case_safe(self.fs.as_ref(),&source,&dest).map_err(|e|e.to_string())?;}if !copy&&cross_volume{if let Err(error)=self.fs.recycle_delete(&[source.clone()]){let _=remove_tree(self.fs.as_ref(),&dest);return Err(error)}}let summary=if copy{format!("Skopírované: {count} súborov (do katalógu sa pridajú pri otvorení priečinka)")}else{format!("Presunutý priečinok: {}",dest.display())};let recorded=if copy{self.writer.record_file_change("copy_folder",&summary,&[],&[],&[]).map(|x|x.0)}else{self.writer.rewrite_folder_paths(&source.to_string_lossy(),&dest.to_string_lossy(),"move_folder",&summary)};let change_id=match recorded{Ok(id)=>id,Err(e)=>{if copy{let _=self.fs.recycle_files(&[dest.clone()]);}else if cross_volume{let _=self.fs.restore_recycled(&source);let _=self.fs.recycle_files(&[dest.clone()]);}else{let _=move_case_safe(self.fs.as_ref(),&dest,&source);}return Err(e)}};let mut affected=vec![source.to_string_lossy().to_string(),dest.to_string_lossy().to_string(),parent.to_string_lossy().to_string()];if let Some(old_parent)=source.parent(){affected.push(old_parent.to_string_lossy().to_string());}for p in &affected{let _=self.listing.invalidate_path(p);}Ok(FileOperationResult{change_id,summary,changed_count:count,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:affected})}
+    pub fn create_folder(&self,parent:&str,name:&str)->Result<FileOperationResult,String>{let _operation=self.lock_operation()?;self.writable()?;let folder=self.validate_folder(parent)?;let name=validate_windows_name(name)?;let target=folder.join(name);if self.fs.exists(&target){return Err(format!("Priečinok už existuje: {}",target.display()))}self.fs.create_dir(&target).map_err(|e|format!("Nepodarilo sa vytvoriť priečinok {}: {e}",target.display()))?;let summary=format!("Vytvorený priečinok {}",target.file_name().unwrap_or_default().to_string_lossy());match self.writer.record_file_change("create_folder",&summary,&[],&[],&[target.to_string_lossy().to_string()]){Ok((change_id,_))=>{self.listing.invalidate_path(parent).ok();Ok(FileOperationResult{change_id,summary,changed_count:1,skipped_count:0,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:vec![parent.to_string()]})},Err(error)=>{let rollback=self.fs.remove_dir(&target).map_err(|e|format!("Nepodarilo sa vrátiť priečinok {}: {e}",target.display()));Err(combine_error(error,rollback))}}
     }
 
     /// Moves the selected files and their sidecars to the Recycle Bin and removes their catalogue rows,
@@ -257,6 +270,7 @@ impl FileManager {
     /// or permanently when requested or confirmed for a drive without a Recycle Bin. Directories are skipped.
     /// Returns the result and the catalogue ids that were purged permanently.
     pub fn delete_files(&self,ids:&[i64],permanent:bool,confirmed_no_bin_drives:&[String])->Result<(FileOperationResult,Vec<i64>),String>{
+        let _operation = self.lock_operation()?;
         self.writable()?;
         let (files_only,sources)=self.delete_sources(ids)?;
         let (to_bin,to_purge):(Vec<&Source>,Vec<&Source>)=sources.iter().partition(|s|!permanent&&self.fs.has_recycle_bin(&s.path));
@@ -293,7 +307,24 @@ impl FileManager {
 
     fn plan(&self,sources:&[Source],folder:&Path,rename_base:Option<&str>)->Result<Vec<Plan>,String>{let mut plans=Vec::new();let mut reserved=HashSet::new();for source in sources{let main=if let Some(base)=rename_base{let ext=source.path.extension().map(|e|e.to_string_lossy().to_string());folder.join(ext.map(|e|format!("{base}.{e}")).unwrap_or_else(||base.to_string()))}else{folder.join(&source.name)};let pairs=sidecar_pairs(&source.path,&main)?;let conflict=pairs.iter().any(|p|self.fs.exists(&p.to)||reserved.contains(&key(&p.to)));for pair in &pairs{reserved.insert(key(&pair.to));}plans.push(Plan{source:source.clone(),target:main,pairs,conflict});}Ok(plans)}
 
-    fn number_conflict(&self,plan:Plan,folder:&Path,reserved:&HashSet<String>)->Result<Plan,String>{if !plan.conflict{return Ok(plan)}let original=plan.target.file_stem().unwrap_or_default().to_string_lossy().to_string();let ext=plan.target.extension().map(|e|e.to_string_lossy().to_string());for n in 2..100_000u32{let base=format!("{original} ({n})");let target=folder.join(ext.as_ref().map(|e|format!("{base}.{e}")).unwrap_or_else(||base.clone()));let pairs=sidecar_pairs(&plan.source.path,&target)?;if pairs.iter().all(|p|!self.fs.exists(&p.to)&&!reserved.contains(&key(&p.to))){return Ok(Plan{source:plan.source,target, pairs, conflict:false});}}Err("Nenašlo sa voľné číslo pre názov súboru".into())}
+    fn number_conflict(&self, plan: Plan, folder: &Path, reserved: &HashSet<String>) -> Result<Plan, String> {
+        self.number_conflict_with(plan, folder, |path| reserved.contains(&key(path)))
+    }
+
+    fn number_conflict_with(&self, plan: Plan, folder: &Path, reserved: impl Fn(&Path) -> bool) -> Result<Plan, String> {
+        if !plan.conflict { return Ok(plan); }
+        let original = plan.target.file_stem().unwrap_or_default().to_string_lossy();
+        let ext = plan.target.extension().map(|e| e.to_string_lossy());
+        for n in 2..100_000u32 {
+            let base = format!("{original} ({n})");
+            let target = folder.join(ext.as_ref().map(|e| format!("{base}.{e}")).unwrap_or(base));
+            let pairs = sidecar_pairs(&plan.source.path, &target)?;
+            if pairs.iter().all(|pair| !self.fs.exists(&pair.to) && !reserved(&pair.to)) {
+                return Ok(Plan { source: plan.source, target, pairs, conflict: false });
+            }
+        }
+        Err("Nenašlo sa voľné číslo pre názov súboru".into())
+    }
 
     fn invalidate_plans(&self,plans:&[Plan],folder:&Path){let _=self.listing.invalidate_path(&folder.to_string_lossy());for plan in plans{if let Some(parent)=plan.source.path.parent(){let _=self.listing.invalidate_path(&parent.to_string_lossy());}}}
     fn no_change_result(&self,skipped:usize,operation:&str)->FileOperationResult{FileOperationResult{change_id:None,summary:if skipped>0{format!("{operation}: preskočené {skipped} {}",slovak_files(skipped))}else{format!("{operation}: bez zmien")},changed_count:0,skipped_count:skipped,remapped_ids:Vec::new(),affected_ids:Vec::new(),affected_folder_paths:Vec::new()}}
@@ -385,10 +416,207 @@ mod tests {
     fn set_up(root:&Path,force_cross:Option<bool>)->(Arc<TestFs>,FileManager){let src=root.join("src");let dst=root.join("dst");fs::create_dir_all(&src).unwrap();fs::create_dir_all(&dst).unwrap();fs::write(src.join("a.jpg"),b"abc").unwrap();let recycle=root.join("recycle");fs::create_dir_all(&recycle).unwrap();let disk=Arc::new(TestFs{force_cross,fail_move:AtomicUsize::new(usize::MAX),move_calls:AtomicUsize::new(0),recycle,copied_mtime_offset:AtomicI64::new(i64::MIN),recycled:Default::default()});let manager=manager(root,false,disk.clone());(disk,manager)}
     fn seed_asset_path(db:&Db,root:&Path){let path=root.join("src/a.jpg");db.lock().unwrap().execute("UPDATE assets SET path=?1 WHERE id=1",[path.to_string_lossy().to_string()]).unwrap();}
 
+    fn quarantine_fixture(root: &Path) -> (Arc<TestFs>, FileManager, crate::quarantine::Settings) {
+        let (disk, manager) = set_up(root, None);
+        seed_asset_path(&manager.db, root);
+        crate::schema::migrate_catalog(&mut manager.db.lock().unwrap()).unwrap();
+        let settings = crate::quarantine::Settings::fixture(&root.join("src"), &root.join("dst"));
+        manager.sync_incoming(settings.incoming().to_str().unwrap()).unwrap();
+        (disk, manager, settings)
+    }
+
+    #[test]
+    fn quarantine_review_excludes_protected_old_undated_outside_and_nonphotos() {
+        let root = temp();
+        let (_, manager, settings) = quarantine_fixture(&root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let now = crate::quarantine::now();
+        let aged = now - 61 * crate::quarantine::DAY;
+        {
+            let conn = manager.db.lock().unwrap();
+            conn.execute_batch("DELETE FROM assets; DELETE FROM asset_categories;").unwrap();
+            for (id, ext, date, rating, label, tagged, base, seen) in [
+                (1, "jpg", Some("2024-06-01T12:30:00"), None, None, None, "src", aged),
+                (2, "rw2", Some("2024-06-02"), Some(0), Some(""), Some(0), "src", aged),
+                (3, "jpg", Some("2024-07-01"), Some(4), None, None, "src", aged),
+                (4, "jpg", Some("2024-07-01"), None, Some("Red"), None, "src", aged),
+                (5, "jpg", Some("2024-07-01"), None, None, Some(1), "src", aged),
+                (6, "jpg", Some("2024-07-01"), None, None, None, "src", aged),
+                (7, "jpg", Some("2024-05-31"), None, None, None, "src", aged),
+                (8, "jpg", None, None, None, None, "src", aged),
+                (9, "jpg", Some("2024-07-01"), None, None, None, "src-other", aged),
+                (10, "mp4", Some("2024-07-01"), None, None, None, "src", aged),
+                (11, "jpg", Some("2024-07-01"), None, None, None, "src", now),
+                (12, "jpg", Some("2024-02-31"), None, None, None, "src", aged),
+            ] {
+                let name = format!("{id}.{ext}");
+                let folder = root.join(base);
+                fs::create_dir_all(&folder).unwrap();
+                let path = folder.join(&name);
+                fs::write(&path, b"test").unwrap();
+                conn.execute("INSERT INTO assets(id,name,ext,ext_lower,is_listed,path,exif_date,rating,label,tagged,incoming_seen_at)
+                    VALUES(?1,?2,?3,?3,1,?4,?5,?6,?7,?8,?9)",
+                    (id, name, ext, path.to_str().unwrap(), date, rating, label, tagged, seen)).unwrap();
+            }
+            conn.execute("INSERT INTO asset_categories VALUES(6,1)", []).unwrap();
+        }
+        let preview = manager.prepare_quarantine_review(settings.clone(), &formats, None).unwrap();
+        assert_eq!(preview.moves.ids, vec![1, 2]);
+        assert_eq!(preview.moves.bytes, 8);
+        assert!(preview.deletes.ids.is_empty());
+        assert!(root.join("src/1.jpg").exists());
+        manager.db.lock().unwrap().execute("UPDATE assets SET rating=5 WHERE id=1", []).unwrap();
+        let result = manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).unwrap();
+        assert_eq!((result.moved, result.failures.len()), (1, 1));
+        assert!(root.join("src/1.jpg").exists());
+        assert!(root.join("dst/2.rw2").exists());
+        assert!(manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quarantine_round_trip_keeps_sidecars_and_both_conflicting_photos() {
+        let root = temp();
+        let (_, manager, settings) = quarantine_fixture(&root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let source = root.join("src/a.jpg");
+        let sidecar = root.join("src/a.xmp");
+        fs::write(&sidecar, b"sidecar").unwrap();
+        fs::write(root.join("dst/a.rw2"), b"existing quarantine file with the same XMP stem").unwrap();
+        let skipped = manager.move_to_quarantine(&[1], &settings, &formats, ConflictPolicy::Skip, false, |_, _| {}).unwrap();
+        assert_eq!((skipped.moved, skipped.failures.len()), (0, 1));
+        let moved = manager.move_to_quarantine(&[1], &settings, &formats, ConflictPolicy::KeepBoth, false, |_, _| {}).unwrap();
+        assert_eq!((moved.moved, moved.failures.len()), (1, 0));
+        assert!(!source.exists() && !sidecar.exists());
+        assert_eq!(fs::read(root.join("dst/a (2).xmp")).unwrap(), b"sidecar");
+        assert!(root.join("dst/a.rw2").exists());
+        {
+            let conn = manager.db.lock().unwrap();
+            let (path, origin, seen, stamp): (String, String, Option<i64>, i64) =
+                conn.query_row("SELECT path,quarantine_origin,incoming_seen_at,quarantined_at FROM assets WHERE id=1", [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+            assert_eq!(Path::new(&path), root.join("dst/a (2).jpg"));
+            assert_eq!(origin, source.to_string_lossy());
+            assert_eq!(seen, None);
+            assert!(stamp > 0);
+        }
+        fs::write(&source, b"new original-name file").unwrap();
+        let restored = manager.restore_from_quarantine(&[1], &settings, |_, _| {}).unwrap();
+        assert_eq!((restored.restored, restored.failures.len()), (1, 0));
+        assert_eq!(fs::read(&source).unwrap(), b"new original-name file");
+        assert_eq!(fs::read(root.join("src/a (2).jpg")).unwrap(), b"abc");
+        assert_eq!(fs::read(root.join("src/a (2).xmp")).unwrap(), b"sidecar");
+        assert!(manager.db.lock().unwrap().query_row("SELECT incoming_seen_at IS NOT NULL AND
+            quarantined_at IS NULL AND quarantine_origin IS NULL FROM assets WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quarantine_delete_uses_bin_and_requires_drive_confirmation_for_purge() {
+        for bin in [true, false] {
+            let temp_dir = temp();
+            let root = temp_dir.join(if bin { "fixed" } else { "nobin" });
+            let (disk, manager, settings) = quarantine_fixture(&root);
+            let formats = crate::formats::FormatTable::load_selected(None);
+            fs::write(root.join("src/a.jpg.xmp"), b"sidecar").unwrap();
+            let moved = manager.move_to_quarantine(&[1], &settings, &formats, ConflictPolicy::KeepBoth, false, |_, _| {}).unwrap();
+            assert_eq!(moved.moved, 1);
+            let photo = root.join("dst/a.jpg");
+            let sidecar = root.join("dst/a.jpg.xmp");
+            let info = manager.quarantine_delete_info(&[1], &settings).unwrap();
+            assert_eq!((info.count, info.sidecars, info.permanent_count), (1, 1, usize::from(!bin)));
+            if !bin {
+                let refused = manager.delete_from_quarantine(&[1], &settings, &[], |_, _| {}).unwrap();
+                assert!(refused.failures[0].contains("potvrdenie"));
+                assert!(photo.exists() && sidecar.exists());
+                manager.quarantine_delete_info(&[1], &settings).unwrap();
+            }
+            let deleted = manager.delete_from_quarantine(&[1], &settings, &info.no_bin_drives, |_, _| {}).unwrap();
+            assert_eq!((deleted.deleted, deleted.failures.len()), (1, 0));
+            assert!(!photo.exists() && !sidecar.exists());
+            assert_eq!(disk.recycled_item(&photo).is_some(), bin);
+            assert_eq!(disk.recycled_item(&sidecar).is_some(), bin);
+            let conn = manager.db.lock().unwrap();
+            assert_eq!(conn.query_row("SELECT count(*) FROM assets WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+            assert_eq!(conn.query_row("SELECT action FROM ddreams_changes ORDER BY id DESC LIMIT 1", [],
+                |r| r.get::<_, String>(0)).unwrap(), if bin { "delete_from_quarantine" } else { "purge_from_quarantine" });
+            fs::remove_dir_all(temp_dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn incoming_seen_is_initialized_for_existing_and_new_assets_and_cleared_on_move() {
+        let root = temp();
+        let (_, manager, settings) = quarantine_fixture(&root);
+        let src = settings.incoming();
+        let seen = |id| manager.db.lock().unwrap().query_row("SELECT incoming_seen_at FROM assets WHERE id=?1",
+            [id], |r| r.get::<_, Option<i64>>(0)).unwrap();
+        assert!(seen(1).is_some());
+        manager.db.lock().unwrap().execute("UPDATE assets SET incoming_seen_at=1 WHERE id=1", []).unwrap();
+        manager.sync_incoming(src.to_str().unwrap()).unwrap();
+        assert_eq!(seen(1), Some(1));
+        let path = src.join("b.jpg");
+        fs::write(&path, b"test").unwrap();
+        let new = manager.writer.catalog_listed_assets(&[crate::journal::ListedAsset {
+            temporary_id: -2, name: "b.jpg".into(), ext: "jpg".into(), size: Some(4.0),
+            file_modified: None, path: path.to_string_lossy().into_owned(), folder_path: src.to_string_lossy().into_owned(),
+        }]).unwrap()[0].new_id;
+        assert!(seen(new).unwrap() > 1);
+        manager.move_files(&[1], settings.quarantine().to_str().unwrap(), ConflictPolicy::Cancel, |_, _| {}).unwrap();
+        assert_eq!(seen(1), None);
+        fs::remove_file(path).unwrap();
+        manager.sync_incoming(src.to_str().unwrap()).unwrap();
+        assert_eq!(seen(new), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn quarantine_rejects_import_folder_and_its_descendants() {
+        let root = temp();
+        let source = root.join("Panasonic");
+        fs::create_dir(&source).unwrap();
+        for target in [&source, &source.join("nested"), &root, &root.join("other/../Panasonic/nested")] {
+            assert!(crate::quarantine::validate_roots(&source, target).is_err());
+        }
+        assert!(crate::quarantine::validate_roots(&source, &root.join("_Karanténa")).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_quarantine_review_deletes_only_previously_reviewed_unchanged_expired_files() {
+        let root = temp();
+        let (disk, manager, settings) = quarantine_fixture(&root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let old = crate::quarantine::now() - 31 * crate::quarantine::DAY;
+        let fresh = crate::quarantine::now();
+        {
+            let conn = manager.db.lock().unwrap();
+            for (id, folder, age) in [(2, "dst", old), (3, "dst", fresh), (4, "src", old), (5, "dst", old)] {
+                let name = format!("{id}.jpg");
+                let path = root.join(folder).join(&name);
+                fs::write(&path, b"before").unwrap();
+                conn.execute("INSERT INTO assets(id,path,name,ext,ext_lower,is_listed,quarantined_at,quarantine_origin)
+                    VALUES(?1,?2,?3,'jpg','jpg',1,?4,?5)", (id, path.to_str().unwrap(), &name, age, root.join("src").join(&name).to_str().unwrap())).unwrap();
+            }
+        }
+        let preview = manager.prepare_quarantine_review(settings.clone(), &formats, None).unwrap();
+        assert_eq!(preview.deletes.ids, vec![2, 5]);
+        assert_eq!(preview.deletes.bytes, 12);
+        assert!(root.join("dst/2.jpg").exists());
+        fs::write(root.join("dst/5.jpg"), b"replacement").unwrap();
+        let result = manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).unwrap();
+        assert_eq!((result.deleted, result.failures.len()), (1, 1));
+        assert!(disk.recycled_item(&root.join("dst").join("2.jpg")).is_some());
+        assert!(root.join("dst/3.jpg").exists());
+        assert!(root.join("src/4.jpg").exists());
+        assert_eq!(fs::read(root.join("dst/5.jpg")).unwrap(), b"replacement");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]fn same_volume_move_updates_catalogue_and_moves_sidecar(){let root=temp();let(disk,manager)=set_up(&root,None);let src=root.join("src/a.jpg");fs::write(root.join("src/a.xmp"),b"side").unwrap();let db=manager.db.clone();seed_asset_path(&db,&root);let listed=ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None));let manager=FileManager::with_fs(db.clone(),listed,manager.writer.clone(),false,disk);let result=manager.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert_eq!(result.changed_count,1);assert!(!src.exists());assert!(root.join("dst/a.xmp").exists());assert_eq!(db.lock().unwrap().query_row("SELECT path||':'||rating FROM assets WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),format!("{}:4",root.join("dst").join("a.jpg").display()));let _=fs::remove_dir_all(root);}
     #[test]fn copy_duplicates_metadata_and_relations(){let root=temp();let(disk,mut manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);let listing=ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None));manager=FileManager::with_fs(db.clone(),listing,manager.writer.clone(),false,disk.clone());let result=manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();let id=result.remapped_ids[0].new_id;{let c=db.lock().unwrap();assert_eq!(c.query_row("SELECT rating||':'||caption FROM assets WHERE id=?1",[id],|r|r.get::<_,String>(0)).unwrap(),"4:cap");assert_eq!(c.query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(c.query_row("SELECT count(*) FROM asset_keywords WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),1);}let _=fs::remove_dir_all(root);}
     #[test]fn conflicts_skip_keep_both_and_overwrite_refusal(){let root=temp();let(disk,mut manager)=set_up(&root,None);fs::write(root.join("dst/a.jpg"),b"existing").unwrap();let db=manager.db.clone();seed_asset_path(&db,&root);manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk);assert_eq!(manager.preview_conflicts(&[1],root.join("dst").to_str().unwrap(),None).unwrap(),1);let skip=manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Skip,|_,_|{}).unwrap();assert_eq!(skip.skipped_count,1);assert_eq!(fs::read(root.join("dst/a.jpg")).unwrap(),b"existing");manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::KeepBoth,|_,_|{}).unwrap();assert_eq!(fs::read(root.join("dst/a (2).jpg")).unwrap(),b"abc");let _=fs::remove_dir_all(root);}
-    #[test]fn cross_volume_switch_and_uncatalogued_move_are_testable(){let root=temp();let(disk,manager)=set_up(&root,Some(false));let listed=ListingService::new(manager.db.clone(),crate::formats::FormatTable::load_selected(None));let _=listed;let mut m=manager;let source=root.join("src/a.jpg");let asset=crate::db::Asset{id:-10_000_000,folder_id:None,name:"a.jpg".into(),ext:"jpg".into(),size:Some(3.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(source.to_string_lossy().to_string()),is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None};m.listing.insert_test_asset(asset);m.move_files(&[-10_000_000],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert!(!source.exists());assert!(root.join("dst/a.jpg").exists());assert_eq!(m.db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE '%a.jpg'",[],|r|r.get::<_,i64>(0)).unwrap(),1);let _=fs::remove_dir_all(root);}
+    #[test]fn cross_volume_switch_and_uncatalogued_move_are_testable(){let root=temp();let(disk,manager)=set_up(&root,Some(false));let listed=ListingService::new(manager.db.clone(),crate::formats::FormatTable::load_selected(None));let _=listed;let mut m=manager;let source=root.join("src/a.jpg");let asset=crate::db::Asset{id:-10_000_000,folder_id:None,name:"a.jpg".into(),ext:"jpg".into(),size:Some(3.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(source.to_string_lossy().to_string()),is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None};m.listing.insert_test_asset(asset);m.move_files(&[-10_000_000],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert!(!source.exists());assert!(root.join("dst/a.jpg").exists());assert_eq!(m.db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE '%a.jpg'",[],|r|r.get::<_,i64>(0)).unwrap(),1);let _=fs::remove_dir_all(root);}
     #[test]fn simulated_mid_batch_failure_rolls_back_and_readonly_refuses(){let root=temp();let(disk,manager)=set_up(&root,Some(true));fs::write(root.join("src/a.xmp"),b"side").unwrap();seed_asset_path(&manager.db,&root);disk.fail_move.store(1,Ordering::SeqCst);let error=manager.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err();assert!(error.contains("simulated failure"));assert!(root.join("src/a.jpg").exists());assert!(root.join("src/a.xmp").exists());assert!(!root.join("dst/a.jpg").exists());assert_eq!(manager.db.lock().unwrap().query_row("SELECT path FROM assets WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),root.join("src/a.jpg").to_string_lossy());let ro=FileManager::with_fs(manager.db.clone(),manager.listing.clone(),manager.writer.clone(),true,disk);assert!(ro.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err().contains("iba na čítanie"));let _=fs::remove_dir_all(root);}
     #[test]fn delete_recycles_main_and_sidecar_and_removes_rows(){let root=temp();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);fs::write(root.join("src/a.xmp"),b"side").unwrap();let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
         let result=manager.delete_files(&[1],false,&[]).unwrap().0;assert_eq!(result.summary,"Odstránené do Koša: 1 súbor");assert!(!root.join("src/a.jpg").exists());assert!(!root.join("src/a.xmp").exists());

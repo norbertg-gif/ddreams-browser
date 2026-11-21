@@ -16,6 +16,7 @@ mod listing;
 mod metadata_view;
 mod paths;
 mod quality;
+mod quarantine;
 mod schema;
 mod thumbs;
 
@@ -60,6 +61,12 @@ pub fn run() {
     let journal_ai=ai_service.clone();
     writer.set_change_hook(Arc::new(move|kinds|for kind in kinds { journal_ai.sync_labels_debounced(kind); }));
     let file_manager=file_ops::FileManager::new(db.clone(),listing.clone(),writer.clone(),paths.readonly);
+    if !paths.readonly {
+        match quarantine::initialize(&paths.settings, &db, &writer) {
+            Ok(()) => {}
+            Err(error) => eprintln!("Nepodarilo sa inicializovať karanténu: {error}"),
+        }
+    }
     let _=ai_service.ensure_colors_attached();
     let auto_exif = exif_index::ExifIndex::new(paths.catalog.clone(),paths.exiftool.clone(),formats.clone(),&db);
     let setup_ai = ai_service.clone();
@@ -157,6 +164,14 @@ pub fn run() {
             commands::ai_series,
             incoming::get_incoming_folder,
             incoming::set_incoming_folder,
+            quarantine::get_quarantine_settings,
+            quarantine::set_quarantine_settings,
+            quarantine::preview_quarantine_review,
+            quarantine::execute_quarantine_review,
+            quarantine::move_to_quarantine,
+            quarantine::restore_from_quarantine,
+            quarantine::get_quarantine_delete_info,
+            quarantine::delete_from_quarantine,
             incoming::suggest_incoming_folders,
             incoming::analyze_incoming_series,
             incoming::get_deletion_suggestions,

@@ -39,7 +39,21 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
     }
     transaction.execute("CREATE INDEX IF NOT EXISTS idx_assets_delete_suggestion ON assets(id) WHERE is_listed=1 AND delete_suggestion=1", [])
         .map_err(|e| e.to_string())?;
+    for (column, kind) in [("incoming_seen_at", "INTEGER"), ("quarantined_at", "INTEGER"), ("quarantine_origin", "TEXT")] {
+        if !has_asset_column(&transaction, column).map_err(|e| e.to_string())? {
+            transaction.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {kind}"), [])
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    transaction.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_assets_incoming_seen ON assets(incoming_seen_at) WHERE incoming_seen_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_assets_quarantined ON assets(quarantined_at) WHERE quarantined_at IS NOT NULL;",
+    ).map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())
+}
+
+pub(crate) fn has_asset_column(conn: &Connection, column: &str) -> rusqlite::Result<bool> {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('assets') WHERE name=?1)", [column], |r| r.get(0))
 }
 
 // Older releases reserved IDs found in history. Carry over only the numeric ID limits
@@ -112,6 +126,19 @@ mod tests {
             assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='index' AND name=?1",[index],|row|row.get::<_,i64>(0)).unwrap(),1);
         }
         assert_eq!(connection.query_row("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='ddreams_change_items'", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    }
+
+    #[test]
+    fn quarantine_migration_preserves_existing_rows_and_timestamps() {
+        let mut conn = fixture();
+        conn.execute("INSERT INTO assets(id,is_listed) VALUES(1,1),(2,1)", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        conn.execute("UPDATE assets SET incoming_seen_at=12 WHERE id=1", []).unwrap();
+        conn.execute("UPDATE assets SET quarantined_at=34,quarantine_origin='X:/in/b.jpg' WHERE id=2", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        assert_eq!(conn.query_row("SELECT incoming_seen_at FROM assets WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 12);
+        assert_eq!(conn.query_row("SELECT quarantined_at,quarantine_origin FROM assets WHERE id=2", [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).unwrap(), (34, "X:/in/b.jpg".into()));
     }
 
     #[test]

@@ -7,6 +7,11 @@ export type HelpBlock =
 export type HelpTopic = { id: string; title: string; keywords: string[]; blocks: HelpBlock[] };
 
 export const helpTopics: HelpTopic[] = [
+  { id: "quarantine", title: "Import a karanténa", keywords: ["Panasonic", "import", "vymazanie", "kôš"], blocks: [
+    { type: "paragraph", text: "V Nastaveniach → Import a karanténa vyberte zdroj, karanténu, lehoty a najstarší dátum snímania. Lehota presunu sa počíta od prvého záznamu v importe. Hodnota 0 danú kontrolu vypne." },
+    { type: "paragraph", text: "Pri štarte môžete skontrolovať fotky bez hodnotenia, štítka, kategórie a označenia, ktoré už majú lehotu presunu za sebou. Kontrola zahŕňa aj staršie položky karantény. Presun a odstránenie sa vykonajú až po potvrdení." },
+    { type: "paragraph", text: "Do karantény môžete potvrdením presunúť aj vybrané fotky alebo návrhy na vymazanie. V položke Katalóg → Karanténa fotky vrátite na pôvodné miesto alebo ich odstránite do Koša. Disk bez Koša vyžaduje potvrdenie trvalého zmazania." }
+  ] },
   { id: "start", title: "Prvé kroky", keywords: ["začiatok", "prehľad"], blocks: [
     { type: "steps", items: ["V paneli Priečinky rozbaľte disk a vyberte priečinok; v strede sa zobrazia jeho položky.", "Kliknutím vyberte fotografiu, dvojklikom ju otvorte. Údaje o výbere sú v paneli Vlastnosti.", "V paneli Katalóg vyberte kategóriu alebo inú skupinu; pomocou Filtre a poľa Filtrovať v zobrazení… zúžte výsledky."] },
     { type: "note", text: "Pomocníka otvoríte klávesom F1 alebo z ponuky Zobrazenie. Témy možno vyhľadávať aj bez diakritiky." }

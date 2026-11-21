@@ -3,12 +3,15 @@ import { invoke } from "@tauri-apps/api/core";
 import FileOperationDialog from "./FileOperationDialog";
 import { useFolderRules, type FolderRuleAction } from "../folderRules";
 import { saveEditors, useEditors, editorsSuggested, type Editor } from "../editors";
+import type { QuarantineSettings } from "./QuarantineReview";
 
 type Props = {
   onClose: () => void;
   incomingFolder: string;
   readOnly: boolean;
   onIncomingFolderChange: (path:string) => Promise<void>;
+  quarantineSettings: QuarantineSettings | null;
+  onQuarantineSettingsChange: (settings: QuarantineSettings) => Promise<void>;
   onRule: FolderRuleAction;
   showOtherFiles: boolean;
   onShowOtherFiles: (value: boolean) => void;
@@ -27,13 +30,23 @@ type MissingSource={path:string;assets:number;offline:boolean;missing:boolean};
 type BackupStatus = { lastBackupAt: number | null; lastBackupFile: string | null; backupCount: number; backupsDir: string; intervalDays: number; snoozedUntil: number | null; due: boolean };
 
 /** Application settings. Sections grow as features arrive. */
-export default function SettingsDialog({ onClose, incomingFolder, onIncomingFolderChange, readOnly, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiLoadModelAtStart, onAiLoadModelAtStart, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
+export default function SettingsDialog({ onClose, incomingFolder, onIncomingFolderChange, quarantineSettings, onQuarantineSettingsChange, readOnly, onRule, showOtherFiles, onShowOtherFiles, aiEnabled, aiLoadModelAtStart, onAiLoadModelAtStart, aiAvailable, aiStatusText, onToggleAi, uiScale, onUiScale,onRemoveSource }: Props) {
   const rules = useFolderRules();
   const [path, setPath] = useState("");
   const [error, setError] = useState("");
   const [incomingPicker, setIncomingPicker] = useState(false);
   const [incomingError, setIncomingError] = useState("");
   const [incomingBusy, setIncomingBusy] = useState(false);
+  const [quarantine, setQuarantine] = useState(quarantineSettings);
+  useEffect(() => setQuarantine(quarantineSettings), [quarantineSettings]);
+  const saveQuarantine = async () => {
+    if (!quarantine) return;
+    setIncomingError("");
+    setIncomingBusy(true);
+    try { await onQuarantineSettingsChange(quarantine); }
+    catch (error) { setIncomingError(String(error)); }
+    finally { setIncomingBusy(false); }
+  };
   const saveIncoming = async (path: string) => {
     setIncomingPicker(false);
     setIncomingError("");
@@ -141,12 +154,35 @@ export default function SettingsDialog({ onClose, incomingFolder, onIncomingFold
         {editorError && <small className="settings-error">{editorError}</small>}
       </section>
       <section className="settings-section">
-        <h3>Priečinok s novými fotkami</h3>
+        <h3>Import a karanténa</h3>
+        <strong>Importovací (zdrojový) priečinok</strong>
         <p className="settings-help" title={incomingFolder}>{incomingFolder || "Priečinok zatiaľ nie je vybraný."}</p>
         <div className="settings-add">
           <button disabled={readOnly||incomingBusy} onClick={()=>setIncomingPicker(true)}>Vybrať priečinok…</button>
           {incomingFolder&&<button disabled={readOnly||incomingBusy} onClick={()=>void saveIncoming("")}>Zrušiť výber</button>}
         </div>
+        {quarantine && <form className="quarantine-settings" onSubmit={event => { event.preventDefault(); void saveQuarantine(); }}>
+          <fieldset disabled={readOnly || incomingBusy}>
+            <label>Priečinok karantény
+              <input value={quarantine.folder} placeholder={quarantine.quarantineFolder || "_Karanténa"}
+                onChange={event => setQuarantine({ ...quarantine, folder: event.target.value })} />
+            </label>
+            <label>Presunúť do karantény po (dňoch)
+              <input type="number" min="0" max="4294967295" required value={Number.isNaN(quarantine.moveAfterDays) ? "" : quarantine.moveAfterDays}
+                onChange={event => setQuarantine({ ...quarantine, moveAfterDays: event.target.valueAsNumber })} />
+            </label>
+            <label>Zmazať z karantény po (dňoch)
+              <input type="number" min="0" max="4294967295" required value={Number.isNaN(quarantine.deleteAfterDays) ? "" : quarantine.deleteAfterDays}
+                onChange={event => setQuarantine({ ...quarantine, deleteAfterDays: event.target.valueAsNumber })} />
+            </label>
+            <label>Spravovať len fotky nasnímané od (dátum)
+              <input type="date" required value={quarantine.manageFrom}
+                onChange={event => setQuarantine({ ...quarantine, manageFrom: event.target.value })} />
+            </label>
+            <small>Prázdna cesta použije priečinok _Karanténa vedľa importu. Hodnota 0 vypne príslušnú kontrolu pri štarte.</small>
+            <div><button type="submit">Uložiť nastavenia karantény</button></div>
+          </fieldset>
+        </form>}
         {incomingError&&<small className="settings-error">{incomingError}</small>}
       </section>
       <section className="settings-section">

@@ -591,14 +591,16 @@ pub fn get_assets(
     formats: State<'_, FormatsState>,
     ai: State<'_, AiState>,
     writer: State<'_, CatalogWriterState>,
+    file_manager: State<'_, FileManagerState>,
     filter: AssetFilter,
 ) -> Result<db::AssetPage, String> {
     // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
     // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
-    if filter.kind == "folder" && filter.offset == 0
-        && auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter).is_ok_and(|count| count > 0)
-    {
-        let _ = app.emit("folder-catalogue-changed", ());
+    if filter.kind == "folder" && filter.offset == 0 {
+        let _operation = file_manager.0.lock_operation()?;
+        if auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter).is_ok_and(|count| count > 0) {
+            let _ = app.emit("folder-catalogue-changed", ());
+        }
     }
     if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people" {
         let status = ai.0.status();
@@ -616,6 +618,7 @@ pub fn get_folder_previews(state: State<'_, BackgroundDbState>, formats: State<'
 }
 fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
     let (path,files)=listing.uncatalogued_files(filter)?;
+    writer.observe_incoming_folder(&path)?;
     if path.is_empty() || files.is_empty() { return Ok(0); }
     let mode = writer.effective_folder_mode(&path);
     let included = mode.as_deref() == Some("include");
