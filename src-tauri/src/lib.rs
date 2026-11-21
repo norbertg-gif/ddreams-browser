@@ -192,6 +192,7 @@ pub fn run() {
             commands::get_quality_counts,
             commands::get_recent_changes,
             commands::get_file_operation_conflicts,
+            commands::get_uncategorized_photos_for_move,
             commands::move_files,
             commands::copy_files,
             commands::rename_file,

@@ -387,6 +387,13 @@ pub fn get_recent_changes(state: State<'_, CatalogWriterState>, limit: i64) -> R
 
 #[tauri::command(async)]
 pub fn get_file_operation_conflicts(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String)->Result<usize,String>{state.0.preview_conflicts(&asset_ids,&target_folder_path,None)}
+#[tauri::command(async)]
+pub fn get_uncategorized_photos_for_move(
+    state: State<'_, FileManagerState>, formats: State<'_, FormatsState>,
+    asset_ids: Vec<i64>, target_folder_path: String, conflict: ConflictPolicy,
+) -> Result<usize, String> {
+    state.0.uncategorized_photos_for_move(&asset_ids, &target_folder_path, conflict, &formats.0)
+}
 #[tauri::command]
 pub async fn move_files(app:tauri::AppHandle,state:State<'_,FileManagerState>,asset_ids:Vec<i64>,target_folder_path:String,conflict:ConflictPolicy)->Result<FileOperationResult,String>{let manager=state.0.clone();tauri::async_runtime::spawn_blocking(move||manager.move_files(&asset_ids,&target_folder_path,conflict,|done,total|{let _=app.emit("file-operation-progress",FileProgress{operation:"Presúvam".into(),done,total});})).await.map_err(|e|e.to_string())?}
 #[tauri::command]

@@ -159,6 +159,35 @@ impl FileManager {
 
     pub fn preview_conflicts(&self,ids:&[i64],target:&str,rename_base:Option<&str>)->Result<usize,String>{let folder=self.validate_folder(target)?;let sources=self.resolve_sources(ids)?;let plans=self.plan(&sources,&folder,rename_base)?;Ok(plans.iter().filter(|p|!path_eq(p.source.path.parent().unwrap_or(Path::new("")),&folder)&&p.conflict).count())}
 
+    pub fn uncategorized_photos_for_move(
+        &self, ids: &[i64], target: &str, policy: ConflictPolicy, formats: &crate::formats::FormatTable,
+    ) -> Result<usize, String> {
+        let folder = self.validate_folder(target)?;
+        let sources = self.resolve_sources(ids)?;
+        let mut candidates = Vec::new();
+        for plan in self.plan(&sources, &folder, None)? {
+            if path_eq(plan.source.path.parent().unwrap_or(Path::new("")), &folder)
+                || (policy == ConflictPolicy::Skip && plan.conflict)
+            {
+                continue;
+            }
+            let ext = plan.source.path.extension().unwrap_or_default().to_string_lossy().to_ascii_lowercase();
+            if matches!(formats.group(&ext), Some("image" | "raw")) {
+                candidates.push(plan.source.id);
+            }
+        }
+        let conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let mut assigned = conn.prepare("SELECT EXISTS(SELECT 1 FROM asset_categories WHERE asset_id=?1)")
+            .map_err(|e| e.to_string())?;
+        let mut count = 0;
+        for id in candidates {
+            if id < 0 || !assigned.query_row([id], |row| row.get::<_, bool>(0)).map_err(|e| e.to_string())? {
+                count += 1;
+            }
+        }
+        Ok(count)
+    }
+
     pub fn move_files<F>(&self,ids:&[i64],target:&str,policy:ConflictPolicy,mut progress:F)->Result<FileOperationResult,String> where F:FnMut(usize,usize){self.run_copy_move(ids,target,policy,false,&mut progress)}
     pub fn copy_files<F>(&self,ids:&[i64],target:&str,policy:ConflictPolicy,mut progress:F)->Result<FileOperationResult,String> where F:FnMut(usize,usize){self.run_copy_move(ids,target,policy,true,&mut progress)}
 
@@ -306,6 +335,28 @@ pub fn validate_windows_name(name:&str)->Result<String,String>{let value=name.tr
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn move_warning_counts_only_uncategorized_photos_that_would_move() {
+        let root = temp();
+        let (_disk, manager) = set_up(&root, None);
+        seed_asset_path(&manager.db, &root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let source = root.join("src");
+        let destination = root.join("dst");
+        let count = |target: &Path, policy| {
+            manager.uncategorized_photos_for_move(&[1, 1], target.to_str().unwrap(), policy, &formats).unwrap()
+        };
+
+        assert_eq!(count(&destination, ConflictPolicy::Cancel), 0);
+        manager.db.lock().unwrap().execute("DELETE FROM asset_categories WHERE asset_id=1", []).unwrap();
+        assert_eq!(count(&destination, ConflictPolicy::Cancel), 1);
+        assert_eq!(count(&source, ConflictPolicy::Cancel), 0);
+        fs::write(destination.join("a.jpg"), b"conflict").unwrap();
+        assert_eq!(count(&destination, ConflictPolicy::Skip), 0);
+        assert_eq!(count(&destination, ConflictPolicy::KeepBoth), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     use super::*;
     use rusqlite::Connection;
     use std::sync::Mutex;

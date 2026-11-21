@@ -64,7 +64,8 @@
 .asset-scroll:focus .asset-tile.focused { outline: 1px dotted #eee; outline-offset: -2px; }
 .thumb-wrap { background: transparent; border-radius: 0; }
 .type-badge { left: auto; right: 1px; top: 1px; padding: 0 4px; border-radius: 1px; background: #26395c; font-size: 9px; }
-.tagged-badge { width: auto; height: auto; right: 3px; top: auto; bottom: 3px; padding: 1px 3px; border-radius: 1px; box-shadow: none; }
+.tagged-badge { z-index: 1; width: 18px; height: 18px; right: auto; left: 6px; top: 1px; bottom: auto; padding: 0; border-radius: 2px; background: #ff9200; color: #241300; font-size: 13px; font-weight: 800; box-shadow: 0 0 0 1px #241300; }
+button.deletion-suggestion-badge:hover { background: #8e3035; color: #fff; }
 .size-badge, .tagged-badge ~ .size-badge { right: 3px; bottom: 2px; border-radius: 1px; }
 .tile-info-lines { padding: 3px 2px 0; }
 .tile-info-line, .tile-info-line.tile-name { text-align: center; font-size: 10px; font-weight: 400; }
