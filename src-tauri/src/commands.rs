@@ -585,6 +585,7 @@ pub struct MetadataResponse {
 
 #[tauri::command(async)]
 pub fn get_assets(
+    app: tauri::AppHandle,
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
     formats: State<'_, FormatsState>,
@@ -594,7 +595,11 @@ pub fn get_assets(
 ) -> Result<db::AssetPage, String> {
     // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
     // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
-    if filter.kind == "folder" && filter.offset == 0 { let _ = auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter); }
+    if filter.kind == "folder" && filter.offset == 0
+        && auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter).is_ok_and(|count| count > 0)
+    {
+        let _ = app.emit("folder-catalogue-changed", ());
+    }
     if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people" {
         let status = ai.0.status();
         let mut page = similarity_page(&state.0, &listing.0, &formats.0, &filter, &status, |ids| ai.0.order_by_similarity(ids))?;
@@ -1169,6 +1174,14 @@ pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::
 
 #[tauri::command(async)]
 pub fn get_folder_rule_state(writer:State<'_,CatalogWriterState>,path:String)->Result<crate::folder_rules::FolderRuleState,String>{writer.0.folder_rule_state(&path)}
+
+#[tauri::command(async)]
+pub fn get_folder_catalogue_states(
+    writer: State<'_, CatalogWriterState>,
+    paths: Vec<String>,
+) -> Result<std::collections::HashMap<String, crate::folder_rules::FolderCatalogueState>, String> {
+    writer.0.folder_catalogue_states(paths)
+}
 
 #[tauri::command(async)]
 pub fn get_exclusion_impact(writer:State<'_,CatalogWriterState>,path:String)->Result<crate::journal::ExclusionImpact,String>{writer.0.exclusion_impact(&path)}

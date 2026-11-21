@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { readStored, writeStored } from "../storage";
+import { usePersistentState } from "../uiState";
 import type { View } from "../types";
 
 type Mode = "events" | "year" | "month" | "day";
@@ -25,7 +26,7 @@ const readSource = (): Source => { const value = readStored<Source>(SOURCE_KEY, 
 export default function CalendarPane({ onNavigate, activeView, refreshToken = 0 }: { onNavigate: (view: View) => void; activeView?: View; refreshToken?: number }) {
   const [mode, setMode] = useState<Mode>(readMode);
   const [source, setSource] = useState<Source>(readSource);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>(() => readStored(EXPANDED_KEY, {}));
+  const [expanded, setExpanded] = usePersistentState<Record<string, boolean>>("ddreams.ui.calendar.expanded", {}, EXPANDED_KEY);
   const [cursor, setCursor] = useState(() => new Date());
   const [data, setData] = useState<CalendarData | null>(null);
   const [error, setError] = useState("");
@@ -33,7 +34,6 @@ export default function CalendarPane({ onNavigate, activeView, refreshToken = 0 
 
   useEffect(() => writeStored(MODE_KEY, mode), [mode]);
   useEffect(() => writeStored(SOURCE_KEY, source), [source]);
-  useEffect(() => writeStored(EXPANDED_KEY, expanded), [expanded]);
   useEffect(() => {
     const id = ++request.current;
     setError("");

@@ -8,19 +8,14 @@ export type FolderRuleAction = (path: string, mode: FolderRuleMode | null) => vo
 /** Fired after any rule change so every view of the rules reloads. */
 export const FOLDER_RULES_EVENT = "ddreams-folder-rules";
 
-const normalize = (path: string) => path.replace(/\//g, "\\").replace(/\\+$/, "").toLocaleLowerCase("sk");
-
-/** Longest matching rule on whole path components — same resolution as the backend. */
-export function effectiveRule(rules: FolderRule[], path: string | null | undefined): FolderRule | null {
-  if (!path) return null;
-  const target = normalize(path);
-  let best: FolderRule | null = null;
-  for (const rule of rules) {
-    const root = normalize(rule.path);
-    if (target === root || target.startsWith(root + "\\")) { if (!best || root.length > normalize(best.path).length) best = rule; }
-  }
-  return best;
-}
+export type FolderCatalogueState = {
+  effective: FolderRuleMode | null;
+  explicitMode: FolderRuleMode | null;
+  rulePath: string | null;
+  listedCount: number;
+  hasCataloguedDescendant: boolean;
+  partiallyExcluded: boolean;
+};
 
 export function useFolderRules(): FolderRule[] {
   const [rules, setRules] = useState<FolderRule[]>([]);
@@ -34,4 +29,4 @@ export function useFolderRules(): FolderRule[] {
   return rules;
 }
 
-export const FolderRulesContext = createContext<{ rules: FolderRule[]; onRule?: FolderRuleAction }>({ rules: [] });
+export const FolderRulesContext = createContext<{ states: Record<string, FolderCatalogueState>; onRule?: FolderRuleAction }>({ states: {} });

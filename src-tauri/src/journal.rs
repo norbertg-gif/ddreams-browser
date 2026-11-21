@@ -132,6 +132,11 @@ impl CatalogWriter {
 
     pub fn folder_rules(&self) -> Result<Vec<crate::folder_rules::FolderRule>, String> { let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?; self.rules.list(&conn) }
     pub fn folder_rule_state(&self, path:&str) -> Result<crate::folder_rules::FolderRuleState, String> { let conn=self.db.lock().map_err(|_|"catalog lock poisoned")?; self.rules.state(&conn,path) }
+
+    pub fn folder_catalogue_states(&self, paths: Vec<String>) -> Result<std::collections::HashMap<String, crate::folder_rules::FolderCatalogueState>, String> {
+        let conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        self.rules.catalogue_states(&conn, paths)
+    }
     /// Effective rule for a folder path: Some("include") / Some("exclude") / None (legacy, no rule).
     pub fn effective_folder_mode(&self, path:&str) -> Option<String> { self.folder_rule_state(path).ok().and_then(|s|s.effective) }
 
@@ -217,7 +222,7 @@ impl CatalogWriter {
             None=>{tx.execute("DELETE FROM ddreams_folder_rules WHERE path=?1",[&path]).map_err(|e|e.to_string())?;}
         }
         tx.commit().map_err(|e|e.to_string())?;
-        self.rules.invalidate();
+        self.rules.reload(&connection);
         if !removed.is_empty() { self.notify_labels_changed(&["category", "keyword"]); }
         Ok(removed)
     }
@@ -551,7 +556,7 @@ impl CatalogWriter {
         }
         let change_id = record_change(&tx, action, summary)?;
         tx.commit().map_err(|e| e.to_string())?;
-        self.rules.invalidate();
+        self.rules.reload(&conn);
         Ok(change_id)
     }
 

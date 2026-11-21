@@ -55,6 +55,7 @@ pub fn run() {
         .map(|(python, script)| thumbs::RawPluginConfig { python, script });
     let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone(), raw_plugin);
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
+    let _ = writer.folder_rules();
     let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone(), writer.clone(), exif.clone());
     let journal_ai=ai_service.clone();
     writer.set_change_hook(Arc::new(move|kinds|for kind in kinds { journal_ai.sync_labels_debounced(kind); }));
@@ -240,6 +241,7 @@ pub fn run() {
             commands::ai_duplicates_of,
             commands::get_folder_rules,
             commands::get_folder_rule_state,
+            commands::get_folder_catalogue_states,
             commands::get_exclusion_impact,
             commands::set_folder_rule,
             commands::refresh_folder_listing,
