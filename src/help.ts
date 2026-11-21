@@ -15,6 +15,13 @@ export const helpTopics: HelpTopic[] = [
     { type: "paragraph", text: "Priečinky zobrazujú strom diskov a skratky, Kalendár dátumy, Vlastnosti údaje vybranej fotografie, Katalóg triedenie a AI nástroje na prehľadávanie a kontrolu fotografií." },
     { type: "bullets", items: ["Kliknutím na záložku aktivujte panel; šípkou na jeho okraji ho zbaľte alebo rozbaľte.", "Záložku panela možno potiahnuť do iného stĺpca alebo medzi záložky. Pravý klik na záložku ponúka aj Obnoviť pôvodné rozloženie.", "Potiahnutím deliacej čiary zmeňte šírku panelu. V Nastaveniach možno zmeniť veľkosť písma rozhrania."] }
   ] },
+  { id: "dock-layout", title: "Rozloženie panelov", keywords: ["sekcie", "stĺpce", "záložky", "presun"], blocks: [
+    { type: "bullets", items: [
+      "Sekciu presuňte za úchyt v hlavičke. Pustite ju nad hornou alebo dolnou polovicou inej sekcie, na lište záložiek alebo pri deliacej čiare či okraji okna, ak chcete vytvoriť nový stĺpec.",
+      "Pravým klikom na hlavičku sekciu skryjete. Znova ju zobrazíte z ponuky Rozloženie.",
+      "V ponuke Rozloženie si uložte pomenované rozloženia a prepínajte medzi nimi. Ukladá sa aj šírka stĺpcov, viditeľnosť a rozbalenie sekcií. Tu môžete obnoviť aj pôvodné rozloženie."
+    ] }
+  ] },
   { id: "folders", title: "Priečinky a katalóg", keywords: ["disk", "zdroj", "skratky", "offline", "vylúčenie"], blocks: [
     { type: "paragraph", text: "Strom Priečinky ukazuje existujúce priečinky na disku. Šípkou rozbaľte podpriečinky, kliknutím otvorte priečinok. Horné šípky slúžia na návrat, postup dopredu, prechod vyššie a obnovenie." },
     { type: "bullets", items: ["Aktuálny priečinok pridáte do časti Skratky tlačidlom +. Pravým klikom na skratku možno zmeniť jej názov alebo poradie či ju odstrániť zo zoznamu; samotný priečinok zostane.", "Pravým klikom na priečinok alebo v Nastaveniach možno nastaviť zahrnutie či vylúčenie z katalógu. Nové fotky a videá zo zahrnutého priečinka sa pridajú pri jeho otvorení. Vylúčený priečinok sa dá ďalej prehliadať. Sýta zelená bodka označuje položky priamo v priečinku alebo vlastné pravidlo zahrnutia, svetlá označuje položky v podpriečinkoch a polovičná upozorňuje na vylúčené podpriečinky.", "V Katalógu sú Špeciálne položky: Všetky fotky, Bez kategórie, Bez keywordov a Označené. OFFLINE označuje odpojený disk, CHÝBA neexistujúci súbor na pripojenom disku.", "V Nastaveniach v časti Offline a chýbajúce zdroje možno taký zdroj odstrániť z katalógu. Odstránia sa aj jeho údaje v katalógu; súbory sa nemažú. Pred odstránením vznikne záloha katalógu."] }

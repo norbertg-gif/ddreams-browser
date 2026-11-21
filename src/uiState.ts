@@ -12,8 +12,11 @@ export function readUiState<T>(key: UiKey, fallback: T, legacyKey?: string): T {
     : fallback;
 }
 
-export function usePersistentState<T>(key: UiKey, fallback: T, legacyKey?: string) {
-  const [value, setValue] = useState(() => readUiState(key, fallback, legacyKey));
+export function usePersistentState<T>(key: UiKey, fallback: T, legacyKey?: string, normalize?: (stored: T) => T) {
+  const [value, setValue] = useState(() => {
+    const stored = readUiState(key, fallback, legacyKey);
+    return normalize ? normalize(stored) : stored;
+  });
   useEffect(() => writeStored(key, value), [key, value]);
   return [value, setValue] as const;
 }
