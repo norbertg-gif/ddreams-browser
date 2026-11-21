@@ -599,3 +599,7 @@ input[type=checkbox]{accent-color:var(--accent)}
 .person-assignment-chips>span{border-color:#3d6fa8;background:rgba(61,111,168,.18)}
 .person-assignment-chips>span>span::before{content:'';display:inline-block;width:7px;height:7px;margin-right:4px;border-radius:50%;background:#5aa9ff;vertical-align:middle}
 .property-keyword-editor{display:flex;flex-direction:column;gap:4px}
+
+.category-badge-popup{position:fixed;z-index:4000;display:grid;gap:3px;max-width:290px;padding:7px 9px;border:1px solid var(--line);border-radius:6px;background:var(--panel);color:var(--text);font-size:11px;box-shadow:0 8px 24px #000a;pointer-events:none}
+.category-badge-popup strong{color:var(--bright);font-size:11px}
+.category-badge-popup span{overflow-wrap:anywhere}

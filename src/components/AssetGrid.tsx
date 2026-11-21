@@ -403,7 +403,7 @@ function AssetTile({ asset, deletionSuggested, onKeepSuggested, folderPreviews, 
         } catch { setBroken(true); }
       }} /> : asset.isDirectory ? <div className="folder-tile"><div className="folder-tab"/><div className="folder-body">{folderPreviews.slice(0, 4).map(preview => <img key={preview.id} className="folder-preview" src={thumbUrl(preview, 160, tileEpoch)} loading="lazy" draggable={false} onError={event => { event.currentTarget.style.display = "none"; }} />)}</div></div> : <div className="file-placeholder"><span>{asset.missing ? "CHÝBA" : offline || asset.offline ? "OFFLINE" : badge}</span>{asset.missing ? <small>Súbor neexistuje</small> : (offline || asset.offline) && <small>Odpojené</small>}</div>}
       {overlayMode>0&&!asset.isDirectory && <span className="type-badge" title={`Typ súboru: ${badge}`}>{badge}</span>}
-      {overlayMode>0&&(asset.hasCategories||!!asset.rating)&&<span className="tile-badges-left">{asset.hasCategories&&<span className="category-badge" title="Zaradené v kategórii">◆</span>}{!!asset.rating&&<span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}</span>}
+      {overlayMode>0&&(asset.hasCategories||!!asset.rating)&&<span className="tile-badges-left">{asset.hasCategories&&<CategoryBadge assetId={asset.id}/>}{!!asset.rating&&<span className="rating-badge" title={`Hodnotenie: ${Math.min(5, asset.rating)} z 5`}>{"★".repeat(Math.min(5, asset.rating))}</span>}</span>}
       {overlayMode>0&&!!asset.tagged && <span className="tagged-badge" title="Označené">✓</span>}
       
       {overlayMode>0&&label && <span className="label-badge" title={`Farebný štítok: ${labelText(label)}`} style={{ backgroundColor: labelColor(label) }} />}
@@ -441,4 +441,24 @@ export function labelText(label: string): string {
 export function labelColor(label: string): string {
   const colors: Record<string, string> = { red: "#c94c50", "červená": "#c94c50", yellow: "#c49b37", "žltá": "#c49b37", green: "#4b9862", "zelená": "#4b9862", blue: "#4e7db7", "modrá": "#4e7db7", purple: "#8866b4", "fialová": "#8866b4", gray: "#8a8f98" };
   return colors[label.toLowerCase()] ?? "#6b7280";
+}
+
+/** Category badge on a tile; hovering shows the categories the photo belongs to. */
+function CategoryBadge({ assetId }: { assetId: number }) {
+  const [anchor, setAnchor] = useState<DOMRect | null>(null);
+  const [paths, setPaths] = useState<string[] | null>(null);
+  const show = (event: MouseEvent<HTMLSpanElement>) => {
+    setAnchor(event.currentTarget.getBoundingClientRect());
+    if (paths !== null || assetId <= 0) return;
+    void invoke<{ categoryPaths: { id: number; path: string }[] } | null>("get_catalog_asset_links", { assetId })
+      .then(links => setPaths((links?.categoryPaths ?? []).map(item => item.path)))
+      .catch(() => setPaths([]));
+  };
+  return <span className="category-badge" onMouseEnter={show} onMouseLeave={() => setAnchor(null)}>◆
+    {anchor && createPortal(<div className="category-badge-popup" role="tooltip"
+      style={{ left: Math.min(anchor.left, window.innerWidth - 300), top: anchor.bottom + 6 }}>
+      <strong>Zaradené v kategóriách</strong>
+      {paths === null ? <small>Načítavam…</small> : paths.length ? paths.map(path => <span key={path}>{path}</span>) : <small>Žiadna kategória</small>}
+    </div>, document.body)}
+  </span>;
 }
