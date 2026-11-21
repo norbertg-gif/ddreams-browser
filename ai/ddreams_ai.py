@@ -104,6 +104,25 @@ CLUSTER_VOCABULARY = tuple(dict.fromkeys((
     "fontána", "socha", "pomník", "cintorín", "trh", "obchod", "reštaurácia", "hotel", "letisko", "prístav",
     "silvester", "vianoce", "veľká noc", "narodeniny", "krst", "promócia", "školská fotografia", "pracovisko", "kancelária", "ulica v noci",
 )))
+KEYWORD_VOCABULARY = tuple(dict.fromkeys(CLUSTER_VOCABULARY + (
+    "slon", "nosorožec", "hroch", "žirafa", "zebra", "lev", "tiger", "leopard",
+    "gepard", "medveď", "vlk", "líška", "jeleň", "srna", "diviak", "zajac",
+    "veverička", "opica", "gorila", "panda", "ťava", "lama", "ovca", "koza",
+    "krava", "prasa", "páv", "sova", "orol", "sokol", "bocian", "volavka",
+    "plameniak", "papagáj", "labuť", "hus", "holub", "tučniak", "vrabec", "sýkorka",
+    "krokodíl", "had", "jašterica", "korytnačka", "žaba", "delfín", "veľryba", "žralok",
+    "vážka", "motýlica", "modlivka", "pavúk", "pavučina", "lienka", "čmeliak",
+    "osa", "mravec", "chrobák", "koník", "slimák", "húsenica", "mucha",
+    "orchidea", "tulipán", "púpava", "sedmokráska", "slnečnica", "levanduľa", "lekno",
+    "mäta", "papraď", "mach", "lišajník", "kaktus", "šiška", "lístie", "kôra stromu",
+    "rosa", "námraza", "snehová vločka", "kvapka vody", "špliechanie vody", "dážď",
+    "dúhové odlesky", "protisvetlo", "bokeh", "dlhá expozícia", "ohňostroj", "Mesiac",
+    "ľadovec", "jaskyňa", "skalný oblúk", "hrebeň hôr", "duny", "savana", "džungľa",
+    "lesná cesta", "potok", "rybník", "priehrada", "vinice", "alej", "kvitnúci strom",
+    "maják", "železnica", "stanica", "tunel", "električka", "ulička", "mrakodrap",
+    "okná", "vitráž", "historická budova", "kamenný múr", "drevenica", "nádvorie",
+    "skleník", "jesenné lístie", "mraky", "nočná obloha", "vidiek", "panoráma mesta",
+)))
 BATCH_SIZE = 32
 DECODE_THREADS = 6
 CHROMATIC_COLORS = ("červená", "oranžová", "hnedá", "žltá", "zelená", "tyrkysová", "modrá", "fialová", "ružová")
@@ -445,8 +464,11 @@ class SiglipEmbedder:
             return features.float().cpu().numpy()
 
     def _text_vector(self, query: str):
+        return self._encode_texts([query])
+
+    def _encode_texts(self, texts: list[str]):
         with self._lock:
-            tokens = self.tokenizer([query]).to("cuda")
+            tokens = self.tokenizer(texts).to("cuda")
             with self.torch.inference_mode(), self.torch.autocast("cuda"):
                 vector = self.model.encode_text(tokens)
                 vector = vector / vector.norm(dim=-1, keepdim=True).clamp_min(1e-12)
@@ -667,6 +689,8 @@ class AIService:
         self._labels: dict[str, dict[int, set[int]]] = {"category": {}, "keyword": {}}
         self._parents: dict[str, dict[int, int | None]] = {"category": {}, "keyword": {}}
         self._cluster_text_vectors: dict[str, np.ndarray] | None = None
+        self._keyword_lock = threading.Lock()
+        self._keyword_matrix: np.ndarray | None = None
         self._query_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-query")
         self._vector_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="ai-vector")
         self._loader: threading.Thread | None = None
@@ -1877,6 +1901,46 @@ class AIService:
         combined.sort(key=lambda row: (-row["score"], -row["count"], row["label_id"]))
         return {"results": results, "combined": combined, "searched": len(index[0])}
 
+    def _content_keywords(self, request: dict[str, Any]) -> dict[str, Any]:
+        asset_id = request.get("asset_id")
+        if type(asset_id) is not int or asset_id <= 0:
+            raise RequestError("Fotka ešte nie je zaindexovaná")
+        _, images, positions = self._index_snapshot()
+        if asset_id not in positions:
+            raise RequestError("Fotka ešte nie je zaindexovaná")
+        photo = images[positions[asset_id]].astype(np.float32)
+        with self._keyword_lock:
+            if self._keyword_matrix is None:
+                self._keyword_matrix = self._load_keyword_matrix()
+            matrix = self._keyword_matrix
+        scores = matrix @ photo
+        # Raw cosine similarity is not a probability. Suppress weak matches and distant runners-up.
+        cutoff = max(0.12, float(scores.max()) - 0.065)
+        return {"words": [KEYWORD_VOCABULARY[i] for i in np.argsort(-scores, kind="stable")[:20]
+                          if scores[i] >= cutoff]}
+
+    def _load_keyword_matrix(self) -> np.ndarray:
+        prompts = [f"a photo of {word}" for word in KEYWORD_VOCABULARY]
+        with self.db_lock:
+            placeholders = ",".join("?" for _ in prompts)
+            vectors = {text: blob for text, blob in self.db.execute(
+                f"SELECT text,vector FROM text_vectors WHERE model=? AND text IN ({placeholders})",
+                (self.model_name, *prompts),
+            ) if len(blob) == DIMENSION * 2}
+        missing = [text for text in prompts if text not in vectors]
+        if missing:
+            self._start_model()
+            embedder = self._wait_model()
+            for start in range(0, len(missing), 16):
+                batch = missing[start:start + 16]
+                values = embedder._encode_texts(batch).cpu().numpy()
+                vectors.update((text, value.tobytes()) for text, value in zip(batch, values, strict=True))
+            with self.db_lock:
+                self.db.executemany("INSERT OR REPLACE INTO text_vectors(model,text,vector) VALUES(?,?,?)",
+                                    [(self.model_name, text, vectors[text]) for text in missing])
+                self.db.commit()
+        return np.stack([np.frombuffer(vectors[text], dtype=np.float16) for text in prompts]).astype(np.float32)
+
     def _suggest_batch(self, request: dict[str, Any]) -> dict[str, Any]:
         kind = self._kind(request.get("kind"))
         asset_ids = request.get("asset_ids")
@@ -2437,6 +2501,45 @@ class AIService:
                 ))
         return {"asset_ids": indexed}
 
+    def _keyword_matches(self, request: dict[str, Any]) -> dict[str, Any]:
+        ids, matrix, positions = self._index_snapshot()
+        seeds = [positions[aid] for aid in request["seeds"] if aid in positions]
+        if not seeds:
+            return {"ids": [], "examples": 0}
+        # Spread the sample over the tagged photos so a long burst does not fill all slots.
+        if len(seeds) > 32:
+            seeds = [seeds[i] for i in np.linspace(0, len(seeds) - 1, 32, dtype=int)]
+        examples = matrix[seeds].astype(np.float32)
+        excluded = set(request["excluded"]).union(request["seeds"])
+        matches = []
+        for start in range(0, len(ids), 2048):
+            scores = (matrix[start:start + 2048].astype(np.float32) @ examples.T).max(axis=1)
+            matches.extend((float(score), aid) for score, aid in zip(scores, ids[start:start + 2048])
+                           if score >= 0.82 and aid not in excluded)
+        matches.sort(key=lambda row: (-row[0], row[1]))
+        return {"ids": [aid for _, aid in matches[:500]], "examples": len(seeds)}
+
+    def _incoming_groups(self, request: dict[str, Any]) -> dict[str, Any]:
+        metadata = self._incoming_folder_metadata(request["catalog"], request["incoming"], request["extensions"])
+        _, matrix, positions = self._index_snapshot()
+        photos = sorted(aid for aid, (folder, _) in metadata.items() if folder is None)
+        indexed = [aid for aid in photos if aid in positions]
+        limit = 2000
+        ids = indexed[-limit:]
+        vectors = matrix[[positions[aid] for aid in ids]].astype(np.float32)
+        similarities = vectors @ vectors.T
+        groups: list[list[int]] = []
+        # Every photo must resemble its group's first photo, avoiding chains of increasingly unrelated shots.
+        remaining = np.arange(len(ids))
+        while remaining.size:
+            scores = similarities[remaining[0], remaining]
+            members = scores >= 0.88
+            members[0] = True
+            groups.append([ids[i] for i in remaining[members]])
+            remaining = remaining[~members]
+        groups.sort(key=lambda group: (-len(group), group[0]))
+        return {"groups": groups, "unindexed": len(photos) - len(indexed), "omitted": len(indexed) - len(ids)}
+
     def _suggest_folders(self, request: dict[str, Any]) -> dict[str, Any]:
         selected = request.get("asset_ids")
         if not isinstance(selected, list):
@@ -2474,6 +2577,7 @@ class AIService:
             torch = self._cuda_torch
             vectors = matrix[torch.as_tensor(indexes, device=matrix.device)]
         votes: dict[str, float] = {}
+        best_scores = np.full(len(candidates), -np.inf, dtype=np.float32) if request.get("include_examples") else None
         missing_days: set[int] = set()
         resolve_days = request.get("resolve_days") is True
         for start in range(0, len(queries), 32):
@@ -2486,6 +2590,8 @@ class AIService:
             else:
                 with torch.inference_mode():
                     scores = (matrix[indexes] @ vectors.T).float().cpu().numpy()
+            if best_scores is not None:
+                np.maximum(best_scores, scores.max(axis=0), out=best_scores)
             for aid, row in zip(batch, scores):
                 day = overrides.get(aid, metadata[aid][1])
                 if day:
@@ -2500,10 +2606,18 @@ class AIService:
                     if resolve_days and day and days[index] is None:
                         missing_days.add(candidate_ids[index])
                     folder = folders[index]
-                    votes[folder] = votes.get(folder, 0.0) + float(row[index]) ** 4
+                    score = float(row[index])
+                    votes[folder] = votes.get(folder, 0.0) + score ** 4
         total = sum(votes.values())
         ranked = sorted(votes, key=lambda folder: (-votes[folder], folder))
         result = {"folders": [{"folder": folder, "share": votes[folder] / total} for folder in ranked[:3]]}
+        if best_scores is not None:
+            examples: dict[str, list[tuple[float, int]]] = {folder: [] for folder in ranked[:3]}
+            for index in np.flatnonzero(best_scores >= 0.82):
+                if folders[index] in examples:
+                    examples[folders[index]].append((-float(best_scores[index]), candidate_ids[index]))
+            for entry in result["folders"]:
+                entry["exampleIds"] = [aid for _, aid in sorted(examples[entry["folder"]])[:12]]
         if missing_days:
             result["missing_days"] = sorted(missing_days)
         if os.environ.get("DDREAMS_INCOMING_TIMINGS"):
@@ -2691,6 +2805,8 @@ class AIService:
             return self._set_labels(request)
         if cmd == "suggest":
             return self._suggest(request)
+        if cmd == "content_keywords":
+            return self._content_keywords(request)
         if cmd == "suggest_batch":
             return self._suggest_batch(request)
         if cmd == "map_build":
@@ -2707,6 +2823,10 @@ class AIService:
             return self._indexed_asset_ids(request)
         if cmd == "suggest_folders":
             return self._suggest_folders(request)
+        if cmd == "keyword_matches":
+            return self._keyword_matches(request)
+        if cmd == "incoming_groups":
+            return self._incoming_groups(request)
         if cmd == "series":
             return self._series(request)
         if cmd == "order_by_similarity":
@@ -2802,7 +2922,7 @@ class AIService:
                     request_id = request.get("id")
                     if isinstance(request_id, bool) or not isinstance(request_id, int):
                         raise RequestError("id musí byť celé číslo")
-                    if request.get("cmd") in {"search_text", "similar", "suggest", "suggest_batch", "duplicate_groups", "map_build", "series", "suggest_folders", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
+                    if request.get("cmd") in {"search_text", "similar", "suggest", "content_keywords", "keyword_matches", "incoming_groups", "suggest_batch", "duplicate_groups", "map_build", "series", "suggest_folders", "clusters", "order_by_similarity", "faces_status", "faces_persons", "faces_person_assets", "faces_review", "faces_clusters", "faces_for_assets", "faces_set", "faces_asset_assign", "faces_asset_remove", "faces_person_create", "faces_person_rename", "faces_recognize_all"}:
                         self._query_pool.submit(query_job, request, request_id)
                         continue
                     result = self.execute(request)

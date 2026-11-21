@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-type FolderSuggestion = { folder: string; share: number };
+type FolderSuggestion = { folder: string; share: number; exampleIds: number[] };
 type Suggestions = { eligible: boolean; folders: FolderSuggestion[] };
+type Groups = { groups: number[][]; unindexed: number; omitted: number };
 export type DeletionSuggestionChange = { changeId: number | null; summary: string };
 
 type Props = {
@@ -16,10 +17,12 @@ type Props = {
   onMove: (folder: string) => void;
   onChooseFolder: () => void;
   onAnalyze: () => Promise<void>;
+  onShowPhotos: (ids: number[], title: string, groups?: number[]) => void;
+  onMoveGroup: (ids: number[], folder: string) => void;
 };
 
 export default function IncomingTools({folder, ids, aiReady, aiReason, readOnly, indexRevision,
-  refreshToken, onMove, onChooseFolder, onAnalyze}: Props) {
+  refreshToken, onMove, onChooseFolder, onAnalyze, onShowPhotos, onMoveGroup}: Props) {
   const [result, setResult] = useState<(Suggestions & { ids: number[]; folder: string }) | null>(null);
   const [busy, setBusy] = useState(false);
   useEffect(() => {
@@ -58,5 +61,92 @@ export default function IncomingTools({folder, ids, aiReady, aiReason, readOnly,
       setBusy(true);
       void onAnalyze().finally(() => setBusy(false));
     }}>{busy ? "Analyzujú sa série…" : "Navrhnúť slabšie zábery na vymazanie"}</button>
+    <IncomingGroups key={JSON.stringify([folder, refreshToken])} aiReady={aiReady} readOnly={readOnly}
+      selectedIds={ids} onShowPhotos={onShowPhotos} onMoveGroup={onMoveGroup}/>
   </section>;
+}
+
+function IncomingGroups({aiReady, readOnly, selectedIds, onShowPhotos, onMoveGroup}: {
+  selectedIds: number[];
+} & Pick<Props, "aiReady" | "readOnly" | "onShowPhotos" | "onMoveGroup">) {
+  const [result, setResult] = useState<Groups | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [visibleCount, setVisibleCount] = useState(30);
+  const [selected, setSelected] = useState<number | null>(null);
+
+  const load = async () => {
+    setBusy(true);
+    setError("");
+    setSelected(null);
+    try {
+      setResult(await invoke<Groups>("ai_incoming_groups"));
+      setVisibleCount(30);
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return <div className="incoming-group-tools">
+    <button disabled={!aiReady || busy} onClick={() => void load()}>
+      {busy ? "Hľadám skupiny…" : "Zoskupiť nové fotky podľa podobnosti"}
+    </button>
+    {error && <small role="status">{error}</small>}
+    {result && <>
+      {!result.groups.length && <small>V priečinku nie sú zaindexované fotky.</small>}
+      {result.unindexed > 0 && <small>Čaká na AI index: {result.unindexed}</small>}
+      {result.omitted > 0 && <small>Spracovaných je posledných 2 000 zaindexovaných položiek. Mimo výsledku: {result.omitted}.</small>}
+      {(selected === null) ? <>
+        {result.groups.slice(0, visibleCount).map((ids, i) =>
+          <button key={ids[0]} onClick={() => {
+            setSelected(i);
+            onShowPhotos(ids, `Nové fotky · skupina ${i + 1}`);
+          }}>Skupina {i + 1} · {ids.length} {ids.length === 1 ? "fotka" : ids.length < 5 ? "fotky" : "fotiek"}</button>
+        )}
+        {visibleCount < result.groups.length && <button onClick={() => setVisibleCount(n => n + 30)}>Ďalšie skupiny</button>}
+      </> : <>
+        <button onClick={() => setSelected(null)}>Späť na skupiny</button>
+        <IncomingGroup key={selected} ids={result.groups[selected]} number={selected + 1}
+          readOnly={readOnly} selectedIds={selectedIds} onShowPhotos={onShowPhotos} onMoveGroup={onMoveGroup}/>
+      </>}
+    </>}
+  </div>;
+}
+
+function IncomingGroup({ids, number, readOnly, selectedIds, onShowPhotos, onMoveGroup}: {
+  ids: number[];
+  number: number;
+  selectedIds: number[];
+} & Pick<Props, "readOnly" | "onShowPhotos" | "onMoveGroup">) {
+  const [folders, setFolders] = useState<FolderSuggestion[] | null>(null);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    void invoke<Suggestions>("suggest_incoming_folders", {assetIds: ids, includeExamples: true})
+      .then(response => { if (active) setFolders(response.folders); })
+      .catch(cause => { if (active) setError(String(cause)); });
+    return () => { active = false; };
+  }, [ids]);
+  const selected = new Set(selectedIds);
+  const selectedNew = ids.filter(id => selected.has(id));
+  return <>
+    <button onClick={() => onShowPhotos(ids, `Nové fotky · skupina ${number}`)}>Zobraziť nové · {ids.length}</button>
+    {error ? <small role="status">{error}</small> : folders === null ? <small>Hľadám cieľ a podobné fotky v katalógu…</small>
+      : folders.length === 0 ? <small>Pre túto skupinu nemáme návrh priečinka.</small> : folders.map(item => (
+        <div className="incoming-group-destination" key={item.folder}>
+          <strong title={item.folder}>{item.folder.split(/[\\/]/).filter(Boolean).slice(-2).join(" › ")}</strong>
+          {!!item.exampleIds.length && <button onClick={() => onShowPhotos(
+            [...ids, ...item.exampleIds], "#1 Nové · #2 Už v katalógu",
+            [...ids.map(() => 1), ...item.exampleIds.map(() => 2)],
+          )}>Porovnať s katalógom · {item.exampleIds.length}</button>}
+          <button disabled={readOnly} onClick={() => onMoveGroup(ids, item.folder)}>Presunúť celú skupinu sem</button>
+          {selectedNew.length > 0 && selectedNew.length < ids.length &&
+            <button disabled={readOnly} onClick={() => onMoveGroup(selectedNew, item.folder)}>
+              Presunúť vybrané nové sem · {selectedNew.length}
+            </button>}
+        </div>
+      ))}
+  </>;
 }

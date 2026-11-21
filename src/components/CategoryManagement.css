@@ -32,3 +32,6 @@
 .keyword-ai-suggestions{display:flex;flex-wrap:wrap;gap:3px}
 .keyword-ai-suggestions .ai-suggestion-chip{border-style:dashed}
 .keyword-ai-suggestions small{opacity:.65}
+.content-keyword-suggestions{display:grid;gap:4px;justify-items:start}
+.content-keyword-search{padding:2px 5px;border:1px solid var(--line);background:var(--panel2)}
+.keyword-ai-suggestions .new-keyword-label{color:#ffce75;opacity:1;font-weight:650}

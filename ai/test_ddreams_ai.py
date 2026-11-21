@@ -16,7 +16,7 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from ddreams_ai import AIService, SiglipEmbedder, VectorIndex, CLUSTER_VOCABULARY, COLOR_PALETTE, COLOR_VERSION, DIMENSION, FACE_VERSION, QUALITY_VERSION, RequestError, compute_quality, dominant_colors, learn_thresholds, palette_counts, text_probability_cutoff
-from ddreams_ai import DECODER_VERSION, RAW_EXTENSIONS, decode_photo
+from ddreams_ai import DECODER_VERSION, KEYWORD_VOCABULARY, RAW_EXTENSIONS, decode_photo
 from faces_schema import ensure_faces_schema
 from import_acdsee_faces import import_acdsee_faces
 
@@ -275,6 +275,38 @@ class LazyModelTests(unittest.TestCase):
         self.service.stop()
         self.temp.cleanup()
 
+    def test_keyword_matches_use_multiple_examples_and_exclude_rejections(self):
+        set_vectors(self.service, {
+            1: [1, 0, 0], 2: [0, 1, 0], 3: [1, 0, 0], 4: [0, 1, 0],
+            5: [0, 0, 1], 6: [1, 0, 0],
+        })
+        self.assertEqual(self.service.execute({"cmd": "keyword_matches", "seeds": [1, 2, 99], "excluded": [6]}),
+                         {"ids": [3, 4], "examples": 2})
+        self.assertEqual(self.calls, [])
+
+    def test_incoming_groups_avoid_similarity_chains_and_count_unindexed(self):
+        set_vectors(self.service, {
+            1: [1, 0], 2: [0.9, 0.4359], 3: [0.62, 0.7846], 4: [1, 0],
+        })
+        metadata = {1: (None, None), 2: (None, None), 3: (None, None),
+                    4: ("Archive", None), 5: (None, None)}
+        with patch.object(self.service, "_incoming_folder_metadata", return_value=metadata):
+            result = self.service.execute({"cmd": "incoming_groups", "catalog": "catalog",
+                                           "incoming": "Incoming", "extensions": ["jpg"]})
+        self.assertEqual(result, {"groups": [[1, 2], [3]], "unindexed": 1, "omitted": 0})
+        self.assertEqual(self.calls, [])
+
+    def test_folder_examples_include_same_day_without_affecting_ranking(self):
+        set_vectors(self.service, {
+            1: [1, 0], 2: [1, 0], 3: [0.9, 0.4359], 4: [0.7, 0.7141], 5: [0, 1],
+        })
+        request = {"cmd": "suggest_folders", "asset_ids": [1],
+                   "photos": [[1, None, "2024-07-23"], [2, "Archive", "2024-07-23"],
+                              [3, "Archive", None], [4, "Archive", None], [5, "Other", None]]}
+        self.assertEqual(self.service.execute(request), {"folders": [{"folder": "Archive", "share": 1.0}]})
+        self.assertEqual(self.service.execute(dict(request, include_examples=True)),
+                         {"folders": [{"folder": "Archive", "share": 1.0, "exampleIds": [2, 3]}]})
+
     def test_indexed_asset_ids_checks_stored_model_and_dimension_without_loading_vectors(self):
         self.assertIsNone(self.service._vectors)
         with self.service.db_lock, self.service.db:
@@ -452,6 +484,23 @@ class LazyModelTests(unittest.TestCase):
                 [(self.service.model_name, f"a photo of {word}", vector.tobytes()) for word in CLUSTER_VOCABULARY])
             self.service.db.commit()
         self.assertIn("krajina", self.service._cluster_names())
+        self.assertEqual(self.calls, [])
+
+    def test_content_keywords_can_find_a_new_word_from_cached_vectors(self):
+        photo = np.zeros(DIMENSION, dtype=np.float16)
+        photo[0] = 1
+        unrelated = np.zeros_like(photo)
+        unrelated[1] = 1
+        self.service._vectors = VectorIndex([1, 2], np.stack([photo, unrelated]))
+        with self.service.db_lock:
+            self.service.db.executemany("INSERT INTO text_vectors VALUES(?,?,?)", [
+                (self.service.model_name, f"a photo of {word}",
+                 (photo if word == "slon" else np.zeros_like(photo)).tobytes())
+                for word in KEYWORD_VOCABULARY
+            ])
+            self.service.db.commit()
+        self.assertEqual(self.service.execute({"cmd": "content_keywords", "asset_id": 1}), {"words": ["slon"]})
+        self.assertEqual(self.service.execute({"cmd": "content_keywords", "asset_id": 2}), {"words": []})
         self.assertEqual(self.calls, [])
 
     def test_model_computed_names_are_persisted(self):

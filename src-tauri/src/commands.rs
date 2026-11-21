@@ -186,6 +186,24 @@ pub fn ai_series(state:State<'_,DatabaseState>,listing:State<'_,ListingState>,fo
 pub fn ai_duplicates_of(state:State<'_,AiState>,asset_id:i64,level:String)->Result<Vec<i64>,String>{state.0.duplicates_of(asset_id,&level)}
 #[tauri::command(async)]
 pub fn ai_suggest(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String)->Result<Value,String>{state.0.suggest(asset_ids,&kind)}
+
+#[tauri::command(async)]
+pub fn ai_content_keywords(state: State<'_, AiState>, asset_id: i64) -> Result<Value, String> {
+    state.0.content_keywords(asset_id)
+}
+
+#[tauri::command(async)]
+pub fn ai_keyword_matches(ai: State<'_, AiState>, db: State<'_, DatabaseState>, keyword_id: i64) -> Result<Value, String> {
+    let mut result = ai.0.keyword_matches(keyword_id)?;
+    let ids: Vec<i64> = result["ids"].as_array().into_iter().flatten().filter_map(Value::as_i64).collect();
+    result["ids"] = serde_json::json!(filter_listed_ids(&db.0, &ids, false)?);
+    Ok(result)
+}
+
+#[tauri::command(async)]
+pub fn ai_incoming_groups(ai: State<'_, AiState>) -> Result<Value, String> {
+    ai.0.incoming_groups()
+}
 #[tauri::command(async)]
 pub fn ai_reject_suggestion(state:State<'_,AiState>,asset_ids:Vec<i64>,kind:String,label_id:i64)->Result<usize,String>{state.0.reject_suggestion(&asset_ids,&kind,label_id)}
 #[tauri::command(async)]

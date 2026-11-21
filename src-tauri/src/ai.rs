@@ -293,7 +293,44 @@ impl AiService {
         matches!(self.status().state.as_str(), "ready" | "indexing" | "paused")
     }
 
-    pub fn rank_incoming_folders(&self, ids: &[i64], folder: &str, days: &HashMap<i64, String>) -> Result<Value, String> {
+    pub fn keyword_matches(&self, keyword_id: i64) -> Result<Value, String> {
+        let (seeds, excluded) = {
+            let conn = self.0.db.lock().map_err(|e| e.to_string())?;
+            let mut stmt = conn.prepare(
+                "SELECT a.id FROM asset_keywords ak JOIN assets a ON a.id=ak.asset_id
+                 WHERE keyword_id=?1 AND a.is_listed=1 ORDER BY coalesce(a.exif_date,a.file_modified),a.id",
+            ).map_err(|e| e.to_string())?;
+            let seeds = stmt.query_map([keyword_id], |row| row.get::<_, i64>(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| e.to_string())?;
+            let mut excluded = seeds.clone();
+            let has_rejections: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='ai_suggestion_rejections' AND type='table')",
+                [], |row| row.get(0),
+            ).map_err(|e| e.to_string())?;
+            if has_rejections {
+                let mut stmt = conn.prepare(
+                    "SELECT asset_id FROM ai_suggestion_rejections WHERE kind='keyword' AND label_id=?1",
+                ).map_err(|e| e.to_string())?;
+                let rejected = stmt.query_map([keyword_id], |row| row.get::<_, i64>(0))
+                    .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>()).map_err(|e| e.to_string())?;
+                excluded.extend(rejected);
+            }
+            (seeds, excluded)
+        };
+        self.request("keyword_matches", json!({"seeds": seeds, "excluded": excluded}), Duration::from_secs(60))
+    }
+
+    pub fn incoming_groups(&self) -> Result<Value, String> {
+        let folder = self.incoming_folder()?;
+        if folder.is_empty() { return Err("Najprv nastav priečinok s novými fotkami.".into()); }
+        self.request("incoming_groups", json!({
+            "catalog": self.0.paths.catalog,
+            "incoming": folder,
+            "extensions": self.0.formats.extensions(&["image", "raw"]),
+        }), Duration::from_secs(120))
+    }
+
+    pub fn rank_incoming_folders(&self, ids: &[i64], folder: &str, days: &HashMap<i64, String>, include_examples: bool) -> Result<Value, String> {
         self.request("suggest_folders", json!({
             "asset_ids": ids,
             "catalog": self.0.paths.catalog,
@@ -301,6 +338,7 @@ impl AiService {
             "extensions": self.0.formats.extensions(&["image", "raw"]),
             "days": days,
             "resolve_days": true,
+            "include_examples": include_examples,
         }), Duration::from_secs(120))
     }
 
@@ -362,6 +400,38 @@ impl AiService {
         let result = self.request("order_by_similarity", json!({"asset_ids":asset_ids}), Duration::from_secs(300))?;
         let ids = result.get("asset_ids").and_then(Value::as_array).ok_or("AI vrátilo neplatné poradie")?;
         Ok(ids.iter().filter_map(Value::as_i64).collect())
+    }
+
+    pub fn content_keywords(&self, asset_id: i64) -> Result<Value, String> {
+        let response = self.request("content_keywords", json!({"asset_id": asset_id}), Duration::from_secs(180))?;
+        let words = response["words"].as_array().ok_or("AI nevrátila kľúčové slová")?;
+        let conn = self.0.db.lock().map_err(|e| e.to_string())?;
+        let mut stmt = conn.prepare(
+            "SELECT k.id, k.name, EXISTS(SELECT 1 FROM asset_keywords
+             WHERE asset_id=?1 AND keyword_id=k.id)
+             FROM keywords k ORDER BY k.parent_id IS NOT NULL, k.id",
+        ).map_err(|e| e.to_string())?;
+        let keywords = stmt.query_map([asset_id], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        }).map_err(|e| e.to_string())?;
+        let mut matching_ids = HashMap::<String, (i64, bool)>::new();
+        for row in keywords {
+            let (id, word, assigned) = row.map_err(|e| e.to_string())?;
+            matching_ids.entry(word.trim().to_lowercase())
+                .and_modify(|entry| entry.1 |= assigned)
+                .or_insert((id, assigned));
+        }
+        let mut result = Vec::new();
+        for word in words.iter().filter_map(Value::as_str) {
+            let (id, path) = match matching_ids.get(&word.to_lowercase()) {
+                Some((_, true)) => continue,
+                Some((id, false)) => (Some(*id), label_path(&conn, "keyword", *id)?),
+                None => (None, word.to_owned()),
+            };
+            result.push(json!({"name": word, "labelId": id, "path": path}));
+            if result.len() == 5 { break; }
+        }
+        Ok(json!(result))
     }
 
     pub fn suggest(&self, asset_ids: Vec<i64>, kind: &str) -> Result<Value, String> {

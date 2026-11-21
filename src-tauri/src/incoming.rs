@@ -265,6 +265,8 @@ fn selection_inside(db: &Db, formats: &FormatTable, listing: &crate::listing::Li
 pub struct FolderSuggestion {
     folder: String,
     share: f64,
+    #[serde(default, rename = "exampleIds")]
+    example_ids: Vec<i64>,
 }
 
 #[derive(Serialize)]
@@ -280,12 +282,13 @@ pub fn suggest_incoming_folders(
     listing: State<'_, ListingState>,
     ai: State<'_, AiState>,
     asset_ids: Vec<i64>,
+    include_examples: Option<bool>,
 ) -> Result<FolderSuggestions, String> {
     let folder = ai.0.incoming_folder()?;
     let eligible = selection_inside(&db.0, &formats.0, &listing.0, &asset_ids, &folder)?;
     let mut response = FolderSuggestions { eligible, folders: Vec::new() };
     if eligible && ai.0.vector_queries_available() && asset_ids.iter().any(|id| *id > 0) {
-        response.folders = rank_folders(&ai.0, &db.0, &asset_ids, &folder)?;
+        response.folders = rank_folders(&ai.0, &db.0, &asset_ids, &folder, include_examples.unwrap_or(false))?;
     }
     Ok(response)
 }
@@ -321,7 +324,7 @@ fn resolve_days(ai: &AiService, db: &Db, ids: &[i64], days: &mut HashMap<i64, St
     Ok(())
 }
 
-pub(crate) fn rank_folders(ai: &AiService, db: &Db, ids: &[i64], incoming: &str) -> Result<Vec<FolderSuggestion>, String> {
+pub(crate) fn rank_folders(ai: &AiService, db: &Db, ids: &[i64], incoming: &str, include_examples: bool) -> Result<Vec<FolderSuggestion>, String> {
     let mut requested = ids.to_vec();
     let mut days = HashMap::new();
     loop {
@@ -329,7 +332,7 @@ pub(crate) fn rank_folders(ai: &AiService, db: &Db, ids: &[i64], incoming: &str)
         resolve_days(ai, db, &requested, &mut days)?;
         trace_timing("folder capture dates", started, requested.len());
         let started = std::time::Instant::now();
-        let result = ai.rank_incoming_folders(ids, incoming, &days)?;
+        let result = ai.rank_incoming_folders(ids, incoming, &days, include_examples)?;
         trace_timing("folder AI", started, ids.len());
         requested = result["missing_days"].as_array().into_iter().flatten()
             .filter_map(Value::as_i64).filter(|id| !days.contains_key(id)).collect();

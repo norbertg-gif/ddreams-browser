@@ -54,6 +54,11 @@ type Props = {
 
 export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], deletionSuggestions, onKeepSuggested, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale=1 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
+  const groupsById = useMemo(() => {
+    const groups = new Map<number, number>();
+    if (view.groups) view.ids?.forEach((id, index) => groups.set(id, view.groups![index]));
+    return groups;
+  }, [view.ids, view.groups]);
   const [shiftDown, setShiftDown] = useState(!!window.__ddreamsShift);
   const dismissTilePopup = useRef<(() => void) | null>(null);
   useEffect(() => {
@@ -307,7 +312,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={view.groups?.[index]} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={groupsById.get(asset.id)} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
