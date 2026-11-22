@@ -466,11 +466,130 @@ mod tests {
         assert!(preview.deletes.ids.is_empty());
         assert!(root.join("src/1.jpg").exists());
         manager.db.lock().unwrap().execute("UPDATE assets SET rating=5 WHERE id=1", []).unwrap();
-        let result = manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).unwrap();
+        let result = manager.execute_quarantine_review(&settings, &formats, None, crate::quarantine::ReviewSelection { moves: true, deletes: true, stale_edits: true }, &[], |_, _| {}).unwrap();
         assert_eq!((result.moved, result.failures.len()), (1, 1));
         assert!(root.join("src/1.jpg").exists());
         assert!(root.join("dst/2.rw2").exists());
-        assert!(manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).is_err());
+        assert!(manager.execute_quarantine_review(&settings, &formats, None, crate::quarantine::ReviewSelection { moves: true, deletes: true, stale_edits: true }, &[], |_, _| {}).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_edit_batch_preserves_first_mark_and_lists_oldest_first() {
+        let root = temp();
+        let (_, manager, settings) = quarantine_fixture(&root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let path = settings.incoming().join("b.jpg");
+        {
+            let conn = manager.db.lock().unwrap();
+            conn.execute("UPDATE assets SET edit_pending_since=123 WHERE id=1", []).unwrap();
+            conn.execute("INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,path)
+                VALUES(2,2,'b.jpg','jpg','jpg',1,?1)", [path.to_str().unwrap()]).unwrap();
+        }
+        let change = |value| manager.writer.set_asset_values(&[1, 2], &[],
+            &serde_json::Map::from_iter([("editPending".into(), value)])).unwrap();
+        let marked = change(serde_json::json!("toggle"));
+        assert_eq!(marked.assets[0].edit_pending_since, Some(123));
+        assert!(marked.assets[1].edit_pending_since.unwrap() > 123);
+        assert!(change(serde_json::json!(true)).change_id.is_none());
+        let filter = serde_json::from_value(serde_json::json!({
+            "kind":"special","value":"edit_pending","sort":"name","descending":true,"offset":0,"limit":50
+        })).unwrap();
+        assert_eq!(crate::db::asset_ids_page(&manager.db, &filter, &formats, 0, 50).unwrap(), vec![1, 2]);
+        let page = crate::db::assets_page(&manager.db, &filter, &formats).unwrap();
+        assert_eq!(page.items.iter().map(|asset| asset.id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(page.items[0].edit_pending_since, Some(123));
+        let counts = crate::db::values_page(&manager.db, "special", 0, 50, &formats).unwrap();
+        assert_eq!(counts.iter().find(|item| item.value == "edit_pending").unwrap().count, 2);
+        assert!(change(serde_json::json!("toggle")).assets.iter().all(|asset| asset.edit_pending_since.is_none()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_edit_clears_only_when_listing_mtime_passes_the_grace_period() {
+        let root = temp();
+        let (disk, manager, settings) = quarantine_fixture(&root);
+        let src = settings.incoming();
+        let file = src.join("a.jpg");
+        let since = 1_700_000_000_i64;
+        {
+            let conn = manager.db.lock().unwrap();
+            conn.execute("UPDATE folders SET path=?1 WHERE id=2", [src.to_str().unwrap()]).unwrap();
+            conn.execute("UPDATE assets SET edit_pending_since=?1 WHERE id=1", [since]).unwrap();
+        }
+        let filter = serde_json::from_value(serde_json::json!({
+            "kind":"folder","id":2,"folderPath":src,"sort":"name","descending":false,"offset":0,"limit":50
+        })).unwrap();
+        for (seconds, expected) in [(60, 0), (61, 1)] {
+            let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs((since + seconds) as u64);
+            disk.set_modified(&file, modified).unwrap();
+            manager.listing.invalidate_path(src.to_str().unwrap()).unwrap();
+            let (_, rows) = manager.listing.listed_folder(&filter).unwrap();
+            assert_eq!(manager.writer.fulfil_edits_from_listing(&rows).unwrap(), expected);
+        }
+        let pending: Option<i64> = manager.db.lock().unwrap().query_row("SELECT edit_pending_since FROM assets WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(pending, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pending_edit_clears_for_a_newer_listed_sibling_in_the_same_folder() {
+        let root = temp();
+        let (_, manager, settings) = quarantine_fixture(&root);
+        let src = settings.incoming();
+        let dst = settings.quarantine();
+        {
+            let conn = manager.db.lock().unwrap();
+            conn.execute("UPDATE folders SET path=?1 WHERE id=2", [src.to_str().unwrap()]).unwrap();
+            conn.execute("UPDATE folders SET path=?1 WHERE id=3", [dst.to_str().unwrap()]).unwrap();
+            conn.execute("UPDATE assets SET edit_pending_since=unixepoch('2024-01-02') WHERE id=1", []).unwrap();
+        }
+        let listed = |id, folder: &Path, name: &str, ext: &str, modified: &str| crate::journal::ListedAsset {
+            temporary_id: id, name: name.into(), ext: ext.into(), size: Some(4.0),
+            file_modified: Some(modified.into()), path: folder.join(name).to_string_lossy().into_owned(),
+            folder_path: folder.to_string_lossy().into_owned(),
+        };
+        let pending = || manager.db.lock().unwrap().query_row("SELECT edit_pending_since IS NOT NULL FROM assets WHERE id=1", [], |r| r.get::<_, bool>(0)).unwrap();
+        let old = listed(-2, src, "A.tif", "tif", "2024-01-01T00:00:00Z");
+        for sibling in [old.clone(), listed(-3, dst, "A.psd", "psd", "2024-01-03T00:00:00Z")] {
+            manager.writer.catalog_listed_assets(&[sibling]).unwrap();
+            assert!(pending());
+        }
+        let touched = crate::journal::ListedAsset { file_modified: Some("2024-01-03T00:00:00Z".into()), ..old };
+        assert!(manager.writer.catalog_listed_assets(&[touched]).unwrap().is_empty());
+        assert!(pending());
+        manager.writer.catalog_listed_assets(&[listed(-4, src, "A.PSD", "psd", "2024-01-03T00:00:00Z")]).unwrap();
+        assert!(!pending());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stale_edit_review_can_be_skipped_and_rechecks_scope_before_moving() {
+        use crate::quarantine::{DAY, ReviewSelection};
+        let root = temp();
+        let (disk, manager, settings) = quarantine_fixture(&root);
+        let formats = crate::formats::FormatTable::load_selected(None);
+        let source = settings.incoming().join("a.jpg");
+        let since = crate::quarantine::now() - 91 * DAY;
+        disk.set_modified(&source, std::time::UNIX_EPOCH + std::time::Duration::from_secs(since as u64)).unwrap();
+        let mark = |timestamp| manager.db.lock().unwrap().execute("UPDATE assets SET edit_pending_since=?1 WHERE id=1", [timestamp]).unwrap();
+        let preview = || manager.prepare_quarantine_review(settings.clone(), &formats, None).unwrap();
+        let execute = |stale_edits| manager.execute_quarantine_review(&settings, &formats, None,
+            ReviewSelection { moves: true, deletes: true, stale_edits }, &[], |_, _| {}).unwrap();
+        mark(Some(since));
+        assert_eq!(preview().stale_edits.ids, vec![1]);
+        assert_eq!(execute(false).moved, 0);
+        assert!(source.exists());
+        assert_eq!(preview().stale_edits.ids, vec![1]);
+        mark(None);
+        let outcome = execute(true);
+        assert_eq!((outcome.moved, outcome.failures.len()), (0, 1));
+        mark(Some(since));
+        assert_eq!(preview().stale_edits.ids, vec![1]);
+        assert_eq!(execute(true).moved, 1);
+        let (pending, quarantined): (Option<i64>, Option<i64>) = manager.db.lock().unwrap().query_row(
+            "SELECT edit_pending_since,quarantined_at FROM assets WHERE id=1", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!(pending.is_none() && quarantined.is_some());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -604,7 +723,7 @@ mod tests {
         assert_eq!(preview.deletes.bytes, 12);
         assert!(root.join("dst/2.jpg").exists());
         fs::write(root.join("dst/5.jpg"), b"replacement").unwrap();
-        let result = manager.execute_quarantine_review(&settings, &formats, None, &[], |_, _| {}).unwrap();
+        let result = manager.execute_quarantine_review(&settings, &formats, None, crate::quarantine::ReviewSelection { moves: true, deletes: true, stale_edits: true }, &[], |_, _| {}).unwrap();
         assert_eq!((result.deleted, result.failures.len()), (1, 1));
         assert!(disk.recycled_item(&root.join("dst").join("2.jpg")).is_some());
         assert!(root.join("dst/3.jpg").exists());
@@ -616,7 +735,7 @@ mod tests {
     #[test]fn same_volume_move_updates_catalogue_and_moves_sidecar(){let root=temp();let(disk,manager)=set_up(&root,None);let src=root.join("src/a.jpg");fs::write(root.join("src/a.xmp"),b"side").unwrap();let db=manager.db.clone();seed_asset_path(&db,&root);let listed=ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None));let manager=FileManager::with_fs(db.clone(),listed,manager.writer.clone(),false,disk);let result=manager.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert_eq!(result.changed_count,1);assert!(!src.exists());assert!(root.join("dst/a.xmp").exists());assert_eq!(db.lock().unwrap().query_row("SELECT path||':'||rating FROM assets WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),format!("{}:4",root.join("dst").join("a.jpg").display()));let _=fs::remove_dir_all(root);}
     #[test]fn copy_duplicates_metadata_and_relations(){let root=temp();let(disk,mut manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);let listing=ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None));manager=FileManager::with_fs(db.clone(),listing,manager.writer.clone(),false,disk.clone());let result=manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();let id=result.remapped_ids[0].new_id;{let c=db.lock().unwrap();assert_eq!(c.query_row("SELECT rating||':'||caption FROM assets WHERE id=?1",[id],|r|r.get::<_,String>(0)).unwrap(),"4:cap");assert_eq!(c.query_row("SELECT count(*) FROM asset_categories WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),1);assert_eq!(c.query_row("SELECT count(*) FROM asset_keywords WHERE asset_id=?1",[id],|r|r.get::<_,i64>(0)).unwrap(),1);}let _=fs::remove_dir_all(root);}
     #[test]fn conflicts_skip_keep_both_and_overwrite_refusal(){let root=temp();let(disk,mut manager)=set_up(&root,None);fs::write(root.join("dst/a.jpg"),b"existing").unwrap();let db=manager.db.clone();seed_asset_path(&db,&root);manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk);assert_eq!(manager.preview_conflicts(&[1],root.join("dst").to_str().unwrap(),None).unwrap(),1);let skip=manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Skip,|_,_|{}).unwrap();assert_eq!(skip.skipped_count,1);assert_eq!(fs::read(root.join("dst/a.jpg")).unwrap(),b"existing");manager.copy_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::KeepBoth,|_,_|{}).unwrap();assert_eq!(fs::read(root.join("dst/a (2).jpg")).unwrap(),b"abc");let _=fs::remove_dir_all(root);}
-    #[test]fn cross_volume_switch_and_uncatalogued_move_are_testable(){let root=temp();let(disk,manager)=set_up(&root,Some(false));let listed=ListingService::new(manager.db.clone(),crate::formats::FormatTable::load_selected(None));let _=listed;let mut m=manager;let source=root.join("src/a.jpg");let asset=crate::db::Asset{id:-10_000_000,folder_id:None,name:"a.jpg".into(),ext:"jpg".into(),size:Some(3.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(source.to_string_lossy().to_string()),is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None};m.listing.insert_test_asset(asset);m.move_files(&[-10_000_000],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert!(!source.exists());assert!(root.join("dst/a.jpg").exists());assert_eq!(m.db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE '%a.jpg'",[],|r|r.get::<_,i64>(0)).unwrap(),1);let _=fs::remove_dir_all(root);}
+    #[test]fn cross_volume_switch_and_uncatalogued_move_are_testable(){let root=temp();let(disk,manager)=set_up(&root,Some(false));let listed=ListingService::new(manager.db.clone(),crate::formats::FormatTable::load_selected(None));let _=listed;let mut m=manager;let source=root.join("src/a.jpg");let asset=crate::db::Asset{id:-10_000_000,folder_id:None,name:"a.jpg".into(),ext:"jpg".into(),size:Some(3.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(source.to_string_lossy().to_string()),is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None,edit_pending_since:None};m.listing.insert_test_asset(asset);m.move_files(&[-10_000_000],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap();assert!(!source.exists());assert!(root.join("dst/a.jpg").exists());assert_eq!(m.db.lock().unwrap().query_row("SELECT count(*) FROM assets WHERE path LIKE '%a.jpg'",[],|r|r.get::<_,i64>(0)).unwrap(),1);let _=fs::remove_dir_all(root);}
     #[test]fn simulated_mid_batch_failure_rolls_back_and_readonly_refuses(){let root=temp();let(disk,manager)=set_up(&root,Some(true));fs::write(root.join("src/a.xmp"),b"side").unwrap();seed_asset_path(&manager.db,&root);disk.fail_move.store(1,Ordering::SeqCst);let error=manager.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err();assert!(error.contains("simulated failure"));assert!(root.join("src/a.jpg").exists());assert!(root.join("src/a.xmp").exists());assert!(!root.join("dst/a.jpg").exists());assert_eq!(manager.db.lock().unwrap().query_row("SELECT path FROM assets WHERE id=1",[],|r|r.get::<_,String>(0)).unwrap(),root.join("src/a.jpg").to_string_lossy());let ro=FileManager::with_fs(manager.db.clone(),manager.listing.clone(),manager.writer.clone(),true,disk);assert!(ro.move_files(&[1],root.join("dst").to_str().unwrap(),ConflictPolicy::Cancel,|_,_|{}).unwrap_err().contains("iba na čítanie"));let _=fs::remove_dir_all(root);}
     #[test]fn delete_recycles_main_and_sidecar_and_removes_rows(){let root=temp();let(disk,manager)=set_up(&root,None);let db=manager.db.clone();seed_asset_path(&db,&root);fs::write(root.join("src/a.xmp"),b"side").unwrap();let manager=FileManager::with_fs(db.clone(),ListingService::new(db.clone(),crate::formats::FormatTable::load_selected(None)),manager.writer.clone(),false,disk.clone());
         let result=manager.delete_files(&[1],false,&[]).unwrap().0;assert_eq!(result.summary,"Odstránené do Koša: 1 súbor");assert!(!root.join("src/a.jpg").exists());assert!(!root.join("src/a.xmp").exists());

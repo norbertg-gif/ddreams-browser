@@ -444,9 +444,11 @@ pub struct FileProgress{pub operation:String,pub done:usize,pub total:usize}
 pub fn set_asset_values(
     state: State<'_, CatalogWriterState>,
     listing: State<'_, ListingState>,
+    file_manager: State<'_, FileManagerState>,
     asset_ids: Vec<i64>,
     changes: serde_json::Map<String, Value>,
 ) -> Result<SetAssetValuesResult, String> {
+    let _operation = changes.contains_key("editPending").then(|| file_manager.0.lock_operation()).transpose()?;
     let mut candidates = Vec::new();
     let mut file_ids = asset_ids.iter().copied().filter(|id| *id >= 0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id| *id < 0) {
@@ -602,7 +604,8 @@ pub fn get_assets(
             let _ = app.emit("folder-catalogue-changed", ());
         }
     }
-    if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people" {
+    if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people"
+        && !(filter.kind == "special" && filter.value.as_deref() == Some("edit_pending")) {
         let status = ai.0.status();
         let mut page = similarity_page(&state.0, &listing.0, &formats.0, &filter, &status, |ids| ai.0.order_by_similarity(ids))?;
         classify_page(&mut page);
@@ -617,24 +620,26 @@ pub fn get_folder_previews(state: State<'_, BackgroundDbState>, formats: State<'
     db::folder_previews(&state.0, &paths, &formats.0).map_err(|e| e.to_string())
 }
 fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTable,writer:&crate::journal::CatalogWriter,ai:&crate::ai::AiService,filter:&AssetFilter)->Result<usize,String>{
-    let (path,files)=listing.uncatalogued_files(filter)?;
+    let (path,files)=listing.listed_folder(filter)?;
     writer.observe_incoming_folder(&path)?;
-    if path.is_empty() || files.is_empty() { return Ok(0); }
+    let fulfilled = writer.fulfil_edits_from_listing(&files)?;
+    if fulfilled > 0 { listing.invalidate_path(&path)?; }
+    if path.is_empty() || !files.iter().any(|asset| !asset.is_directory && asset.id < 0) { return Ok(fulfilled); }
     let mode = writer.effective_folder_mode(&path);
     let included = mode.as_deref() == Some("include");
     if mode.as_deref() == Some("exclude") || (!included &&
         !ai.incoming_folder().is_ok_and(|folder| crate::incoming::contains_folder(&path, &folder))) {
-        return Ok(0);
+        return Ok(fulfilled);
     }
-    let candidates=files.into_iter().filter(|a|match formats.group(&a.ext) {
+    let candidates=files.iter().filter(|a| !a.is_directory && a.id < 0).filter(|a|match formats.group(&a.ext) {
         Some("image" | "raw") => true,
         Some("video") => included,
         _ => false,
-    }).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name,ext:a.ext,size:a.size,file_modified:a.file_modified,path:file_path,folder_path})}).collect::<Vec<_>>();
-    if candidates.is_empty(){return Ok(0);}
+    }).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name.clone(),ext:a.ext.clone(),size:a.size,file_modified:a.file_modified.clone(),path:file_path,folder_path})}).collect::<Vec<_>>();
+    if candidates.is_empty(){return Ok(fulfilled);}
     let remaps=writer.catalog_listed_assets(&candidates)?;
     if !remaps.is_empty(){let _=listing.invalidate_path(&path);ai.index_assets(&remaps.iter().map(|r|r.new_id).collect::<Vec<_>>());}
-    Ok(remaps.len())
+    Ok(remaps.len() + fulfilled)
 }
 #[tauri::command(async)]
 pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) -> Result<(), String> {

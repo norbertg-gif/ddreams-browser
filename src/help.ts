@@ -86,12 +86,18 @@ export const helpTopics: HelpTopic[] = [
     { type: "note", text: "Záloha sa týka katalógu; na uchovanie originálnych fotografií je potrebná samostatná záloha súborov." },
     { type: "paragraph", text: "Nastavenia obsahujú aj pravidlá priečinkov, offline zdroje, zobrazenie iných súborov, veľkosť písma, externé editory a zapnutie AI." }
   ] },
+  { id: "pending-edit", title: "Na úpravu", keywords: ["U", "Hotovo", "karanténa", "čaká"], blocks: [
+    { type: "paragraph", text: "Vybrané fotky označíte klávesom U, v ponuke náhľadu alebo v paneli úprav. Pri zmiešanom výbere U označí aj zvyšné fotky, pri označenom výbere stav zruší. V špeciálnej položke Na úpravu sú najstaršie označenia navrchu." },
+    { type: "paragraph", text: "Stav zrušíte tlačidlom Hotovo. Katalóg ho zruší aj pri zistení zmeny súboru viac ako 60 sekúnd po označení alebo pri zaevidovaní novšieho súboru s rovnakým názvom a inou príponou v tom istom priečinku (napríklad PSD alebo TIFF)." },
+    { type: "paragraph", text: "Po 90 dňoch sa pri štarte ponúkne presun dlho čakajúcich fotiek z importu do karantény. Skupinu môžete v kontrole odškrtnúť. Lehotu zmeníte v časti Import a karanténa a hodnotou 0 ponuku vypnete." }
+  ] },
   { id: "shortcuts", title: "Klávesové skratky", keywords: ["klávesnica", "klávesy", "F1", "Ctrl", "Shift"], blocks: [
     { type: "note", text: "Skratky závisia od aktívnej oblasti. Pri písaní do polí sa globálne skratky pre prácu s fotografiami nepoužívajú." },
     { type: "shortcuts", rows: [
       ["F1 / Esc", "Otvoriť / zavrieť Pomocníka; Esc zatvára aj ďalšie dialógy a prehliadač."],
       ["Ctrl+1 až 5 / Ctrl+0", "Hodnotenie 1 až 5 / odstrániť hodnotenie."],
       ["Alt+1 až 6 / Alt+0", "Červená, žltá, zelená, modrá, fialová, Na vyradenie / odstrániť štítok."],
+      ["U", "Prepnúť stav Na úpravu pre vybrané fotky."],
       ["X / spätná lomka", "Prepnúť štítok Na vyradenie / označenie vybraných."], ["Ctrl+Alt+X", "Otvoriť výber v predvolenom editore."],
       ["Ctrl+C / Ctrl+X / Ctrl+V", "V mriežke alebo v strome priečinkov kopírovať / vystrihnúť / vložiť."],
       ["F2 / Delete / Shift+Delete", "V mriežke premenovať / zmazať / zmazať natrvalo; F2 a Delete fungujú aj v strome priečinkov. F2 premenuje aj aktívnu kategóriu alebo kľúčové slovo."],

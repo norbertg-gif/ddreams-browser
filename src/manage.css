@@ -109,6 +109,8 @@ button.deletion-suggestion-badge:hover { background: #8e3035; color: #fff; }
 }
 .quarantine-settings input { max-width: 50%; }
 .quarantine-review-link { text-decoration: underline; }
+.edit-pending-badge { padding: 0 4px; border-radius: 6px; background: #0b0d11cc; color: #b8d9ff; font-size: 12px; line-height: 16px; }
+.edit-pending-controls { display: inline-flex; flex-wrap: wrap; gap: 4px; }
 .quarantine-days {
   position: absolute;
   bottom: 5px;

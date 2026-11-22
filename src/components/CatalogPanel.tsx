@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState,
   type ReactElement, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { CatalogAssetLinks, Node as CatalogNode, Root, ValueCount, View } from "../types";
 import { labelColor, labelText } from "./AssetGrid";
 import { readStored, writeStored } from "../storage";
@@ -114,10 +115,27 @@ function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeCh
     load(invoke<Root[]>("get_category_roots",{includeChildren,offset:0,limit:500}),setRoots);
     load(invoke<ValueCount[]>("get_catalog_values",{kind:"rating",offset:0,limit:20}),values=>{const counts=new Map(values.map(v=>[v.value,v.count]));setRatings(["unrated","1","2","3","4","5"].map(value=>({value,count:counts.get(value)??0})));});
     load(invoke<ValueCount[]>("get_catalog_values",{kind:"label",offset:0,limit:100}),setLabels);
-    load(invoke<ValueCount[]>("get_catalog_values",{kind:"special",offset:0,limit:20}),setSpecial);
     load(invoke<CatalogNode[]>("get_catalog_nodes",{kind:"keyword",parentId:null,rootId:null,includeChildren,offset:0,limit:500}),setKeywords);
     return()=>{active=false};
   },[includeChildren,refreshToken]);
+
+  useEffect(() => {
+    let latest = 0;
+    let active = true;
+    const refresh = () => {
+      if (!active) return;
+      const request = ++latest;
+      void invoke<ValueCount[]>("get_catalog_values", { kind: "special", offset: 0, limit: 20 })
+        .then(values => { if (active && request === latest) setSpecial(values); })
+        .catch(() => {});
+    };
+    const subscription = listen("folder-catalogue-changed", refresh);
+    void subscription.then(refresh, refresh);
+    return () => {
+      active = false;
+      void subscription.then(unlisten => unlisten()).catch(() => {});
+    };
+  }, [refreshToken]);
 
   useEffect(()=>{
     if(!keywordQuery.trim()){setKeywordResults([]);setCategoryResults([]);return;}
@@ -389,7 +407,7 @@ function SpecialSection(): ReactElement {
   const {
     isCollapsed, onNavigate, special,
   } = useRightSectionData("catalog");
-  return <DockSection id="catalog.special"><section className="catalog-section"><SectionHeading id="catalog.special" title="Špeciálne položky"/>{!isCollapsed("catalog.special")&&[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["quarantine","Karanténa"],["tagged","Označené"],["delete_suggested","Návrh na vymazanie"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section></DockSection>;
+  return <DockSection id="catalog.special"><section className="catalog-section"><SectionHeading id="catalog.special" title="Špeciálne položky"/>{!isCollapsed("catalog.special")&&[["all_photos","Všetky fotky"],["uncategorized","Bez kategórie"],["unkeyworded","Bez keywordov"],["quarantine","Karanténa"],["edit_pending","Na úpravu"],["tagged","Označené"],["delete_suggested","Návrh na vymazanie"]].map(([value,label])=><button className="value-row" key={value} onClick={()=>onNavigate({kind:"special",value,title:label})}><span>{label}</span><small>{special.find(s=>s.value===value)?.count??0}</small></button>)}</section></DockSection>;
 }
 
 function PeopleSection(): ReactElement {

@@ -1,4 +1,4 @@
-export type Asset = { quarantinedAt?: number;
+export type Asset = { quarantinedAt?: number; editPendingSince?: number | null;
   id: number; folderId: number | null; name: string; ext: string; size: number | null;
   width: number | null; height: number | null; bpp: number | null; caption: string | null;
   notes: string | null; author: string | null; rating: number | null; tagged: number | null;

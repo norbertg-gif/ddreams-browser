@@ -39,7 +39,7 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
     }
     transaction.execute("CREATE INDEX IF NOT EXISTS idx_assets_delete_suggestion ON assets(id) WHERE is_listed=1 AND delete_suggestion=1", [])
         .map_err(|e| e.to_string())?;
-    for (column, kind) in [("incoming_seen_at", "INTEGER"), ("quarantined_at", "INTEGER"), ("quarantine_origin", "TEXT")] {
+    for (column, kind) in [("incoming_seen_at", "INTEGER"), ("quarantined_at", "INTEGER"), ("quarantine_origin", "TEXT"), ("edit_pending_since", "INTEGER")] {
         if !has_asset_column(&transaction, column).map_err(|e| e.to_string())? {
             transaction.execute(&format!("ALTER TABLE assets ADD COLUMN {column} {kind}"), [])
                 .map_err(|e| e.to_string())?;
@@ -47,7 +47,8 @@ pub fn migrate_catalog(connection: &mut Connection) -> Result<(), String> {
     }
     transaction.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_assets_incoming_seen ON assets(incoming_seen_at) WHERE incoming_seen_at IS NOT NULL;
-         CREATE INDEX IF NOT EXISTS idx_assets_quarantined ON assets(quarantined_at) WHERE quarantined_at IS NOT NULL;",
+         CREATE INDEX IF NOT EXISTS idx_assets_quarantined ON assets(quarantined_at) WHERE quarantined_at IS NOT NULL;
+         CREATE INDEX IF NOT EXISTS idx_assets_edit_pending ON assets(edit_pending_since) WHERE edit_pending_since IS NOT NULL;",
     ).map_err(|e| e.to_string())?;
     transaction.commit().map_err(|e| e.to_string())
 }
@@ -139,6 +140,21 @@ mod tests {
         assert_eq!(conn.query_row("SELECT incoming_seen_at FROM assets WHERE id=1", [], |r| r.get::<_, i64>(0)).unwrap(), 12);
         assert_eq!(conn.query_row("SELECT quarantined_at,quarantine_origin FROM assets WHERE id=2", [],
             |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))).unwrap(), (34, "X:/in/b.jpg".into()));
+    }
+
+    #[test]
+    fn edit_pending_migration_preserves_rows_and_uses_a_partial_index() {
+        let mut conn = fixture();
+        conn.execute("INSERT INTO assets(id,is_listed) VALUES(1,1),(2,1)", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        conn.execute("UPDATE assets SET edit_pending_since=123 WHERE id=1", []).unwrap();
+        migrate_catalog(&mut conn).unwrap();
+        let mut stmt = conn.prepare("SELECT edit_pending_since FROM assets ORDER BY id").unwrap();
+        let values = stmt.query_map([], |r| r.get::<_, Option<i64>>(0)).unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(values, vec![Some(123), None]);
+        let partial: bool = conn.query_row("SELECT partial FROM pragma_index_list('assets') WHERE name='idx_assets_edit_pending'", [], |r| r.get(0)).unwrap();
+        assert!(partial);
     }
 
     #[test]

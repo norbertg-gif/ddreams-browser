@@ -4,7 +4,7 @@ use crate::{
     formats::FormatTable,
     incoming::{Photo, fill_capture_dates},
     quarantine::{
-        Outcome, Review, ReviewList, ReviewPreview, Settings, Snapshot, Stage, checked_path,
+        Outcome, Review, ReviewList, ReviewPreview, ReviewSelection, Settings, Snapshot, Stage, checked_path,
         due_candidates, inside, validate_roots,
     },
 };
@@ -45,12 +45,13 @@ impl FileManager {
             return Ok(ReviewPreview::default());
         }
         validate_roots(settings.incoming(), settings.quarantine())?;
-        let (moves, deletes) = {
+        let (moves, deletes, stale_edits) = {
             let conn = self.db.lock().map_err(|e| e.to_string())?;
             let at = crate::quarantine::now();
             (
                 due_candidates(&conn, &settings, formats, Stage::Move, at, None)?,
                 due_candidates(&conn, &settings, formats, Stage::Delete, at, None)?,
+                due_candidates(&conn, &settings, formats, Stage::StaleEdit, at, None)?,
             )
         };
         let (mut move_candidates, move_snapshots): (Vec<_>, Vec<_>) = moves
@@ -77,6 +78,16 @@ impl FileManager {
                     .ok()
             })
             .collect::<Vec<_>>();
+        let stale_edits = stale_edits
+            .into_iter()
+            .filter_map(|photo| {
+                let path = Path::new(&photo.path);
+                if !photo_format(formats, path) {
+                    return None;
+                }
+                self.review_snapshot(Stage::StaleEdit, photo.id, path, &settings).ok()
+            })
+            .collect::<Vec<_>>();
         let list = |files: &[Snapshot]| ReviewList {
             ids: files.iter().map(|file| file.id).collect(),
             bytes: files
@@ -95,12 +106,15 @@ impl FileManager {
         let preview = ReviewPreview {
             moves: list(&moves),
             deletes: list(&deletes),
+            stale_edits: list(&stale_edits),
+            edit_after_days: settings.edit_after_days(),
             no_bin_drives,
         };
         *pending = Some(Review {
             settings,
             moves,
             deletes,
+            stale_edits,
         });
         Ok(preview)
     }
@@ -110,11 +124,12 @@ impl FileManager {
         settings: &Settings,
         formats: &FormatTable,
         exif: Option<&ExifTool>,
+        selection: ReviewSelection,
         drives: &[String],
         mut progress: impl FnMut(usize, usize),
     ) -> Result<Outcome, String> {
         self.writable()?;
-        let review = self
+        let mut review = self
             .review
             .lock()
             .map_err(|e| e.to_string())?
@@ -124,8 +139,11 @@ impl FileManager {
             return Err("Nastavenia importu alebo karantény sa zmenili. Skontrolujte zoznam po ďalšom štarte.".into());
         }
         validate_roots(settings.incoming(), settings.quarantine())?;
-        let total = review.moves.len() + review.deletes.len();
-        let mut reserved = if review.moves.is_empty() {
+        if !selection.moves { review.moves.clear(); }
+        if !selection.deletes { review.deletes.clear(); }
+        if !selection.stale_edits { review.stale_edits.clear(); }
+        let total = review.moves.len() + review.deletes.len() + review.stale_edits.len();
+        let mut reserved = if review.moves.is_empty() && review.stale_edits.is_empty() {
             Ok(HashSet::new())
         } else {
             self.quarantine_stems(settings.quarantine())
@@ -135,15 +153,12 @@ impl FileManager {
             .moves
             .into_iter()
             .map(|p| (Stage::Move, p))
+            .chain(review.stale_edits.into_iter().map(|p| (Stage::StaleEdit, p)))
             .chain(review.deletes.into_iter().map(|p| (Stage::Delete, p)))
             .enumerate()
         {
             progress(index, total);
             let result = (|| {
-                let root = match stage {
-                    Stage::Move => settings.incoming(),
-                    Stage::Delete => settings.quarantine(),
-                };
                 let mut eligible = {
                     let conn = self.db.lock().map_err(|e| e.to_string())?;
                     due_candidates(
@@ -159,7 +174,7 @@ impl FileManager {
                     .first()
                     .map(|photo| Path::new(&photo.path))
                     .ok_or("Podmienky sa zmenili")?;
-                if self.snapshot(snapshot.id, path, root)? != snapshot {
+                if self.review_snapshot(stage, snapshot.id, path, settings)? != snapshot {
                     return Err("Súbor alebo XMP sa od kontroly zmenil".into());
                 }
                 if stage == Stage::Move {
@@ -173,7 +188,7 @@ impl FileManager {
                     return Err("Cesta súboru sa od kontroly zmenila".into());
                 }
                 match stage {
-                    Stage::Move => self.move_quarantine_file(
+                    Stage::Move | Stage::StaleEdit => self.move_quarantine_file(
                         source,
                         settings.quarantine(),
                         ConflictPolicy::KeepBoth,
@@ -368,6 +383,21 @@ impl FileManager {
             .quarantine_origin(source.id)?
             .ok_or("Položka nie je v karanténe")?;
         Ok((source, origin))
+    }
+
+    fn review_snapshot(&self, stage: Stage, id: i64, path: &Path, settings: &Settings) -> Result<Snapshot, String> {
+        let snapshot = self.snapshot(id, path, stage.root(settings))?;
+        if stage == Stage::StaleEdit {
+            let since: Option<i64> = self.db.lock().map_err(|e| e.to_string())?
+                .query_row("SELECT edit_pending_since FROM assets WHERE id=?1", [id], |r| r.get(0))
+                .map_err(|e| e.to_string())?;
+            if since.is_none_or(|since| snapshot.files.iter().any(|(file, _, modified, _)| {
+                file == path && crate::quarantine::modified_after_mark(*modified, since)
+            })) {
+                return Err("Fotka už bola upravená".into());
+            }
+        }
+        Ok(snapshot)
     }
 
     fn snapshot(&self, id: i64, path: &Path, root: &Path) -> Result<Snapshot, String> {

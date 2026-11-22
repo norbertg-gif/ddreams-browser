@@ -20,6 +20,7 @@ use tauri::{AppHandle, Emitter, State};
 
 const SETTINGS_KEY: &str = "quarantine";
 pub(crate) const DAY: i64 = 86_400;
+pub(crate) const EDIT_MTIME_GRACE: i64 = 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -27,8 +28,12 @@ pub(crate) struct Preferences {
     folder: String,
     pub move_after_days: u32,
     pub delete_after_days: u32,
+    #[serde(default = "default_edit_after_days")]
+    pub edit_after_days: u32,
     pub manage_from: String,
 }
+
+fn default_edit_after_days() -> u32 { 90 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +45,10 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    pub fn edit_after_days(&self) -> u32 {
+        self.preferences.edit_after_days
+    }
+
     pub fn incoming(&self) -> &Path {
         Path::new(&self.incoming_folder)
     }
@@ -62,6 +71,7 @@ impl Settings {
                 folder: quarantine.to_string_lossy().into_owned(),
                 move_after_days: 60,
                 delete_after_days: 30,
+                edit_after_days: default_edit_after_days(),
                 manage_from: "2024-06-01".into(),
             },
         )
@@ -73,6 +83,11 @@ pub(crate) fn now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64
+}
+
+pub(crate) fn modified_after_mark(modified: SystemTime, since: i64) -> bool {
+    modified.duration_since(UNIX_EPOCH).ok()
+        .is_some_and(|age| age.as_secs() as i64 > since.saturating_add(EDIT_MTIME_GRACE))
 }
 
 fn default_folder(incoming_folder: &str) -> String {
@@ -114,6 +129,7 @@ fn load(path: &Path, db: &Db, writable: bool) -> Result<Settings, String> {
         folder: String::new(),
         move_after_days: 60,
         delete_after_days: 30,
+        edit_after_days: default_edit_after_days(),
         manage_from: today,
     };
     let mut result = None;
@@ -260,6 +276,16 @@ pub(crate) fn validate_roots(source: &Path, quarantine: &Path) -> Result<(), Str
 pub(crate) enum Stage {
     Move,
     Delete,
+    StaleEdit,
+}
+
+impl Stage {
+    pub fn root(self, settings: &Settings) -> &Path {
+        match self {
+            Self::Move | Self::StaleEdit => settings.incoming(),
+            Self::Delete => settings.quarantine(),
+        }
+    }
 }
 
 pub(crate) fn due_candidates(
@@ -273,25 +299,30 @@ pub(crate) fn due_candidates(
     let days = match stage {
         Stage::Move => settings.preferences.move_after_days,
         Stage::Delete => settings.preferences.delete_after_days,
+        Stage::StaleEdit => settings.preferences.edit_after_days,
     };
     if days == 0 {
         return Ok(Vec::new());
     }
     let action_filter = match stage {
         Stage::Move => format!(
-            "incoming_seen_at <= ?1 AND quarantined_at IS NULL
+            "incoming_seen_at <= ?1 AND quarantined_at IS NULL AND edit_pending_since IS NULL
              AND coalesce(rating,0)=0 AND trim(coalesce(label,''))='' AND coalesce(tagged,0)=0
              AND NOT EXISTS(SELECT 1 FROM asset_categories c WHERE c.asset_id=a.id)
              AND {}",
             formats.sql_in("ext_lower", &["image", "raw"])
         ),
         Stage::Delete => "quarantined_at <= ?1 AND quarantine_origin IS NOT NULL".into(),
+        Stage::StaleEdit => format!(
+            "edit_pending_since <= ?1 AND quarantined_at IS NULL AND {}",
+            formats.sql_in("ext_lower", &["image", "raw"])
+        ),
     };
     let capture = match stage {
         Stage::Move => {
             "CASE WHEN date(substr(exif_date,1,10),'+0 days')=substr(exif_date,1,10) THEN substr(exif_date,1,10) END"
         }
-        Stage::Delete => "NULL",
+        Stage::Delete | Stage::StaleEdit => "NULL",
     };
     let id_filter = if id.is_some() { " AND id=?2" } else { "" };
     let mut stmt = conn.prepare(&format!(
@@ -302,10 +333,7 @@ pub(crate) fn due_candidates(
     if let Some(id) = id {
         stmt.raw_bind_parameter(2, id).map_err(|e| e.to_string())?;
     }
-    let root = match stage {
-        Stage::Move => settings.incoming(),
-        Stage::Delete => settings.quarantine(),
-    };
+    let root = stage.root(settings);
     stmt.raw_query()
         .mapped(|r| {
             Ok(incoming::Photo {
@@ -329,6 +357,7 @@ pub(crate) struct Review {
     pub settings: Settings,
     pub moves: Vec<Snapshot>,
     pub deletes: Vec<Snapshot>,
+    pub stale_edits: Vec<Snapshot>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -350,7 +379,17 @@ pub(crate) struct ReviewList {
 pub(crate) struct ReviewPreview {
     pub moves: ReviewList,
     pub deletes: ReviewList,
+    pub stale_edits: ReviewList,
+    pub edit_after_days: u32,
     pub no_bin_drives: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ReviewSelection {
+    pub moves: bool,
+    pub deletes: bool,
+    pub stale_edits: bool,
 }
 
 #[derive(Serialize, Default)]
@@ -452,6 +491,7 @@ pub(crate) fn execute_quarantine_review(
     exif: State<'_, ExifState>,
     ai: State<'_, AiState>,
     confirmed_no_bin_drives: Vec<String>,
+    selection: ReviewSelection,
 ) -> Result<Outcome, String> {
     let result = {
         let _operation = manager.0.lock_operation()?;
@@ -460,6 +500,7 @@ pub(crate) fn execute_quarantine_review(
             &settings,
             &formats.0,
             Some(&exif.0),
+            selection,
             &confirmed_no_bin_drives,
             |done, total| progress(&app, "Spracúvam karanténu", done, total),
         )?
@@ -542,4 +583,49 @@ pub(crate) fn delete_from_quarantine(
     };
     ai.0.forget(result.purged.clone());
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn existing_preferences_default_to_ninety_days() {
+        let old = serde_json::json!({"folder":"","moveAfterDays":60,"deleteAfterDays":30,"manageFrom":"2024-06-01"});
+        let preferences: Preferences = serde_json::from_value(old).unwrap();
+        assert_eq!(preferences.edit_after_days, 90);
+    }
+
+    #[test]
+    fn stale_edits_are_due_at_the_cutoff_only_in_import_and_can_be_disabled() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT,is_listed INTEGER,ext_lower TEXT,
+            exif_date TEXT,incoming_seen_at INTEGER,quarantined_at INTEGER,edit_pending_since INTEGER,
+            rating INTEGER,label TEXT,tagged INTEGER);
+            CREATE TABLE asset_categories(asset_id INTEGER);").unwrap();
+        let root = std::env::temp_dir();
+        let mut settings = Settings::fixture(&root.join("import"), &root.join("quarantine"));
+        let at = 1_800_000_000;
+        let cutoff = at - 90 * DAY;
+        for (id, folder, pending, quarantined, listed) in [
+            (1, "import", Some(cutoff), None, 1),
+            (2, "import", Some(cutoff + 1), None, 1),
+            (3, "import-old", Some(cutoff - 1), None, 1),
+            (4, "import", Some(cutoff - 1), Some(at), 1),
+            (5, "import", Some(cutoff - 1), None, 0),
+            (6, "import", None, None, 1),
+        ] {
+            let path = root.join(folder).join(format!("{id}.jpg"));
+            db.execute("INSERT INTO assets(id,path,is_listed,ext_lower,exif_date,incoming_seen_at,quarantined_at,edit_pending_since)
+                VALUES(?1,?2,?3,'jpg','2020-01-01',?4,?5,?6)",
+                (id, path.to_string_lossy().as_ref(), listed, cutoff, quarantined, pending)).unwrap();
+        }
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let ids = |settings: &Settings, stage| due_candidates(&db, settings, &formats, stage, at, None)
+            .unwrap().into_iter().map(|photo| photo.id).collect::<Vec<_>>();
+        assert_eq!(ids(&settings, Stage::Move), vec![6]);
+        assert_eq!(ids(&settings, Stage::StaleEdit), vec![1]);
+        settings.preferences.edit_after_days = 0;
+        assert!(ids(&settings, Stage::StaleEdit).is_empty());
+    }
 }

@@ -118,6 +118,8 @@ pub struct Asset {
     pub display_keywords: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quarantined_at: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit_pending_since: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -282,6 +284,7 @@ fn map_asset(row: &rusqlite::Row<'_>, include_categories: bool, include_keywords
         display_categories: if include_categories { row.get(21)? } else { None },
         display_keywords: if include_keywords { row.get(if include_categories { 22 } else { 21 })? } else { None },
         quarantined_at: None,
+        edit_pending_since: row.get("edit_pending_since")?,
     })
 }
 
@@ -294,11 +297,14 @@ pub struct CategoryPath { pub id: i64, pub path: String }
 pub struct KeywordOption { pub id: i64, pub name: String, pub path: String }
 
 const ASSET_COLS: &str = "a.id,a.folder_id,a.name,a.ext,a.size,a.width,a.height,a.bpp,a.caption,a.notes,a.author,a.rating,a.tagged,a.label,a.file_modified,a.exif_date,a.acdsee_date,a.md_dirty,a.is_orphan,a.path,EXISTS(SELECT 1 FROM asset_categories acx WHERE acx.asset_id=a.id)";
-fn asset_cols(include_categories: bool, include_keywords: bool) -> String {
+fn asset_cols(conn: &Connection, include_categories: bool, include_keywords: bool) -> rusqlite::Result<String> {
     let mut columns = ASSET_COLS.to_owned();
     if include_categories { columns.push_str(", (SELECT group_concat(name, ', ') FROM (SELECT DISTINCT c.name AS name FROM asset_categories ac JOIN categories c ON c.id=ac.category_id WHERE ac.asset_id=a.id ORDER BY c.name COLLATE NOCASE))"); }
     if include_keywords { columns.push_str(", (SELECT group_concat(name, ', ') FROM (SELECT DISTINCT k.name AS name FROM asset_keywords ak JOIN keywords k ON k.id=ak.keyword_id WHERE ak.asset_id=a.id ORDER BY k.name COLLATE NOCASE))"); }
-    columns
+    columns.push_str(if crate::schema::has_asset_column(conn, "edit_pending_since")? {
+        ",a.edit_pending_since"
+    } else { ",NULL AS edit_pending_since" });
+    Ok(columns)
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -464,12 +470,14 @@ pub fn compare_assets(a: &Asset, b: &Asset, sort: &str, descending: bool) -> std
 }
 
 pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, String, Vec<Asset>)>> {
+    if ids.is_empty() { return Ok(Vec::new()); }
     let conn = db.lock().unwrap();
+    let cols = asset_cols(&conn, false, false)?;
     let mut result = Vec::new();
     for id in ids {
         let path: Option<String> = conn.query_row("SELECT path FROM folders WHERE id=?", [id], |r| r.get(0)).optional()?.flatten();
         let Some(path) = path else { continue };
-        let sql = format!("SELECT {ASSET_COLS} FROM assets a WHERE a.folder_id=? AND a.is_listed=1");
+        let sql = format!("SELECT {cols} FROM assets a WHERE a.folder_id=? AND a.is_listed=1");
         let mut stmt = conn.prepare(&sql)?;
         let assets = stmt.query_map([id], |row| map_asset(row, false, false))?.collect::<rusqlite::Result<Vec<_>>>()?;
         result.push((*id, path, assets));
@@ -570,6 +578,8 @@ fn catalog_asset_filter(conn: &Connection, filter: &AssetFilter, formats: &Forma
             "delete_suggested" if crate::incoming::has_deletion_column(conn)? => where_sql.push_str(" AND a.delete_suggestion=1"),
             "quarantine" if crate::schema::has_asset_column(conn, "quarantined_at")? =>
                 where_sql.push_str(" AND a.quarantined_at IS NOT NULL AND a.quarantine_origin IS NOT NULL"),
+            "edit_pending" if crate::schema::has_asset_column(conn, "edit_pending_since")? =>
+                where_sql.push_str(" AND a.edit_pending_since IS NOT NULL"),
             _ => where_sql.push_str(" AND 0"),
         },
         "quarantine_review" => {
@@ -614,7 +624,7 @@ pub(crate) fn catalog_ordered_ids(db: &Db, conn: &Connection, filter: &AssetFilt
         return collect_ordered_ids(conn, ai_asset_filter(filter, formats)?, "r.ord");
     }
     let CatalogAssetFilter { with_sql, from_sql, where_sql, args } = catalog_asset_filter(&conn, filter, formats)?;
-    let order = order_clause(&filter.sort, filter.descending);
+    let order = catalog_order(conn, filter)?;
     let cacheable = conn.is_autocommit() && !matches!(filter.kind.as_str(), "auto" | "color" | "quality")
         && !where_sql.contains("ai.") && !where_sql.contains("auto_exif.");
     let key = (Arc::as_ptr(db) as usize, with_sql.clone(), from_sql.clone(), where_sql.clone(), order.to_string(), args.clone());
@@ -655,6 +665,14 @@ pub(crate) fn catalog_ordered_ids(db: &Db, conn: &Connection, filter: &AssetFilt
     Ok((ids, total_size))
 }
 
+fn catalog_order(conn: &Connection, filter: &AssetFilter) -> rusqlite::Result<String> {
+    if filter.kind == "special" && filter.value.as_deref() == Some("edit_pending")
+        && crate::schema::has_asset_column(conn, "edit_pending_since")? {
+        return Ok("a.edit_pending_since ASC,a.id ASC".into());
+    }
+    Ok(order_clause(&filter.sort, filter.descending))
+}
+
 fn collect_ordered_ids(conn: &Connection, filter: CatalogAssetFilter, order: &str) -> rusqlite::Result<(Arc<Vec<i64>>, f64)> {
     let CatalogAssetFilter { with_sql, from_sql, where_sql, args } = filter;
     let sql = format!("{with_sql} SELECT a.id,a.size FROM {from_sql} WHERE {where_sql} ORDER BY {order}");
@@ -670,7 +688,7 @@ fn collect_ordered_ids(conn: &Connection, filter: CatalogAssetFilter, order: &st
 }
 
 pub(crate) fn hydrate_asset_ids(conn: &Connection, page_ids: &[i64], filter: &AssetFilter) -> rusqlite::Result<Vec<Asset>> {
-    let mut selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let mut selected_cols = asset_cols(conn, filter.include_categories, filter.include_keywords)?;
     let quarantine = filter.kind == "quarantine_review" || (filter.kind == "special" && filter.value.as_deref() == Some("quarantine"));
     let quarantine = quarantine && crate::schema::has_asset_column(conn, "quarantined_at")?;
     if quarantine { selected_cols.push_str(",a.quarantined_at"); }
@@ -714,7 +732,7 @@ fn ai_assets_page(db: &Db, filter: &AssetFilter, formats: &FormatTable) -> rusql
     let conn = db.lock().unwrap();
     let count_sql = format!("{with_sql} SELECT count(*),coalesce(sum(a.size),0) FROM {from_sql} WHERE {where_sql}");
     let (total,total_size):(i64,f64)=conn.query_row(&count_sql,rusqlite::params_from_iter(args.iter()),|row|Ok((row.get(0)?,row.get(1)?)))?;
-    let selected_cols = asset_cols(filter.include_categories, filter.include_keywords);
+    let selected_cols = asset_cols(&conn, filter.include_categories, filter.include_keywords)?;
     let sql = format!("{with_sql} SELECT {selected_cols} FROM {from_sql} WHERE {where_sql} ORDER BY r.ord LIMIT ? OFFSET ?");
     args.push(filter.limit.clamp(1,500).into());
     args.push(filter.offset.max(0).into());
@@ -753,7 +771,8 @@ pub fn asset_ids_page(
     if filter.kind=="ai"||filter.kind=="series"||filter.kind=="people"{let mut page_filter=filter.clone();page_filter.offset=offset;page_filter.limit=limit.clamp(1,500);return Ok(ai_assets_page(db,&page_filter,formats)?.items.into_iter().map(|asset|asset.id).collect());}
     let conn = db.lock().unwrap();
     let CatalogAssetFilter { with_sql, from_sql, where_sql, mut args } = catalog_asset_filter(&conn, filter, formats)?;
-    let sql = format!("{with_sql} SELECT a.id FROM {from_sql} WHERE {where_sql} ORDER BY {} LIMIT ? OFFSET ?", order_clause(&filter.sort, filter.descending));
+    let order = catalog_order(&conn, filter)?;
+    let sql = format!("{with_sql} SELECT a.id FROM {from_sql} WHERE {where_sql} ORDER BY {order} LIMIT ? OFFSET ?");
     args.push(limit.clamp(1, 500).into());
     args.push(offset.max(0).into());
     let mut stmt = conn.prepare(&sql)?;
@@ -1043,7 +1062,10 @@ pub fn values_page(
             let quarantine = if crate::schema::has_asset_column(&conn, "quarantined_at")? {
                 format!(" UNION ALL SELECT 'quarantine' FROM assets a WHERE is_listed=1 AND {hidden} AND a.quarantined_at IS NOT NULL AND a.quarantine_origin IS NOT NULL")
             } else { String::new() };
-            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0{suggested}{quarantine}) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
+            let edit_pending = if crate::schema::has_asset_column(&conn, "edit_pending_since")? {
+                format!(" UNION ALL SELECT 'edit_pending' FROM assets a WHERE is_listed=1 AND {hidden} AND a.edit_pending_since IS NOT NULL")
+            } else { String::new() };
+            let sql=format!("SELECT v,count(*) FROM (SELECT 'all_photos' v FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} UNION ALL SELECT 'uncategorized' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_categories ac WHERE ac.asset_id=a.id) UNION ALL SELECT 'unkeyworded' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND NOT EXISTS(SELECT 1 FROM asset_keywords ak WHERE ak.asset_id=a.id) UNION ALL SELECT 'tagged' FROM assets a WHERE is_listed=1 AND {hidden} AND {photos} AND coalesce(tagged,0)<>0{suggested}{quarantine}{edit_pending}) GROUP BY v ORDER BY v LIMIT ? OFFSET ?");
             let mut stmt=conn.prepare(&sql)?;
             return stmt.query_map(params![limit.clamp(1,500),offset.max(0)],|r|Ok(ValueCount{value:r.get(0)?,count:r.get(1)?}))?.collect();
         }
@@ -1061,9 +1083,10 @@ pub fn values_page(
 
 pub fn asset_metadata(db: &Db, id: i64) -> rusqlite::Result<Option<AssetMetadata>> {
     let conn = db.lock().unwrap();
+    let cols = asset_cols(&conn, false, false)?;
     let asset = conn
         .query_row(
-            &format!("SELECT {ASSET_COLS} FROM assets a WHERE a.id=?"),
+            &format!("SELECT {cols} FROM assets a WHERE a.id=?"),
             [id],
             |row| map_asset(row, false, false),
         )
@@ -1122,7 +1145,7 @@ pub fn keyword_options(db:&Db,query:&str)->rusqlite::Result<Vec<KeywordOption>>{
 mod feature_tests {
     use super::*;
     use std::cmp::Ordering;
-    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None} }
+    fn asset(id:i64,name:&str,size:Option<f64>,rating:Option<i64>)->Asset { Asset{id,folder_id:Some(1),name:name.into(),ext:"jpg".into(),size,width:Some(10),height:Some(10),bpp:None,caption:None,notes:None,author:None,rating,tagged:Some(0),label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:None,is_directory:false,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None,edit_pending_since:None} }
     #[test]
     fn filter_logic_supports_modes_and_groups() {
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();

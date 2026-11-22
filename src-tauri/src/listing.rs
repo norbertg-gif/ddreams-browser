@@ -143,7 +143,7 @@ impl ListingService {
                 id: self.id(), folder_id: if is_dir { matched_folder } else { parent_folder_id }, name: name.clone(), ext: ext.clone(), size: None,
                 width: None, height: None, bpp: None, caption: None, notes: None, author: None, rating: None, tagged: None,
                 label: None, file_modified: None, exif_date: None, acdsee_date: None, md_dirty: None, is_orphan: None,
-                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, missing: false, has_categories: false, display_categories: None, display_keywords: None, quarantined_at: None,
+                path: Some(full.to_string_lossy().to_string()), is_directory: is_dir, offline: false, missing: false, has_categories: false, display_categories: None, display_keywords: None, quarantined_at: None, edit_pending_since: None,
             });
             asset.name = name;
             asset.ext = ext;
@@ -175,11 +175,10 @@ impl ListingService {
         Ok((path, ids))
     }
 
-    /// The folder's disk path and its files that are not in the catalogue yet (negative listing ids).
-    pub fn uncatalogued_files(&self, filter: &AssetFilter) -> Result<(String, Vec<Asset>), String> {
+    pub(crate) fn listed_folder(&self, filter: &AssetFilter) -> Result<(String, Arc<Vec<Asset>>), String> {
         let (path, ids) = self.folder_of_filter(filter)?;
         let (rows, _) = self.list(&path, &ids);
-        Ok((path, rows.iter().filter(|a| !a.is_directory && a.id < 0 && !a.ext.is_empty() && a.path.is_some()).cloned().collect()))
+        Ok((path, rows))
     }
 
     pub(crate) fn ordered_rows(&self, filter: &AssetFilter) -> Result<(Arc<Vec<Asset>>, f64), String> {
@@ -245,7 +244,7 @@ impl ListingService {
         let parent=if let Some(parent_path)=parent_path.filter(|p|!p.is_empty()&&normalize(p)!=key){self.resolve_folder(&parent_path)?}else{None};
         let name=path_buf.file_name().map(|n|n.to_string_lossy().to_string()).unwrap_or_else(||path.to_string());
         let id=self.id(); let parent_id=parent.as_ref().map(|p|p.id); let root_id=parent.as_ref().and_then(|p|p.root_id);
-        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None};
+        let asset=Asset{id,folder_id:None,name:name.clone(),ext:String::new(),size:Some(0.0),width:None,height:None,bpp:None,caption:None,notes:None,author:None,rating:None,tagged:None,label:None,file_modified:None,exif_date:None,acdsee_date:None,md_dirty:None,is_orphan:None,path:Some(path_buf.to_string_lossy().to_string()),is_directory:true,offline:false,missing:false,has_categories:false,display_categories:None,display_keywords:None,quarantined_at:None,edit_pending_since:None};
         self.temporary.lock().map_err(|_|"entry map poisoned")?.insert(asset, parent_id);
         Ok(Some(db::Folder{id,parent_id,root_id,name,path:Some(path_buf.to_string_lossy().to_string()),count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}))
     }

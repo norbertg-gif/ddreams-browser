@@ -175,6 +175,10 @@ export default function SettingsDialog({ onClose, incomingFolder, onIncomingFold
               <input type="number" min="0" max="4294967295" required value={Number.isNaN(quarantine.deleteAfterDays) ? "" : quarantine.deleteAfterDays}
                 onChange={event => setQuarantine({ ...quarantine, deleteAfterDays: event.target.valueAsNumber })} />
             </label>
+            <label>Na úpravu: po koľkých dňoch ponúknuť do karantény
+              <input type="number" min="0" max="4294967295" required value={Number.isNaN(quarantine.editAfterDays) ? "" : quarantine.editAfterDays}
+                onChange={event => setQuarantine({ ...quarantine, editAfterDays: event.target.valueAsNumber })} />
+            </label>
             <label>Spravovať len fotky nasnímané od (dátum)
               <input type="date" required value={quarantine.manageFrom}
                 onChange={event => setQuarantine({ ...quarantine, manageFrom: event.target.value })} />

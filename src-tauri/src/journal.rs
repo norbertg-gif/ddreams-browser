@@ -36,7 +36,7 @@ pub struct AssetIdRemap { pub old_id: i64, pub new_id: i64 }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AssetValueState { pub id: i64, pub rating: Option<i64>, pub label: Option<String>, pub tagged: bool }
+pub struct AssetValueState { pub id: i64, pub rating: Option<i64>, pub label: Option<String>, pub tagged: bool, pub edit_pending_since: Option<i64> }
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -177,13 +177,14 @@ impl CatalogWriter {
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
         let mut folder_paths=load_folder_paths(&tx)?;let mut folder_roots=load_folder_roots(&tx)?;
         let mut remaps=Vec::new();
+        let has_edit_pending = crate::schema::has_asset_column(&tx, "edit_pending_since").map_err(|e| e.to_string())?;
         for candidate in listed {
             if candidate.ext.trim().is_empty() || find_asset_by_path(&tx,&candidate.path)?.is_some() { continue; }
             let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots)?;
             let id=next_id(&tx,"assets")?;
             insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false})?;
             self.track_incoming(&tx, id, &candidate.path)?;
-
+            if has_edit_pending { fulfil_edit_with_sibling(&tx, folder_id, candidate)?; }
             remaps.push(AssetIdRemap{old_id:candidate.temporary_id,new_id:id});
         }
         if remaps.is_empty() { return Ok(remaps); }
@@ -191,6 +192,28 @@ impl CatalogWriter {
         record_change(&tx, "auto_catalog", &summary)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(remaps)
+    }
+
+    pub(crate) fn fulfil_edits_from_listing(&self, assets: &[crate::db::Asset]) -> Result<usize, String> {
+        if !self.writable { return Ok(0); }
+        let mut modified = assets.iter().filter_map(|asset| {
+            (asset.id > 0 && !asset.is_directory && !asset.offline && asset.edit_pending_since.is_some())
+                .then_some(asset.file_modified.as_deref()).flatten().map(|mtime| (asset.id, mtime))
+        }).peekable();
+        if modified.peek().is_none() { return Ok(0); }
+        let mut conn = self.db.lock().map_err(|e| e.to_string())?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let mut count = 0;
+        {
+            let mut update = tx.prepare("UPDATE assets SET edit_pending_since=NULL
+                WHERE id=?1 AND is_listed=1 AND unixepoch(?2)>edit_pending_since+?3").map_err(|e| e.to_string())?;
+            for (id, mtime) in modified {
+                count += update.execute((id, mtime, crate::quarantine::EDIT_MTIME_GRACE)).map_err(|e| e.to_string())?;
+            }
+        }
+        if count > 0 { record_change(&tx, "fulfil_pending_edits", &format!("Úpravy zistené v súboroch · {count}"))?; }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(count)
     }
 
     /// How much catalogue data lives under `path` (shown before excluding the folder).
@@ -297,9 +320,28 @@ impl CatalogWriter {
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         self.rules.guard(&tx, asset_ids, listed_assets)?;
-        let (mut targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, true, true, |tx, id, path| self.track_incoming(tx, id, path))?;
+        let insert_missing = updates.edit_pending != Some(false) || updates.rating.is_some()
+            || updates.label.is_some() || updates.tagged.is_some() || updates.tagged_toggle;
+        let (mut targets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed_assets, insert_missing, true, |tx, id, path| self.track_incoming(tx, id, path))?;
         if targets.is_empty() { return Err("No files were selected".into()); }
         let toggle_tagged_to = if updates.tagged_toggle { Some(targets.iter().any(|asset| !asset.tagged)) } else { updates.tagged };
+        let mut pending_to = updates.edit_pending;
+        let mut pending_targets = HashMap::new();
+        if updates.edit_pending_toggle || pending_to.is_some() {
+            let mut stmt = tx.prepare("SELECT edit_pending_since FROM assets WHERE id=?1 AND quarantined_at IS NULL")
+                .map_err(|e| e.to_string())?;
+            for target in &targets {
+                if let Some(since) = stmt.query_row([target.id], |r| r.get::<_, Option<i64>>(0))
+                    .optional().map_err(|e| e.to_string())? {
+                    pending_targets.insert(target.id, since);
+                }
+            }
+            if pending_targets.is_empty() && updates.rating.is_none() && updates.label.is_none() && toggle_tagged_to.is_none() {
+                return Err("Vyberte súbory mimo karantény".into());
+            }
+            if updates.edit_pending_toggle { pending_to = Some(pending_targets.values().any(Option::is_none)); }
+        }
+        let marked_at = pending_to.filter(|pending| *pending).map(|_| crate::quarantine::now());
         let mut changed = inserted > 0;
         for target in &mut targets {
             if let Some(rating) = updates.rating {
@@ -314,9 +356,15 @@ impl CatalogWriter {
                 changed |= update_column(&tx, "assets", target.id, "tagged", i64::from(tagged))?;
                 target.tagged = tagged;
             }
+            if let Some(&since) = pending_targets.get(&target.id) {
+                let next = marked_at.map(|now| since.unwrap_or(now));
+                changed |= update_column(&tx, "assets", target.id, "edit_pending_since", next)?;
+                target.edit_pending_since = next;
+            }
         }
 
-        let action_parts = update_summary_parts(&updates, toggle_tagged_to);
+        let mut action_parts = update_summary_parts(&updates, toggle_tagged_to);
+        if let Some(pending) = pending_to { action_parts.push(if pending { "Na úpravu" } else { "Hotovo" }.into()); }
         let file_word = slovak_count(targets.len(), "súbor", "súbory", "súborov");
         let summary = format!("{} · {} {}", action_parts.join(" · "), targets.len(), file_word);
         let change_id = if changed { record_change(&tx, "set_asset_values", &summary)? } else { None };
@@ -569,7 +617,7 @@ impl CatalogWriter {
             };
             self.track_incoming(&tx, id, &item.target_path)?;
             if let Some((source, entering)) = quarantine {
-                tx.execute("UPDATE assets SET quarantined_at=?2,quarantine_origin=?3,delete_suggestion=0 WHERE id=?1",
+                tx.execute("UPDATE assets SET quarantined_at=?2,quarantine_origin=?3,delete_suggestion=0,edit_pending_since=NULL WHERE id=?1",
                     (id, entering.then(crate::quarantine::now), entering.then_some(source))).map_err(|e| e.to_string())?;
             }
         }
@@ -758,10 +806,12 @@ struct AssetUpdates {
     label: Option<Option<String>>,
     tagged: Option<bool>,
     tagged_toggle: bool,
+    edit_pending: Option<bool>,
+    edit_pending_toggle: bool,
 }
 
 impl AssetUpdates {
-    fn is_empty(&self) -> bool { self.rating.is_none() && self.label.is_none() && self.tagged.is_none() && !self.tagged_toggle }
+    fn is_empty(&self) -> bool { self.rating.is_none() && self.label.is_none() && self.tagged.is_none() && !self.tagged_toggle && self.edit_pending.is_none() && !self.edit_pending_toggle }
 }
 
 struct NewCatalogAsset {
@@ -797,6 +847,8 @@ fn parse_asset_updates(values: &serde_json::Map<String, Value>) -> Result<AssetU
             }
             "tagged" if value.as_str() == Some("toggle") => result.tagged_toggle = true,
             "tagged" => result.tagged = Some(value.as_bool().ok_or("Tagged state must be true, false, or 'toggle'")?),
+            "editPending" if value.as_str() == Some("toggle") => result.edit_pending_toggle = true,
+            "editPending" => result.edit_pending = Some(value.as_bool().ok_or("Neplatný stav úpravy")?),
             _ => return Err(format!("Unsupported asset value: {key}")),
         }
     }
@@ -824,7 +876,7 @@ fn read_asset_values(transaction: &Transaction<'_>, id: i64) -> Result<Option<As
     transaction.query_row("SELECT id,rating,label,coalesce(tagged,0),ext_lower,is_listed FROM assets WHERE id=?1", [id], |row| {
         let id = row.get(0)?; let rating = row.get(1)?; let label = row.get(2)?; let tagged = row.get::<_, i64>(3)? != 0;
         let ext: String = row.get(4)?; let listed: i64 = row.get(5)?;
-        Ok((ext, listed, AssetValueState { id, rating, label, tagged }))
+        Ok((ext, listed, AssetValueState { id, rating, label, tagged, edit_pending_since: None }))
     }).optional().map_err(|e| e.to_string()).map(|row| row.filter(|(ext,listed,_)| !ext.is_empty() && *listed != 0).map(|(_,_,state)| state))
 }
 
@@ -908,6 +960,26 @@ fn track_incoming(tx: &Transaction<'_>, id: i64, path: &str, folder: &str) -> Re
     Ok(())
 }
 
+fn fulfil_edit_with_sibling(tx: &Transaction<'_>, folder_id: i64, candidate: &ListedAsset) -> Result<(), String> {
+    let Some(modified) = candidate.file_modified.as_deref() else { return Ok(()); };
+    let Some(stem) = Path::new(&candidate.name).file_stem() else { return Ok(()); };
+    let stem = stem.to_string_lossy().to_lowercase();
+    let mut select = tx.prepare_cached("SELECT id,name,ext_lower FROM assets
+        WHERE folder_id=?1 AND is_listed=1 AND edit_pending_since IS NOT NULL AND edit_pending_since<unixepoch(?2)")
+        .map_err(|e| e.to_string())?;
+    let matches = select.query_map((folder_id, modified), |r| {
+        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+    }).map_err(|e| e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    let mut clear = tx.prepare_cached("UPDATE assets SET edit_pending_since=NULL WHERE id=?1").map_err(|e| e.to_string())?;
+    for (id, name, ext) in matches {
+        if !ext.is_empty() && !ext.eq_ignore_ascii_case(&candidate.ext)
+            && Path::new(&name).file_stem().is_some_and(|name| name.to_string_lossy().to_lowercase() == stem) {
+            clear.execute([id]).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(())
+}
+
 fn reconcile_incoming(tx: &Transaction<'_>, root: &str, scanned_folder: Option<&str>) -> Result<(), String> {
     let available = Path::new(root).is_dir();
     let now = crate::quarantine::now();
@@ -917,9 +989,11 @@ fn reconcile_incoming(tx: &Transaction<'_>, root: &str, scanned_folder: Option<&
         "(incoming_seen_at IS NOT NULL OR (is_listed=1 AND path IS NOT NULL))"
     };
     let mut select = tx.prepare(&format!(
-        "SELECT id,coalesce(path,''),incoming_seen_at,is_listed=1 FROM assets WHERE {filter} ORDER BY id"
+        "SELECT id,coalesce(path,''),incoming_seen_at,is_listed=1,edit_pending_since FROM assets WHERE {filter} ORDER BY id"
     )).map_err(|e| e.to_string())?;
     let mut update = tx.prepare("UPDATE assets SET incoming_seen_at=?2 WHERE id=?1").map_err(|e| e.to_string())?;
+    let mut clear = tx.prepare("UPDATE assets SET edit_pending_since=NULL WHERE id=?1").map_err(|e| e.to_string())?;
+    let mut fulfilled = 0;
     if let Some(folder) = scanned_folder {
         select.raw_bind_parameter(1, normalize_fs_path(folder)).map_err(|e| e.to_string())?;
     }
@@ -929,13 +1003,20 @@ fn reconcile_incoming(tx: &Transaction<'_>, root: &str, scanned_folder: Option<&
         let path: String = row.get(1).map_err(|e| e.to_string())?;
         let seen: Option<i64> = row.get(2).map_err(|e| e.to_string())?;
         let listed: Option<bool> = row.get(3).map_err(|e| e.to_string())?;
+        let pending: Option<i64> = row.get(4).map_err(|e| e.to_string())?;
         let next = if listed != Some(true) || !crate::incoming::is_inside(&path, root) {
             None
         } else if !available {
             seen
         } else {
             match std::fs::metadata(&path) {
-                Ok(info) if info.is_file() => seen.or(Some(now)),
+                Ok(info) if info.is_file() => {
+                    if scanned_folder.is_none() && pending.is_some_and(|since| info.modified().ok()
+                        .is_some_and(|mtime| crate::quarantine::modified_after_mark(mtime, since))) {
+                        fulfilled += clear.execute([id]).map_err(|e| e.to_string())?;
+                    }
+                    seen.or(Some(now))
+                }
                 Ok(_) => None,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(_) => seen,
@@ -943,6 +1024,7 @@ fn reconcile_incoming(tx: &Transaction<'_>, root: &str, scanned_folder: Option<&
         };
         if next != seen { update.execute((id, next)).map_err(|e| e.to_string())?; }
     }
+    if fulfilled > 0 { record_change(tx, "fulfil_pending_edits", &format!("Úpravy zistené v súboroch · {fulfilled}"))?; }
     Ok(())
 }
 
