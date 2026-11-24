@@ -260,6 +260,7 @@ pub fn run() {
             commands::get_exclusion_impact,
             commands::set_folder_rule,
             commands::refresh_folder_listing,
+            commands::check_folder_changed,
             commands::get_asset_paths,
             commands::asset_action,commands::startup_mark,commands::open_in_editor,commands::get_editors,commands::set_editors,commands::detect_photoshop,commands::pick_editor_program,commands::program_exists,
             commands::get_asset_ids,

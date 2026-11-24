@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent as ReactMouseEvent, type WheelEvent as ReactWheelEvent } from "react";
 import Filmstrip from "./components/Filmstrip";
 import { launchEditor, useEditors, type Editor } from "./editors";
 import { invoke } from "@tauri-apps/api/core";
@@ -283,6 +283,39 @@ export default function App() {
     viewportView.current = view;
     updateViewport();
   }, [view, updateViewport]);
+  const watchedFolderId = view.kind === "folder" ? view.id : null;
+  const watchedFolder = useRef<{ id: number; path?: string } | null>(null);
+  useLayoutEffect(() => {
+    watchedFolder.current = watchedFolderId == null ? null : { id: watchedFolderId, path: view.folderPath };
+    return () => { watchedFolder.current = null; };
+  }, [watchedFolderId, view.folderPath]);
+  useEffect(() => {
+    let pending = false;
+    const check = async () => {
+      const folder = watchedFolder.current;
+      if (!folder || pending || document.visibilityState !== "visible") return;
+      pending = true;
+      try {
+        const changed = await invoke<boolean>("check_folder_changed", { folderId: folder.id });
+        const current = watchedFolder.current;
+        if (changed && current?.id === folder.id && current.path === folder.path) {
+          await grid.current?.reloadListing();
+        }
+      } catch (error) {
+        console.warn("Kontrola zmien priečinka zlyhala", error);
+      } finally {
+        pending = false;
+      }
+    };
+    const interval = window.setInterval(check, 3000);
+    window.addEventListener("focus", check);
+    document.addEventListener("visibilitychange", check);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", check);
+      document.removeEventListener("visibilitychange", check);
+    };
+  }, []);
   const up = useCallback(async()=>{if(view.kind!=="folder")return;const p=view.folderPath??view.title;const parts=p.split(/[\\/]/).filter(Boolean);if(parts.length<=1)return;parts.pop();let parent=parts.join("\\");if(/^[A-Za-z]:$/.test(parent))parent+="\\";const f=await invoke<Folder|null>("find_folder_path",{path:parent}).catch(()=>null);if(f)navigate({kind:"folder",id:f.id,ids:f.folderIds,title:f.path??f.name,folderPath:f.path??undefined});},[view,navigate]);
   const refresh = useCallback(()=>{if(view.kind==="folder"&&view.id!=null)void invoke("refresh_folder_listing",{folderId:view.id});setRefreshTick(v=>v+1);setTreeRefreshPaths([]);setTreeRefreshTick(v=>v+1);updateViewport();},[view,updateViewport]);
   const loadRecentChanges=useCallback(()=>{void invoke<RecentChange[]>("get_recent_changes",{limit:20}).then(setRecentChanges).catch(()=>setRecentChanges([]));},[]);

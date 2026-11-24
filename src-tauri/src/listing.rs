@@ -1,5 +1,5 @@
 use crate::{db::{self, Asset, AssetFilter, AssetPage, Db}, formats::FormatTable};
-use std::{collections::{BTreeMap, HashMap}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}, mpsc}, time::Duration};
+use std::{collections::{BTreeMap, HashMap, HashSet, hash_map::DefaultHasher}, hash::{Hash, Hasher}, path::{Path, PathBuf}, sync::{Arc, atomic::{AtomicI64, AtomicU64, Ordering}, mpsc}, time::{Duration, Instant}};
 
 const LIST_TIMEOUT: Duration = Duration::from_secs(2);
 const OFFLINE_RETRY: Duration = Duration::from_secs(8);
@@ -11,22 +11,26 @@ const MAX_TEMPORARY_ENTRIES: usize = 125_000;
 struct TemporaryEntries {
     entries: BTreeMap<i64, Asset>,
     parents: HashMap<i64, i64>,
-    paths: HashMap<String, i64>,
+    paths: HashMap<(String, bool), i64>,
 }
 
 impl TemporaryEntries {
+    fn path_key(path: &str, is_directory: bool) -> (String, bool) {
+        (if is_directory { normalize(path) } else { path.to_owned() }, is_directory)
+    }
+
     fn insert(&mut self, asset: Asset, parent: Option<i64>) {
         let id = asset.id;
         if asset.is_directory {
             if let Some(parent) = parent { self.parents.insert(id, parent); }
-            if let Some(path) = asset.path.as_deref() { self.paths.insert(normalize(path), id); }
         }
+        if let Some(path) = asset.path.as_deref() { self.paths.insert(Self::path_key(path, asset.is_directory), id); }
         self.entries.insert(id, asset);
         while self.entries.len() > MAX_TEMPORARY_ENTRIES {
             let Some((id, entry)) = self.entries.pop_last() else { break };
             self.parents.remove(&id);
-            if let Some(path) = entry.path.as_deref().filter(|_| entry.is_directory) {
-                let key = normalize(path);
+            if let Some(path) = entry.path.as_deref() {
+                let key = Self::path_key(path, entry.is_directory);
                 if self.paths.get(&key) == Some(&id) { self.paths.remove(&key); }
             }
         }
@@ -37,10 +41,34 @@ pub struct ListingService {
     db: Db,
     formats: std::sync::Arc<FormatTable>,
     temporary: std::sync::Mutex<TemporaryEntries>,
-    listings: std::sync::Mutex<HashMap<String, (std::time::Instant, Arc<Vec<Asset>>)>>,
+    listings: std::sync::Mutex<HashMap<String, CachedListing>>,
+    checking: std::sync::Mutex<HashSet<String>>,
     prepared: std::sync::Mutex<Option<PreparedListing>>,
     next_id: AtomicI64,
     revision: AtomicU64,
+}
+
+struct CachedListing {
+    when: Instant,
+    rows: Arc<Vec<Asset>>,
+    signature: Option<DirectorySignature>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DirectorySignature {
+    count: usize,
+    hash: u64,
+}
+
+struct FolderCheck {
+    service: Arc<ListingService>,
+    key: String,
+}
+
+impl Drop for FolderCheck {
+    fn drop(&mut self) {
+        if let Ok(mut checking) = self.service.checking.lock() { checking.remove(&self.key); }
+    }
 }
 
 struct PreparedListing {
@@ -52,15 +80,63 @@ struct PreparedListing {
 
 impl ListingService {
     pub fn new(db: Db, formats: std::sync::Arc<FormatTable>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db, formats, temporary: std::sync::Mutex::new(TemporaryEntries::default()), listings: std::sync::Mutex::new(HashMap::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000), revision: AtomicU64::new(0) })
+        std::sync::Arc::new(Self { db, formats, temporary: std::sync::Mutex::new(TemporaryEntries::default()), listings: std::sync::Mutex::new(HashMap::new()), checking: std::sync::Mutex::new(HashSet::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000), revision: AtomicU64::new(0) })
     }
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
 
+    fn folder_path(&self, folder_id: i64) -> Option<String> {
+        self.asset(folder_id).and_then(|a| a.path).or_else(|| {
+            // The ancestor query also counts catalogued assets, which a path lookup does not need.
+            self.db.lock().ok()?.query_row("SELECT path FROM folders WHERE id=?1", [folder_id], |row| row.get(0))
+                .ok().flatten()
+        })
+    }
+
     pub fn invalidate(&self, folder_id: i64) -> Result<(), String> {
-        let path = self.asset(folder_id).and_then(|a| a.path).or_else(|| db::folder_ancestors(&self.db, folder_id).ok()?.last()?.path.clone()).ok_or("folder path unavailable")?;
-        self.invalidate_path(&path)?;
-        Ok(())
+        self.invalidate_path(&self.folder_path(folder_id).ok_or("folder path unavailable")?)
+    }
+
+    pub fn check_folder_changed(self: &Arc<Self>, folder_id: i64) -> bool {
+        let Some(path) = self.folder_path(folder_id) else { return false };
+        let key = normalize(&path);
+        let (signature, source) = {
+            let Ok(cache) = self.listings.lock() else { return false };
+            let Some(cached) = cache.get(&key) else { return false };
+            let Some(signature) = cached.signature else { return false };
+            (signature, cached.rows.clone())
+        };
+        {
+            let Ok(mut checking) = self.checking.lock() else { return false };
+            if !checking.insert(key.clone()) { return false; }
+        }
+
+        let (tx, rx) = mpsc::sync_channel(1);
+        let check = Arc::new(FolderCheck { service: self.clone(), key: key.clone() });
+        // Both the caller and worker hold the marker through completion, including a timeout.
+        let worker = check.clone();
+        if std::thread::Builder::new().spawn(move || {
+            let result = read_directory(Path::new(&path), &worker.service.formats, false);
+            drop(worker);
+            let _ = tx.send(result);
+        }).is_err() {
+            return false;
+        }
+        let Ok(Ok((current, _))) = rx.recv_timeout(LIST_TIMEOUT) else { return false };
+        if current == signature { return false; }
+
+        let Ok(mut cache) = self.listings.lock() else { return false };
+        // F5 or another write may have replaced this listing while the check ran.
+        if !cache.get(&key).is_some_and(|cached| Arc::ptr_eq(&cached.rows, &source)) { return false; }
+        cache.remove(&key);
+        drop(cache);
+        if let Ok(mut prepared) = self.prepared.lock() {
+            if prepared.as_ref().is_some_and(|listing| Arc::ptr_eq(&listing.source, &source)) {
+                *prepared = None;
+            }
+        }
+        self.revision.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     pub(crate) fn revision(&self) -> u64 { self.revision.load(Ordering::Relaxed) }
@@ -81,46 +157,39 @@ impl ListingService {
         self.invalidate_path(&parent)
     }
 
-    fn remember_listing(&self, key: String, rows: Arc<Vec<Asset>>) {
+    fn remember_listing(&self, key: String, rows: Arc<Vec<Asset>>, signature: Option<DirectorySignature>) {
         if let Ok(mut cache) = self.listings.lock() {
             cache.remove(&key);
-            let mut count = rows.len() + cache.values().map(|(_, rows)| rows.len()).sum::<usize>();
+            let mut count = rows.len() + cache.values().map(|cached| cached.rows.len()).sum::<usize>();
             while !cache.is_empty() && (cache.len() >= MAX_LISTINGS || count > MAX_LISTING_ROWS) {
-                let oldest = cache.iter().min_by_key(|(_, (when, _))| *when).map(|(key, _)| key.clone()).unwrap();
-                if let Some((_, old)) = cache.remove(&oldest) { count -= old.len(); }
+                let oldest = cache.iter().min_by_key(|(_, cached)| cached.when).map(|(key, _)| key.clone()).unwrap();
+                if let Some(old) = cache.remove(&oldest) { count -= old.rows.len(); }
             }
-            cache.insert(key, (std::time::Instant::now(), rows));
+            cache.insert(key, CachedListing { when: Instant::now(), rows, signature });
         }
     }
 
     fn list(&self, path: &str, folder_ids: &[i64]) -> (Arc<Vec<Asset>>, bool) {
         let key = normalize(path);
         if let Ok(cache) = self.listings.lock() {
-            if let Some((when, rows)) = cache.get(&key) {
-                if !rows.iter().any(|a| a.offline) || when.elapsed() < OFFLINE_RETRY { return (rows.clone(), rows.iter().any(|a| a.offline)); }
+            if let Some(cached) = cache.get(&key) {
+                let offline = cached.signature.is_none();
+                if !offline || cached.when.elapsed() < OFFLINE_RETRY { return (cached.rows.clone(), offline); }
             }
         }
         let (tx, rx) = mpsc::sync_channel(1);
         let root = PathBuf::from(path);
         let formats = self.formats.clone();
         std::thread::spawn(move || {
-            let result = std::fs::read_dir(&root).map(|items| {
-                items.filter_map(Result::ok).filter_map(|entry| {
-                    let p = entry.path(); let name = entry.file_name().to_string_lossy().to_string();
-                    let meta = entry.metadata().ok()?;
-                    if hidden_or_ignored(&name, &meta, &formats) { return None; }
-                    Some((p, name, meta))
-                }).collect::<Vec<_>>()
-            });
-            let _ = tx.send(result);
+            let _ = tx.send(read_directory(&root, &formats, true));
         });
-        let disk = match rx.recv_timeout(LIST_TIMEOUT) { Ok(Ok(v)) => v, _ => {
+        let (signature, disk) = match rx.recv_timeout(LIST_TIMEOUT) { Ok(Ok(v)) => v, _ => {
             let mut rows = Vec::new();
             if let Ok(context) = db::folder_disk_context(&self.db, folder_ids) {
                 for (_, _, assets) in context { rows.extend(assets.into_iter().filter(|a| !a.ext.is_empty() && !self.formats.is_hidden(&a.ext)).map(|mut a| { a.offline = true; a })); }
             }
             let rows = Arc::new(rows);
-            self.remember_listing(key, rows.clone());
+            self.remember_listing(key, rows.clone(), None);
             return (rows, true);
         }};
         let parent_folder_id = db::folder_by_path(&self.db, path).ok().flatten().map(|folder| folder.id)
@@ -153,13 +222,18 @@ impl ListingService {
             asset.is_directory = is_dir;
             asset.offline = false;
             if asset.id <= -10_000_000 {
-                if let Ok(mut entries) = self.temporary.lock() { entries.insert(asset.clone(), folder_ids.first().copied()); }
+                if let Ok(mut entries) = self.temporary.lock() {
+                    if let Some(path) = &asset.path {
+                        if let Some(id) = entries.paths.get(&TemporaryEntries::path_key(path, is_dir)) { asset.id = *id; }
+                    }
+                    entries.insert(asset.clone(), folder_ids.first().copied());
+                }
             }
             rows.push(asset);
         }
         rows.sort_by(|a,b| a.is_directory.cmp(&b.is_directory).reverse().then_with(||a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.id.cmp(&b.id)));
         let rows = Arc::new(rows);
-        self.remember_listing(key, rows.clone());
+        self.remember_listing(key, rows.clone(), Some(signature));
         (rows, false)
     }
 
@@ -226,7 +300,7 @@ impl ListingService {
     pub fn asset(&self, id: i64) -> Option<Asset> { {
         if let Some(asset) = self.temporary.lock().ok()?.entries.get(&id).cloned() { return Some(asset); }
         if id > -10_000_000 { return None; }
-        self.listings.lock().ok()?.values().find_map(|(_, rows)| rows.iter().find(|a| a.id == id).cloned())
+        self.listings.lock().ok()?.values().find_map(|cached| cached.rows.iter().find(|a| a.id == id).cloned())
     } }
     #[cfg(test)]
     pub fn insert_test_asset(&self, asset:Asset){if let Ok(mut entries)=self.temporary.lock(){entries.insert(asset,None);}}
@@ -236,7 +310,7 @@ impl ListingService {
         let path_buf=PathBuf::from(path);
         if !path_buf.is_dir(){return Ok(None)}
         let key=normalize(path);
-        let cached_id = self.temporary.lock().map_err(|_|"path map poisoned")?.paths.get(&key).copied();
+        let cached_id = self.temporary.lock().map_err(|_|"path map poisoned")?.paths.get(&(key.clone(), true)).copied();
         if let Some(id)=cached_id{
             if let Some(asset)=self.asset(id){let parent=self.temporary.lock().ok().and_then(|p|p.parents.get(&id).copied());return Ok(Some(db::Folder{id,parent_id:parent,root_id:parent.and_then(|p|self.asset(p)).and_then(|a|a.folder_id).or_else(||parent.and_then(|p|db::folder_ancestors(&self.db,p).ok()?.last()?.root_id)),name:asset.name,path:asset.path,count:0,folder_ids:vec![id],virtual_node:None,offline:false,missing:false}));}
         }
@@ -276,7 +350,7 @@ mod listing_cache_tests {
         let service = ListingService::new(db, FormatTable::load_selected(None));
         let path = "C:\\photos";
         let source = Arc::new(vec![asset(-1,"folder",true,0.0), asset(-2,"b.jpg",false,20.0), asset(-3,"a.jpg",false,10.0)]);
-        service.listings.lock().unwrap().insert(normalize(path), (std::time::Instant::now(), source));
+        service.remember_listing(normalize(path), source, Some(DirectorySignature::default()));
         let mut filter: AssetFilter = serde_json::from_value(serde_json::json!({"kind":"folder","folderPath":path,"sort":"name","descending":false,"offset":0,"limit":2})).unwrap();
         let first = service.page(&filter).unwrap();
         assert_eq!(first.items.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), ["folder", "a.jpg"]);
@@ -292,11 +366,121 @@ mod listing_cache_tests {
         assert!(!Arc::ptr_eq(&prepared, &service.prepared.lock().unwrap().as_ref().unwrap().rows));
         service.invalidate_path(path).unwrap();
         assert!(service.prepared.lock().unwrap().is_none());
-        service.listings.lock().unwrap().insert(normalize(path), (std::time::Instant::now(), Arc::new(vec![asset(-4,"new.jpg",false,7.0)])));
+        service.remember_listing(normalize(path), Arc::new(vec![asset(-4,"new.jpg",false,7.0)]), Some(DirectorySignature::default()));
         filter.query = None;
         let refreshed = service.page(&filter).unwrap();
         assert_eq!((refreshed.total, refreshed.total_size, refreshed.items[0].name.as_str()), (1, 7.0, "new.jpg"));
     }
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new() -> Self {
+            let unique = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let path = std::env::temp_dir().join(format!("ddreams-listing-{}-{unique}", std::process::id()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) { let _ = std::fs::remove_dir_all(&self.0); }
+    }
+
+    #[test]
+    fn directory_signature_tracks_visible_entry_changes() {
+        let dir = TempDir::new();
+        let formats = FormatTable::load_selected(None);
+        let signature = || read_directory(&dir.0, &formats, false).unwrap().0;
+        let empty = signature();
+        assert_eq!(signature(), empty);
+        std::fs::write(dir.0.join(".ignored.jpg"), b"ignored").unwrap();
+        assert_eq!(signature(), empty);
+
+        let file = dir.0.join("photo.jpg");
+        std::fs::write(&file, b"a").unwrap();
+        let added = signature();
+        assert_ne!(added, empty);
+        assert_eq!(signature(), added);
+        assert_eq!(read_directory(&dir.0, &formats, true).unwrap().0, added);
+        std::fs::OpenOptions::new().write(true).open(&file).unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)).unwrap();
+        let modified = signature();
+        assert_ne!(modified, added);
+        std::fs::write(&file, b"larger").unwrap();
+        std::fs::OpenOptions::new().write(true).open(&file).unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000)).unwrap();
+        let resized = signature();
+        assert_ne!(resized, modified);
+        let renamed = dir.0.join("renamed.jpg");
+        std::fs::rename(file, &renamed).unwrap();
+        assert_ne!(signature(), resized);
+        std::fs::remove_file(renamed).unwrap();
+        assert_eq!(signature(), empty);
+    }
+
+    #[test]
+    fn folder_check_requires_online_cache_and_keeps_existing_file_ids() {
+        let dir = TempDir::new();
+        let db = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
+        let service = ListingService::new(db, FormatTable::load_selected(None));
+        let path = dir.0.to_str().unwrap();
+        let mut folder = asset(-11_000_000, "test", true, 0.0);
+        folder.path = Some(path.to_owned());
+        let id = folder.id;
+        service.insert_test_asset(folder);
+        assert!(!service.check_folder_changed(id));
+
+        service.remember_listing(normalize(path), Arc::new(Vec::new()), None);
+        let file = dir.0.join("photo.jpg");
+        std::fs::write(&file, b"a").unwrap();
+        assert!(!service.check_folder_changed(id));
+        service.invalidate(id).unwrap();
+        let (rows, offline) = service.list(path, &[]);
+        assert!(!offline);
+        let file_id = rows[0].id;
+        assert!(!service.check_folder_changed(id));
+        std::fs::write(dir.0.join("another.jpg"), b"b").unwrap();
+        assert!(service.check_folder_changed(id));
+        assert!(!service.check_folder_changed(id));
+        let (rows, _) = service.list(path, &[]);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows.iter().find(|row| row.name == "photo.jpg").unwrap().id, file_id);
+    }
+}
+
+type DiskEntry = (PathBuf, String, std::fs::Metadata);
+
+fn read_directory(path: &Path, formats: &FormatTable, collect_rows: bool) -> std::io::Result<(DirectorySignature, Vec<DiskEntry>)> {
+    let mut signature = DirectorySignature::default();
+    let mut rows = Vec::new();
+    for item in std::fs::read_dir(path)? {
+        let (entry, metadata) = match item.and_then(|entry| {
+            let metadata = entry.metadata()?;
+            Ok((entry, metadata))
+        }) {
+            Ok(entry) => entry,
+            // The normal listing can display readable entries. A check must not
+            // interpret an incomplete scan as deletions.
+            Err(_) if collect_rows => continue,
+            Err(error) => return Err(error),
+        };
+        let file_name = entry.file_name();
+        let name = file_name.to_string_lossy();
+        if hidden_or_ignored(&name, &metadata, formats) { continue; }
+        let modified = match metadata.modified() {
+            Ok(time) => Some(time),
+            Err(_) if collect_rows => None,
+            Err(error) => return Err(error),
+        };
+        let mut hash = DefaultHasher::new();
+        (file_name.as_os_str(), metadata.is_dir(), metadata.len(), modified).hash(&mut hash);
+        signature.count += 1;
+        // Directory iteration order is unspecified. Include case for case-only renames.
+        signature.hash = signature.hash.wrapping_add(hash.finish());
+        if collect_rows { rows.push((entry.path(), name.into_owned(), metadata)); }
+    }
+    Ok((signature, rows))
 }
 
 fn normalize(path: &str) -> String { path.trim_end_matches(['\\','/']).replace('/',"\\").to_lowercase() }

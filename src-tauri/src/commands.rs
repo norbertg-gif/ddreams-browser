@@ -646,6 +646,12 @@ pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) 
     listing.0.invalidate(folder_id)
 }
 #[tauri::command(async)]
+pub async fn check_folder_changed(listing: State<'_, ListingState>, folder_id: i64) -> Result<bool, String> {
+    let service = listing.0.clone();
+    Ok(tauri::async_runtime::spawn_blocking(move || service.check_folder_changed(folder_id))
+        .await.unwrap_or(false))
+}
+#[tauri::command(async)]
 pub fn get_asset_paths(db: State<'_, DatabaseState>, listing: State<'_, ListingState>, ids: Vec<i64>) -> Result<Vec<String>, String> {
     Ok(ids.into_iter().filter_map(|id| listing.0.asset(id).and_then(|a|a.path).or_else(||db::asset_metadata(&db.0,id).ok().flatten().and_then(|m|m.asset.path))).collect())
 }

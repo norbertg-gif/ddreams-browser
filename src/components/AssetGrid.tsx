@@ -12,6 +12,7 @@ const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostrá", over:"Prepá
 export type AssetValuePatch = Pick<Asset, "id" | "rating" | "label" | "tagged"> & Partial<Pick<Asset, "editPendingSince">>;
 export type AssetGridHandle = {
   applyValues: (patches: ReadonlyMap<number, AssetValuePatch>, reloadListing: boolean) => void;
+  reloadListing: () => Promise<void>;
 };
 
 type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
@@ -96,6 +97,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, []);
   const pages = useRef(new Set<number>());
   const requestVersion = useRef(0);
+  const diskReload = useRef<{ version: number; pending: boolean } | null>(null);
   const anchorIndex = useRef(0);
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
   const scrollPulse = useRef(0);
@@ -128,7 +130,9 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   const infoHeight = Math.max(27, 8 + infoLineCount * 14);
   const rowHeight = zoom + 30 + infoHeight;
 
-  const fetchPage = useCallback(async (offset: number, version: number, listingOnly = false) => {
+  const fetchPage = useCallback(async (offset: number, version: number, listingOnly = false, beforeStore?: (page: Page, offset: number) => void) => {
+    const reload = diskReload.current?.version === version ? diskReload.current : null;
+    if (reload?.pending && !beforeStore) return;
     const pageNo = Math.floor(offset / PAGE_SIZE);
     if (pages.current.has(pageNo)) return;
     pages.current.add(pageNo);
@@ -137,6 +141,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
     try {
       const result = await invoke<Page>("get_assets", { filter: { ...params, offset: pageNo * PAGE_SIZE, limit: PAGE_SIZE } });
       if (version !== requestVersion.current) return;
+      beforeStore?.(result, pageNo * PAGE_SIZE);
       storePage(result.items, pageNo * PAGE_SIZE);
       setTotal(result.total);
       onCounts(result.total, result.totalSize);
@@ -146,7 +151,11 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
       if (version === requestVersion.current) pages.current.delete(pageNo);
       console.error("Katalóg sa nepodarilo načítať", error);
     }
-    finally { pendingFetches.current = Math.max(0, pendingFetches.current - 1); if (!pendingFetches.current) { if (loadingTimer.current !== undefined) window.clearTimeout(loadingTimer.current); loadingTimer.current = undefined; setLoading(false); } }
+    finally {
+      if (reload && beforeStore) reload.pending = false;
+      pendingFetches.current = Math.max(0, pendingFetches.current - 1);
+      if (!pendingFetches.current) { if (loadingTimer.current !== undefined) window.clearTimeout(loadingTimer.current); loadingTimer.current = undefined; setLoading(false); }
+    }
   }, [params, onCounts, storePage]);
 
   useEffect(() => {
@@ -173,6 +182,28 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, [refreshToken, fetchPage, rowHeight, columns]);
 
   useImperativeHandle(ref, () => ({
+    reloadListing() {
+      const scroll = scrollRef.current;
+      const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
+      const version = ++requestVersion.current;
+      diskReload.current = { version, pending: true };
+      pages.current.clear();
+      return fetchPage(firstVisible, version, false, (page, offset) => {
+        // Keep the previous page on-screen until its replacement arrives.
+        const previous = cache.current;
+        const findIndex = (index: number) => {
+          const id = previous.get(index)?.id;
+          const next = page.items.findIndex(asset => asset.id === id);
+          return next < 0 ? null : offset + next;
+        };
+        cache.current = new Map();
+        setFocusIndex(index => index == null ? null : findIndex(index));
+        anchorIndex.current = findIndex(anchorIndex.current) ?? Math.min(anchorIndex.current, Math.max(0, page.total - 1));
+        folderPreviewGeneration.current++;
+        folderPreviewCache.current.clear();
+        setFolderPreviews(new Map());
+      });
+    },
     applyValues(patches, reloadListing) {
       for (const [id, patch] of patches) {
         const merged = { ...valuePatches.current.get(id), ...patch };
@@ -374,7 +405,7 @@ function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletio
   const [broken, setBroken] = useState(false);
   const [offline, setOffline] = useState(false);
   const [retry, setRetry] = useState(0);
-  useEffect(() => { setBroken(false); setOffline(false); }, [asset.id, epoch]);
+  useEffect(() => { setBroken(false); setOffline(false); }, [asset.id, asset.fileModified, asset.size, epoch]);
   const ext = asset.ext.toUpperCase();
   const format = formatFor(asset, formats);
   const badge = format?.group === "raw" ? ext.toUpperCase() : ext || "FILE";
@@ -391,7 +422,7 @@ function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletio
       case "sizeKb": return formatKilobytes(asset.size);
       case "sizeAuto": return formatBytes(asset.size);
       case "folder": { const parts = asset.path?.replace(/[\\/]+$/, "").split(/[\\/]/).slice(0, -1) ?? []; return parts[parts.length - 1] ?? ""; }
-      case "modified": return formatSlovakDate(asset.fileModified);
+      case "modified": return formatSlovakDate(asset.fileModified?.replace(/\.\d+Z$/, "Z"));
       case "resolution": return asset.width && asset.height ? `${asset.width} × ${asset.height}` : "";
       case "dateTaken": return formatSlovakDate(asset.exifDate ?? tileMetadata?.dateTaken);
       case "rating": return asset.rating ? `${asset.rating} / 5` : "";
@@ -476,13 +507,14 @@ function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletio
     )}
   </div>;
 }
-export function thumbUrl(asset: Pick<Asset, "id" | "path" | "fileModified">, size: number, epoch: number, retry = 0): string {
+export function thumbUrl(asset: Pick<Asset, "id" | "path" | "fileModified"> & Partial<Pick<Asset, "size">>, size: number, epoch: number, retry = 0): string {
   const url = new URL(convertFileSrc(asset.path ?? "", "thumb"));
   url.searchParams.set("id", String(asset.id));
   url.searchParams.set("s", String(size));
   url.searchParams.set("v", String(epoch));
   url.searchParams.set("r", String(retry));
   if (asset.fileModified) url.searchParams.set("m", asset.fileModified);
+  if (asset.size != null) url.searchParams.set("bytes", String(asset.size));
   return url.toString();
 }
 export function labelText(label: string): string {
