@@ -754,7 +754,11 @@ impl AiService {
     pub fn forget(&self, asset_ids:Vec<i64>) {
         if asset_ids.is_empty() { return; }
         let service=self.clone();
-        let _=thread::Builder::new().name("ai-forget".into()).spawn(move||{let _=service.request("forget",json!({"asset_ids":asset_ids}),Duration::from_secs(60));});
+        let _=thread::Builder::new().name("ai-forget".into()).spawn(move || {
+            for chunk in asset_ids.chunks(1000) {
+                let _ = service.request("forget", json!({"asset_ids": chunk}), Duration::from_secs(60));
+            }
+        });
     }
 }
 

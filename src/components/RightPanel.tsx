@@ -1,20 +1,31 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent, type ReactElement, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AssetQuality, CatalogAssetLinks, Metadata, MetadataRow, View } from "../types";
-import { labelColor, labelText } from "./AssetGrid";
+import type { AssetQuality, CatalogAssetLinks, Metadata, MetadataRow, ValueCount, View } from "../types";
+import { labelColor, labelText, type AssetValuePatch } from "./AssetGrid";
 import { readStored, writeStored } from "../storage";
 import { propertySection } from "../dockLayout";
 import { DockChrome, DockSection, SectionHeading, useRegisterSections, useSectionCollapse } from "./Dock";
 import { AiPanel } from "./AiPanel";
-import { CatalogPanel } from "./CatalogPanel";
+import { CatalogPanel, type CatalogValueTokens } from "./CatalogPanel";
 import { RightSectionContext, useRightSectionData } from "./rightSectionContext";
 import { fetchFaceThumbs, type AssetColorInfo, type AiSuggestion, type CategoryMutation,
   type FaceInfo, type FacePerson, type FaceStatus, type KeywordMutation } from "./rightPanelData";
 
-type Props = { incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
-function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
-  const [metadata, setMetadata] = useState<Metadata | null>(null);
+type Props = { primaryReadId: number | null; selectedReadIds: number[]; labelCounts: ValueCount[]; primaryValues?: AssetValuePatch; valueTokens: CatalogValueTokens; incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
+function useRightPanelModel({ primaryReadId, selectedReadIds, labelCounts, primaryValues, valueTokens, incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
+  const [loadedMetadata, setMetadata] = useState<Metadata | null>(null);
+  const metadata = useMemo(() => {
+    if (!loadedMetadata || !primaryValues || (loadedMetadata.asset.id !== primaryValues.id && loadedMetadata.asset.id !== primaryReadId)) return loadedMetadata;
+    const rows = loadedMetadata.rows.map(row => {
+      if (row.group !== "Katalóg") return row;
+      if (row.name === "Hodnotenie") return { ...row, value: String(primaryValues.rating ?? "") };
+      if (row.name === "Farebný štítok") return { ...row, value: primaryValues.label ?? "" };
+      if (row.name === "Označené") return { ...row, value: primaryValues.tagged ? "Áno" : "Nie" };
+      return row;
+    });
+    return { ...loadedMetadata, asset: { ...loadedMetadata.asset, ...primaryValues }, rows };
+  }, [loadedMetadata, primaryValues, primaryReadId]);
   const [assetLinks,setAssetLinks]=useState<CatalogAssetLinks|null>(null);
   const [loading, setLoading] = useState(false);
   const { isCollapsed } = useSectionCollapse();
@@ -31,7 +42,9 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
   const [assetFaceThumbs,setAssetFaceThumbs]=useState<Record<number,string>>({});
   const assignedAssetIds = useMemo(() => selectedIds.length ? selectedIds : primaryId == null ? [] : [primaryId], [selectedIds, primaryId]);
   const suggestionIds = useMemo(() => assignedAssetIds.slice(0, 200), [assignedAssetIds]);
-  const suggestionKey = useMemo(() => suggestionIds.join(","), [suggestionIds]);
+  const selectionReadKey = useMemo(() => selectedReadIds.join(","), [selectedReadIds]);
+  const suggestionKey = useMemo(() => selectedReadIds.length
+    ? selectedReadIds.slice(0, 200).join(",") : String(primaryReadId ?? ""), [selectedReadIds, primaryReadId]);
   const sampled = assignedAssetIds.length > suggestionIds.length;
   const sampleSet = useMemo(() => new Set(suggestionIds), [suggestionIds]);
   const [suggestionResult, setSuggestionResult] = useState<{key:string; category:AiSuggestion[]; keyword:AiSuggestion[]} | null>(null);
@@ -64,7 +77,7 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
   const [assetPersonCounts,setAssetPersonCounts]=useState<Record<number,number>>({});
   const [personInput,setPersonInput]=useState("");
   const faceRequest=useRef(0);
-  const selectionKey=`${primaryId}:${suggestionKey}`;
+  const selectionKey=`${primaryReadId}:${suggestionKey}`;
   const currentSelection=useRef(selectionKey);
   currentSelection.current=selectionKey;
   const reloadAssignedPeople=async()=>{const key=selectionKey;if(currentSelection.current!==key)return;const request=++faceRequest.current;const valid=()=>faceRequest.current===request&&currentSelection.current===key;const ids=primaryId!=null&&!sampleSet.has(primaryId)?[...suggestionIds,primaryId]:suggestionIds;if(!ids.length){if(valid()){setAssetPersonCounts({});setAssetFaces([]);setAssetFaceThumbs({})}return}try{const byPerson=new Map<number,Set<number>>();const primaryRows:FaceInfo[]=[];for(let start=0;start<ids.length;start+=500){const rows=await invoke<FaceInfo[]>("ai_faces_for_assets",{assetIds:ids.slice(start,start+500)});if(!valid())return;for(const row of rows){if(row.assetId===primaryId)primaryRows.push(row);if(row.personId!=null&&sampleSet.has(row.assetId)){const assets=byPerson.get(row.personId)??new Set<number>();assets.add(row.assetId);byPerson.set(row.personId,assets)}}}const counts:Record<number,number>={};for(const [person,assets] of byPerson)counts[person]=assets.size;if(!valid())return;setAssetPersonCounts(counts);setAssetFaces(primaryRows);setAssetFaceThumbs({});const thumbs=await fetchFaceThumbs(primaryRows.map(row=>row.faceId));if(valid())setAssetFaceThumbs(thumbs)}catch{if(valid()){setAssetPersonCounts({});setAssetFaces([]);setAssetFaceThumbs({})}}};
@@ -80,10 +93,10 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
     setMetadata(null); if (primaryId == null) return;
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
-  }, [primaryId, refreshToken]);
-  useEffect(()=>{let active=true;setAssetColors([]);if(!colorIds.length)return;const timer=window.setTimeout(()=>{void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[colorIds,refreshToken,colorToken]);
-  useEffect(()=>{let active=true;setAssetQuality([]);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<AssetQuality[]>("get_asset_quality",{assetIds:[primaryId]}).then(rows=>{if(active)setAssetQuality(rows)}).catch(()=>{if(active)setAssetQuality([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryId,refreshToken,colorToken]);
-  useEffect(()=>{let active=true;setAssetLinks(null);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryId,refreshToken]);
+  }, [primaryReadId, refreshToken]);
+  useEffect(()=>{let active=true;setAssetColors([]);if(!colorIds.length)return;const timer=window.setTimeout(()=>{void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[selectionReadKey,primaryReadId,refreshToken,colorToken]);
+  useEffect(()=>{let active=true;setAssetQuality([]);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<AssetQuality[]>("get_asset_quality",{assetIds:[primaryId]}).then(rows=>{if(active)setAssetQuality(rows)}).catch(()=>{if(active)setAssetQuality([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken,colorToken]);
+  useEffect(()=>{let active=true;setAssetLinks(null);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken]);
   useEffect(()=>{if(aiAvailable&&aiReady)void reloadFacePersons();else{++facePersonsRequest.current;if(facePersonsTimer.current!==undefined){window.clearTimeout(facePersonsTimer.current);facePersonsTimer.current=undefined}setFacePersons([]);setFaceStatus({available:false,scanned:0,pending:0,faces:0,named:0,unknown:0,persons:0})}return()=>{++facePersonsRequest.current;if(facePersonsTimer.current!==undefined){window.clearTimeout(facePersonsTimer.current);facePersonsTimer.current=undefined}}},[aiAvailable,catalogRefreshToken,aiReady]);
   const previousColorToken=useRef(colorToken);
   useEffect(()=>{if(previousColorToken.current===colorToken)return;previousColorToken.current=colorToken;if(!aiAvailable||!aiReady||facePersonsTimer.current!==undefined)return;const delay=Math.max(0,20000-(Date.now()-facePersonsLastLoad.current));facePersonsTimer.current=window.setTimeout(()=>{facePersonsTimer.current=undefined;void reloadFacePersons()},delay)},[colorToken,aiAvailable,aiReady]);
@@ -172,8 +185,10 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
   const qualityText=quality?.flags.map(flag=>({blur:"Neostrá",over:"Prepálená",under:"Tmavá"}[flag]??flag)).join(", ")||"V poriadku";
   const qualityTitle=quality?`ostrosť: ${quality.sharp.toFixed(1)}, svetlá: ${(quality.hi*100).toFixed(1)} %, tiene: ${(quality.lo*100).toFixed(1)} %, jas: ${(quality.mean*100).toFixed(1)} %`:"";
   const editorRow=(name:string,content:ReactNode)=><div className="meta-row editor-row"><span>{name}</span><b>{content}</b></div>;
-  const ratingValue=Number(catalogValue("Hodnotenie"))||0, labelValue=catalogValue("Farebný štítok"), taggedValue=catalogValue("Označené")==="Áno";
-  const pendingSince = metadata?.asset.editPendingSince;
+  const ratingValue = primaryValues ? primaryValues.rating ?? 0 : Number(catalogValue("Hodnotenie")) || 0;
+  const labelValue = primaryValues ? primaryValues.label ?? "" : catalogValue("Farebný štítok");
+  const taggedValue = primaryValues ? !!primaryValues.tagged : catalogValue("Označené") === "Áno";
+  const pendingSince = primaryValues && "editPendingSince" in primaryValues ? primaryValues.editPendingSince : metadata?.asset.editPendingSince;
   const pendingDays = pendingSince == null ? null : Math.max(0, Math.floor((Date.now() / 1000 - pendingSince) / 86400));
   const catalogEditor=!editIds.length?<div className="catalog-editor empty"><div className="catalog-zone-title edit-zone">Zadávanie – mení vybrané fotky</div><small>Vyber súbory, ktoré chceš triediť.</small></div>:<section className="catalog-editor">
     <div className="catalog-zone-title edit-zone">Zadávanie – mení vybrané fotky</div><div className="catalog-editor-title">{selectedIds.length>1?`${selectedIds.length} vybraných súborov`:(metadata?.asset.name??"Vybraný súbor")}</div>
@@ -187,7 +202,7 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
         onClick={() => onSetValues(editIds, { editPending: false })}>Hotovo</button>}
     </span>)}
     {editorRow("Kategórie",<span className="property-categories">{(assetLinks?.categoryPaths??[]).length?(assetLinks?.categoryPaths??[]).map(category=><span key={category.id} title={category.path}>{category.path}<button aria-label={`Odobrať z kategórie ${category.path}`} onClick={()=>onSetCategory(editIds,category.id,false)}>×</button></span>):<small className="subtle">— priraď štvorčekom v strome nižšie</small>}{aiReady&&aiSuggestions.category.length>0&&<span className="keyword-ai-suggestions category-ai-suggestions" title="Návrhy AI podľa podobných fotiek – kliknutím priradíš, × odmietne">{[...aiSuggestions.category].filter(item=>!(assetLinks?.categoryIds??[]).includes(item.labelId)||selectedIds.length>1).sort((a,b)=>b.score-a.score).slice(0,5).map(item=><span className="ai-suggestion-chip" key={item.labelId} title={`${item.path}\n${selectedIds.length>1?`${item.count??0} z ${suggestionIds.length} fotiek vo vzorke`:`podobných fotiek: ${item.count??0}`}`}><button type="button" disabled={readOnly} onClick={()=>void acceptAiSuggestion("category",item)}>{item.path.split("/").slice(-2).join(" / ")} <small>{Math.round(item.score*100)} %</small></button><button type="button" aria-label="Odmietnuť návrh" onClick={()=>{const ids=suggestionIds;void invoke("ai_reject_suggestion",{assetIds:ids,kind:"category",labelId:item.labelId}).then(()=>removeAiSuggestion("category",item.labelId))}}>×</button></span>)}</span>}</span>)}
-    {editorRow("Kľúčové slová",<KeywordProperties links={assetLinks} primaryId={primaryId} selectedIds={selectedIds} onSetKeyword={onSetKeyword} onCreateAssignKeyword={onCreateAssignKeyword} readOnly={readOnly} onError={onCategoryError}
+    {editorRow("Kľúčové slová",<KeywordProperties selectionReadKey={selectionReadKey} links={assetLinks} primaryId={primaryId} selectedIds={selectedIds} onSetKeyword={onSetKeyword} onCreateAssignKeyword={onCreateAssignKeyword} readOnly={readOnly} onError={onCategoryError}
       contentSuggestions={aiReady && editIds.length === 1 && editIds[0] > 0
         ? <ContentKeywordSuggestions key={`${editIds[0]}:${refreshToken}`} assetId={editIds[0]} readOnly={readOnly}
             onAssign={onSetKeyword} onCreate={onCreateAssignKeyword}/>
@@ -233,7 +248,7 @@ function useRightPanelModel({ incomingTools, thumbEpoch = 0, catalogReady = true
       </div>{copyMessage && <div className="copy-message">{copyMessage}</div>}
     </div></DockChrome>
   <IncomingSection>{incomingTools}</IncomingSection><AiPanel activeQuality={activeQuality} thumbEpoch={thumbEpoch} primaryId={primaryId} onNavigate={onNavigate} aiReady={aiReady} aiAvailable={aiAvailable} aiReason={aiReason} catalogRefreshToken={catalogRefreshToken} onSetCategory={onSetCategory} onCategoryChanged={onCategoryChanged} onCategoryError={onCategoryError} onRefresh={onRefresh} onClusterNotice={onClusterNotice} readOnly={readOnly} />
-  {!catalogReady ? <DockChrome id="catalogIntro"><small className="color-hint">Načítavam katalóg…</small></DockChrome> : <CatalogPanel activeColors={activeColors} activeQuality={activeQuality} header={catalogEditor} onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} primaryId={primaryId} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} colorToken={colorToken} aiAvailable={aiAvailable} aiReady={aiReady} facePersons={facePersons} faceStatus={faceStatus} onRefreshFacePersons={reloadFacePersons} onNotice={onClusterNotice} readOnly={readOnly} />}</>,
+  {!catalogReady ? <DockChrome id="catalogIntro"><small className="color-hint">Načítavam katalóg…</small></DockChrome> : <CatalogPanel selectionReadKey={selectionReadKey} labelCounts={labelCounts} links={assetLinks} valueTokens={valueTokens} activeColors={activeColors} activeQuality={activeQuality} header={catalogEditor} onNavigate={onNavigate} includeChildren={includeChildren} onIncludeChildrenChange={onIncludeChildrenChange} selectedIds={selectedIds} onSetCategory={onSetCategory} onSetKeyword={onSetKeyword} onCategoryChanged={onCategoryChanged} onKeywordChanged={onKeywordChanged} onCategoryError={onCategoryError} refreshToken={refreshToken} colorToken={colorToken} aiAvailable={aiAvailable} aiReady={aiReady} facePersons={facePersons} faceStatus={faceStatus} onRefreshFacePersons={reloadFacePersons} onNotice={onClusterNotice} readOnly={readOnly} />}</>,
   };
 }
 
@@ -338,11 +353,11 @@ function ContentKeywordSuggestions({ assetId, readOnly, onAssign, onCreate }: {
   </div>;
 }
 
-function KeywordProperties({links,primaryId,selectedIds,onSetKeyword,onCreateAssignKeyword,readOnly,onError,suggestions=[],onAcceptSuggestion,onRejectSuggestion,contentSuggestions}:{contentSuggestions?:ReactNode;links:CatalogAssetLinks|null;primaryId:number|null;selectedIds:number[];onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void;onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void;readOnly:boolean;onError:(error:unknown)=>void;suggestions?:AiSuggestion[];onAcceptSuggestion?:(item:AiSuggestion)=>void;onRejectSuggestion?:(item:AiSuggestion)=>void}){
+function KeywordProperties({selectionReadKey,links,primaryId,selectedIds,onSetKeyword,onCreateAssignKeyword,readOnly,onError,suggestions=[],onAcceptSuggestion,onRejectSuggestion,contentSuggestions}:{selectionReadKey:string;contentSuggestions?:ReactNode;links:CatalogAssetLinks|null;primaryId:number|null;selectedIds:number[];onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void;onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void;readOnly:boolean;onError:(error:unknown)=>void;suggestions?:AiSuggestion[];onAcceptSuggestion?:(item:AiSuggestion)=>void;onRejectSuggestion?:(item:AiSuggestion)=>void}){
   const [text,setText]=useState("");const [options,setOptions]=useState<{id:number;name:string;path:string}[]>([]);const [offerCreate,setOfferCreate]=useState(false);const ids=selectedIds.length?selectedIds:primaryId==null?[]:[primaryId];
   // With several photos selected, a chip shows how many of them carry the keyword; clicking it assigns it to all.
   const [selectionCounts,setSelectionCounts]=useState<Record<number,number>>({});
-  const selectionKey=ids.length>1?`${ids.length}:${ids[0]}:${ids[ids.length-1]}:${(links?.keywordIds??[]).join(",")}`:"";
+  const selectionKey = ids.length > 1 ? `${selectionReadKey}:${(links?.keywordIds ?? []).join(",")}` : "";
   useEffect(()=>{if(!selectionKey){setSelectionCounts({});return;}let active=true;void invoke<{totalFiles:number;assigned:Record<number,number>}>("get_keyword_selection_counts",{assetIds:ids}).then(value=>{if(active)setSelectionCounts(value.assigned)}).catch(()=>{if(active)setSelectionCounts({})});return()=>{active=false}},[selectionKey]);
   useEffect(()=>{const query=text.trim();if(!query){setOptions([]);setOfferCreate(false);return;}let active=true;const timer=window.setTimeout(()=>{void invoke<{id:number;name:string;path:string}[]>("search_keyword_options",{query}).then(rows=>{if(active)setOptions(rows)}).catch(error=>{if(active){setOptions([]);onError(error)}})},140);return()=>{active=false;window.clearTimeout(timer)}},[text]);
   const exact=options.find(item=>item.name.toLowerCase()===text.trim().toLowerCase());const add=(id:number)=>{if(!ids.length||readOnly)return;onSetKeyword(ids,id,true);setText("");setOptions([]);setOfferCreate(false)};const create=()=>{if(!ids.length||readOnly||!text.trim())return;onCreateAssignKeyword(ids,null,text.trim());setText("");setOptions([]);setOfferCreate(false)};

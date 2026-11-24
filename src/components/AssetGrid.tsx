@@ -1,6 +1,6 @@
 import { buildAssetFilter } from "../assetFilter";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent } from "react";
-import { launchEditor, useEditors } from "../editors";
+import { useCallback, useEffect, useImperativeHandle, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type KeyboardEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type Ref } from "react";
+import { launchEditor, useEditors, type Editor } from "../editors";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { createPortal } from "react-dom";
@@ -9,6 +9,11 @@ import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type Thumbnai
 
 const PAGE_SIZE = 120;
 const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostrá", over:"Prepálená", under:"Tmavá" };
+export type AssetValuePatch = Pick<Asset, "id" | "rating" | "label" | "tagged"> & Partial<Pick<Asset, "editPendingSince">>;
+export type AssetGridHandle = {
+  applyValues: (patches: ReadonlyMap<number, AssetValuePatch>, reloadListing: boolean) => void;
+};
+
 type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
 declare global { interface Window { __ddreamsShift?: boolean } }
 export function formatBytes(bytes: number | null | undefined): string {
@@ -50,11 +55,12 @@ type Props = {
   aiReason: string;
   readOnly: boolean;
   uiScale?: number;
+  ref?: Ref<AssetGridHandle>;
   refreshToken?: number;
   qualityToken?: number;
 };
 
-export default function AssetGrid({ view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], quarantineDeleteDays, onQuarantine, deletionSuggestions, onKeepSuggested, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale=1 }: Props) {
+export default function AssetGrid({ ref, view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], quarantineDeleteDays, onQuarantine, deletionSuggestions, onKeepSuggested, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale=1 }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const groupsById = useMemo(() => {
     const groups = new Map<number, number>();
@@ -78,7 +84,16 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
       window.removeEventListener("resize", dismiss);
     };
   }, []);
+  const editors = useEditors();
   const cache = useRef(new Map<number, Asset>());
+  const valuePatches = useRef(new Map<number, AssetValuePatch>());
+  const [, setValuesVersion] = useState(0);
+  const storePage = useCallback((items: Asset[], offset: number) => {
+    items.forEach((asset, index) => {
+      const patch = valuePatches.current.get(asset.id);
+      cache.current.set(offset + index, patch ? { ...asset, ...patch } : asset);
+    });
+  }, []);
   const pages = useRef(new Set<number>());
   const requestVersion = useRef(0);
   const anchorIndex = useRef(0);
@@ -113,7 +128,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   const infoHeight = Math.max(27, 8 + infoLineCount * 14);
   const rowHeight = zoom + 30 + infoHeight;
 
-  const fetchPage = useCallback(async (offset: number, version: number) => {
+  const fetchPage = useCallback(async (offset: number, version: number, listingOnly = false) => {
     const pageNo = Math.floor(offset / PAGE_SIZE);
     if (pages.current.has(pageNo)) return;
     pages.current.add(pageNo);
@@ -122,15 +137,21 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     try {
       const result = await invoke<Page>("get_assets", { filter: { ...params, offset: pageNo * PAGE_SIZE, limit: PAGE_SIZE } });
       if (version !== requestVersion.current) return;
-      result.items.forEach((asset, i) => cache.current.set(pageNo * PAGE_SIZE + i, asset));
-      setTotal(result.total); onCounts(result.total, result.totalSize); setItemsVersion(v => v + 1);
-    } catch (error) { pages.current.delete(pageNo); console.error("Katalóg sa nepodarilo načítať", error); }
+      storePage(result.items, pageNo * PAGE_SIZE);
+      setTotal(result.total);
+      onCounts(result.total, result.totalSize);
+      if (listingOnly) setValuesVersion(v => v + 1);
+      else setItemsVersion(v => v + 1);
+    } catch (error) {
+      if (version === requestVersion.current) pages.current.delete(pageNo);
+      console.error("Katalóg sa nepodarilo načítať", error);
+    }
     finally { pendingFetches.current = Math.max(0, pendingFetches.current - 1); if (!pendingFetches.current) { if (loadingTimer.current !== undefined) window.clearTimeout(loadingTimer.current); loadingTimer.current = undefined; setLoading(false); } }
-  }, [params, onCounts]);
+  }, [params, onCounts, storePage]);
 
   useEffect(() => {
     requestVersion.current++;
-    cache.current.clear(); pages.current.clear(); setTotal(0); setFocusIndex(null); anchorIndex.current = 0; setItemsVersion(v => v + 1);
+    cache.current.clear(); pages.current.clear(); valuePatches.current.clear(); setTotal(0); setFocusIndex(null); anchorIndex.current = 0; setItemsVersion(v => v + 1);
     folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setTileMetadata(new Map());
     scrollRef.current?.scrollTo({ top: 0 });
@@ -142,6 +163,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     if (refreshTokenRef.current === refreshToken) return;
     refreshTokenRef.current = refreshToken;
     requestVersion.current++;
+    valuePatches.current.clear();
     pages.current.clear();
     folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setItemsVersion(v => v + 1);
@@ -149,6 +171,29 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
     void fetchPage(firstVisible, requestVersion.current);
   }, [refreshToken, fetchPage, rowHeight, columns]);
+
+  useImperativeHandle(ref, () => ({
+    applyValues(patches, reloadListing) {
+      for (const [id, patch] of patches) {
+        const merged = { ...valuePatches.current.get(id), ...patch };
+        valuePatches.current.set(id, merged);
+        valuePatches.current.set(patch.id, merged);
+      }
+      for (const [index, asset] of cache.current) {
+        const patch = patches.get(asset.id);
+        if (patch) cache.current.set(index, { ...asset, ...patch });
+      }
+      setValuesVersion(version => version + 1);
+      if (reloadListing) {
+        requestVersion.current++;
+        pages.current.clear();
+        cache.current.clear();
+        const scroll = scrollRef.current;
+        const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
+        void fetchPage(firstVisible, requestVersion.current, true);
+      }
+    },
+  }), [fetchPage, rowHeight, columns]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -182,17 +227,17 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
       for (const path of requested) folderPreviewCache.current.set(path, []);
       void invoke<Record<string, FolderPreview[]>>("get_folder_previews", { paths: requested }).then(result => {
         if (generation !== folderPreviewGeneration.current) return;
-        const next = new Map(folderPreviews);
-        for (const path of requested) {
-          const previews = result[path] ?? [];
-          folderPreviewCache.current.set(path, previews);
-          next.set(path, previews);
-        }
-        setFolderPreviews(next);
+        for (const path of requested) folderPreviewCache.current.set(path, result[path] ?? []);
+        setFolderPreviews(current => {
+          if (generation !== folderPreviewGeneration.current) return current;
+          const next = new Map(current);
+          for (const path of requested) next.set(path, result[path] ?? []);
+          return next;
+        });
       }).catch(error => console.error("Náhľady priečinkov sa nepodarilo načítať", error));
     }, 70);
     return () => window.clearTimeout(timer);
-  }, [virtualRows, columns, total, itemsVersion, folderPreviews]);
+  }, [virtualRows, columns, total, itemsVersion]);
 
   const visibleSignature = virtualRows.length ? `${virtualRows[0].index}:${virtualRows[virtualRows.length - 1].index}:${columns}:${itemsVersion}` : "";
   useEffect(()=>{qualityCache.current.clear();qualityRequests.current.clear();setTileQuality(new Map())},[refreshToken]);
@@ -242,7 +287,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
       if (Array.from({length: last - first + 1}, (_, i) => getAt(first + i)).some(item => !item)) {
         const page = await invoke<Page>("get_assets", { filter: { ...params, offset, limit: PAGE_SIZE } });
         if (version !== requestVersion.current) return;
-        page.items.forEach((item, i) => cache.current.set(offset + i, item));
+        storePage(page.items, offset);
       }
       for (let i = first; i <= last; i++) { const item = getAt(i); if (item) ids.push(item.id); }
     }
@@ -255,7 +300,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
     else { anchorIndex.current = index; onSelect(asset, index, event); }
   };
   const onKeyDown = async (event: KeyboardEvent<HTMLDivElement>) => {
-    if (document.activeElement !== event.currentTarget) return;
+    if (document.activeElement !== event.currentTarget || event.altKey) return;
     if (event.key === "Enter") {
       event.preventDefault();
       // The viewer listens on window and would close again on this same keypress.
@@ -291,7 +336,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
       const offset = Math.floor(next / PAGE_SIZE) * PAGE_SIZE;
       const page = await invoke<Page>("get_assets", {filter: {...params, offset, limit: PAGE_SIZE}});
       if (version !== requestVersion.current) return;
-      page.items.forEach((item, i) => cache.current.set(offset + i, item));
+      storePage(page.items, offset);
       setItemsVersion(v => v + 1);
     }
     const asset = getAt(next); if (!asset) return;
@@ -302,7 +347,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   };
   const beginRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(e.button!==0||(e.target as HTMLElement).closest(".asset-tile,.tile-context-menu"))return;const r=e.currentTarget.getBoundingClientRect();const v={x1:e.clientX-r.left,y1:e.clientY-r.top,x2:e.clientX-r.left,y2:e.clientY-r.top,add:e.ctrlKey||e.metaKey};rubberRef.current=v;setRubber(v);e.currentTarget.setPointerCapture(e.pointerId);e.preventDefault()};
   const moveRubber=(e:ReactPointerEvent<HTMLDivElement>)=>{if(!rubberRef.current)return;const r=e.currentTarget.getBoundingClientRect();const v={...rubberRef.current,x2:e.clientX-r.left,y2:e.clientY-r.top};rubberRef.current=v;setRubber(v);if(v.y2<30)e.currentTarget.scrollTop-=22;else if(v.y2>r.height-30)e.currentTarget.scrollTop+=22};
-  const endRubber=async()=>{const v=rubberRef.current;if(!v)return;rubberRef.current=null;setRubber(null);const el=scrollRef.current;if(!el)return;if(Math.hypot(v.x2-v.x1,v.y2-v.y1)<4){onSelectAll([]);return;}const xlo=Math.min(v.x1,v.x2),xhi=Math.max(v.x1,v.x2),ylo=Math.min(v.y1,v.y2)+el.scrollTop,yhi=Math.max(v.y1,v.y2)+el.scrollTop;const indexes:number[]=[];for(let row=Math.max(0,Math.floor((ylo-10)/rowHeight));row<=Math.min(rowCount-1,Math.floor((yhi-10)/rowHeight));row++){const cy=row*rowHeight+10+Math.min(zoom,rowHeight-24)/2;if(cy<ylo||cy>yhi)continue;for(let col=0;col<columns;col++){const cx=12+col*(tileWidth+9)+tileWidth/2;if(cx>=xlo&&cx<=xhi){const i=row*columns+col;if(i<total)indexes.push(i)}}}const needed=[...new Set(indexes.map(i=>Math.floor(i/PAGE_SIZE)*PAGE_SIZE))];for(const offset of needed){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:PAGE_SIZE}});p.items.forEach((a,j)=>cache.current.set(offset+j,a));}const ids=indexes.map(i=>getAt(i)?.id).filter((id):id is number=>id!=null);onSelectAll(v.add?[...new Set([...selectedIds,...ids])]:ids);};
+  const endRubber=async()=>{const v=rubberRef.current;if(!v)return;rubberRef.current=null;setRubber(null);const el=scrollRef.current;if(!el)return;if(Math.hypot(v.x2-v.x1,v.y2-v.y1)<4){onSelectAll([]);return;}const xlo=Math.min(v.x1,v.x2),xhi=Math.max(v.x1,v.x2),ylo=Math.min(v.y1,v.y2)+el.scrollTop,yhi=Math.max(v.y1,v.y2)+el.scrollTop;const indexes:number[]=[];for(let row=Math.max(0,Math.floor((ylo-10)/rowHeight));row<=Math.min(rowCount-1,Math.floor((yhi-10)/rowHeight));row++){const cy=row*rowHeight+10+Math.min(zoom,rowHeight-24)/2;if(cy<ylo||cy>yhi)continue;for(let col=0;col<columns;col++){const cx=12+col*(tileWidth+9)+tileWidth/2;if(cx>=xlo&&cx<=xhi){const i=row*columns+col;if(i<total)indexes.push(i)}}}const needed=[...new Set(indexes.map(i=>Math.floor(i/PAGE_SIZE)*PAGE_SIZE))];for(const offset of needed){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:PAGE_SIZE}});storePage(p.items,offset);}const ids=indexes.map(i=>getAt(i)?.id).filter((id):id is number=>id!=null);onSelectAll(v.add?[...new Set([...selectedIds,...ids])]:ids);};
   useEffect(()=>{if(!rubber)return;const timer=window.setInterval(()=>{const el=scrollRef.current,v=rubberRef.current;if(!el||!v)return;if(v.y2<30)el.scrollTop-=14;else if(v.y2>el.clientHeight-30)el.scrollTop+=14},24);return()=>window.clearInterval(timer)},[!!rubber]);
 
   return <div className="grid-shell">
@@ -314,7 +359,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} quarantineDeleteDays={quarantineDeleteDays} onQuarantine={onQuarantine} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={groupsById.get(asset.id)} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} editors={editors} quarantineDeleteDays={quarantineDeleteDays} onQuarantine={onQuarantine} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={groupsById.get(asset.id)} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} uiScale={uiScale} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -322,7 +367,7 @@ export default function AssetGrid({ view, query, sort, descending, zoom, epoch, 
   </div>;
 }
 
-function AssetTile({ asset, quarantineDeleteDays, onQuarantine, deletionSuggested, onKeepSuggested, folderPreviews, groupNumber, best, size, epoch, selected, primary, focused, cut, onClick, onContextMenu, onDoubleClick, overlayMode, hoverMode, selectedIds, shiftDown, dismissTilePopup, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; quarantineDeleteDays?: number; onQuarantine: (ids: number[]) => void; deletionSuggested: boolean; onKeepSuggested: (id: number) => void; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; focused: boolean; cut:boolean; selectedIds:ReadonlySet<number>; shiftDown:boolean; dismissTilePopup:{current:(()=>void)|null}; onClick: (event: MouseEvent<HTMLDivElement>) => void; onContextMenu: () => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
+function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletionSuggested, onKeepSuggested, folderPreviews, groupNumber, best, size, epoch, selected, primary, focused, cut, onClick, onContextMenu, onDoubleClick, overlayMode, hoverMode, selectedIds, shiftDown, dismissTilePopup, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, uiScale }: { asset: Asset; editors: Editor[]; quarantineDeleteDays?: number; onQuarantine: (ids: number[]) => void; deletionSuggested: boolean; onKeepSuggested: (id: number) => void; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; focused: boolean; cut:boolean; selectedIds:ReadonlySet<number>; shiftDown:boolean; dismissTilePopup:{current:(()=>void)|null}; onClick: (event: MouseEvent<HTMLDivElement>) => void; onContextMenu: () => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; uiScale:number }) {
   // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
   // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
   const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
@@ -363,7 +408,6 @@ function AssetTile({ asset, quarantineDeleteDays, onQuarantine, deletionSuggeste
       default: return "";
     }
   };
-  const editors=useEditors();
   const [menu,setMenu]=useState<{x:number;y:number}|null>(null);
   const menuRef=useRef<HTMLDivElement>(null);
   const [menuPosition,setMenuPosition]=useState<{left:number;top:number}|null>(null);

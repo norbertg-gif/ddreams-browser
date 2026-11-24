@@ -82,7 +82,7 @@ pub struct RemoveCatalogInfo{pub assets:usize,pub folders:usize,pub offline:bool
 #[tauri::command(async)]
 pub fn remove_folder_from_catalog_info(db:State<'_,BackgroundDbState>,folder_path:String)->Result<RemoveCatalogInfo,String>{let path=folder_path.trim().trim_end_matches(['\\','/']);let conn=db.0.lock().map_err(|_|"catalog lock poisoned")?;let normal=crate::journal::normalize_fs_path(path);let prefix=format!("{}\\",normal);let asset_paths={let mut stmt=conn.prepare("SELECT path FROM assets WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let assets=asset_paths.iter().filter(|p|{let p=crate::journal::normalize_fs_path(p);p==normal||p.starts_with(&prefix)}).count();let all={let mut stmt=conn.prepare("SELECT path FROM folders WHERE path IS NOT NULL").map_err(|e|e.to_string())?;stmt.query_map([],|r|r.get::<_,String>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?};let prefix=format!("{}\\",path.replace('/',"\\").trim_end_matches('\\'));let folders=all.iter().filter(|p|p.eq_ignore_ascii_case(path)||p.to_lowercase().starts_with(&prefix.to_lowercase())).count();drop(conn);let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(path,&mut cache);Ok(RemoveCatalogInfo{assets,folders,offline,missing})}
 #[tauri::command(async)]
-pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,app:State<'_,AppInfoState>,listing:State<'_,ListingState>,folder_path:String)->Result<crate::journal::RemoveCatalogResult,String>{let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(&folder_path,&mut cache);if !offline&&!missing{return Err("Priečinok existuje na disku – z katalógu ho vyraď cez vylúčenie".into())}if app.0.readonly{return Err("Katalóg je iba na čítanie".into())}crate::backup::backup_now(Path::new(&app.0.catalog),Path::new(&app.0.backups))?;let result=writer.0.remove_folder_from_catalog(&folder_path)?;for chunk in result.asset_ids.chunks(1000){ai.0.forget(chunk.to_vec())}let _=listing.0.invalidate_path(&folder_path);Ok(result)}
+pub fn remove_folder_from_catalog(writer:State<'_,CatalogWriterState>,ai:State<'_,AiState>,app:State<'_,AppInfoState>,listing:State<'_,ListingState>,folder_path:String)->Result<crate::journal::RemoveCatalogResult,String>{let mut cache=std::collections::HashMap::new();let(offline,missing)=classify_source(&folder_path,&mut cache);if !offline&&!missing{return Err("Priečinok existuje na disku – z katalógu ho vyraď cez vylúčenie".into())}if app.0.readonly{return Err("Katalóg je iba na čítanie".into())}crate::backup::backup_now(Path::new(&app.0.catalog),Path::new(&app.0.backups))?;let result=writer.0.remove_folder_from_catalog(&folder_path)?;ai.0.forget(result.asset_ids.clone());let _=listing.0.invalidate_path(&folder_path);Ok(result)}
 
 #[tauri::command(async)]
 pub fn ai_status(state: State<'_, AiState>) -> AiStatus { state.0.status() }
@@ -1175,7 +1175,19 @@ pub fn get_delete_info(state:State<'_,FileManagerState>,asset_ids:Vec<i64>,perma
 /// Deletes the selected files (with sidecars): to the Recycle Bin or permanently when
 /// Shift+Delete is requested or permanent deletion without a Recycle Bin is confirmed.
 #[tauri::command]
-pub async fn delete_files(state:State<'_,FileManagerState>,ai:State<'_,AiState>,asset_ids:Vec<i64>,permanent:Option<bool>,confirmed_no_bin_drives:Option<Vec<String>>)->Result<FileOperationResult,String>{let manager=state.0.clone();let (result,purged)=tauri::async_runtime::spawn_blocking(move||manager.delete_files(&asset_ids,permanent.unwrap_or(false),&confirmed_no_bin_drives.unwrap_or_default())).await.map_err(|e|e.to_string())??;ai.0.forget(purged);Ok(result)}
+pub async fn delete_files(
+    state: State<'_, FileManagerState>, ai: State<'_, AiState>, asset_ids: Vec<i64>,
+    permanent: Option<bool>, confirmed_no_bin_drives: Option<Vec<String>>,
+) -> Result<FileOperationResult, String> {
+    let manager = state.0.clone();
+    let (result, purged) = tauri::async_runtime::spawn_blocking(move || {
+        let mut purged = Vec::new();
+        let result = manager.delete_files(&asset_ids, permanent.unwrap_or(false), &confirmed_no_bin_drives.unwrap_or_default(), &mut purged);
+        (result, purged)
+    }).await.map_err(|e| e.to_string())?;
+    ai.0.forget(purged);
+    result
+}
 
 #[tauri::command(async)]
 pub fn get_folder_rules(writer:State<'_,CatalogWriterState>)->Result<Vec<crate::folder_rules::FolderRule>,String>{writer.0.folder_rules()}

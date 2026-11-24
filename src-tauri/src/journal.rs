@@ -147,6 +147,18 @@ impl CatalogWriter {
         let folder = self.incoming.lock().map_err(|e| e.to_string())?;
         track_incoming(tx, id, path, &folder)
     }
+    fn track_incoming_move(&self, tx: &Transaction<'_>, id: i64, from: Option<&str>, to: &str) -> Result<(), String> {
+        let folder = self.incoming.lock().map_err(|e| e.to_string())?;
+        track_incoming(tx, id, to, &folder)?;
+        if !folder.is_empty() && from.is_some_and(|path| crate::incoming::is_inside(path, &folder))
+            && !crate::incoming::is_inside(to, &folder)
+        {
+            tx.execute("UPDATE assets SET delete_suggestion=NULL WHERE id=?1 AND delete_suggestion IS NOT NULL", [id])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
     pub fn set_change_hook(&self, hook: ChangeHook) {
         *self.change_hook.lock().unwrap() = Some(hook);
     }
@@ -594,6 +606,7 @@ impl CatalogWriter {
                 }
             }
             let folder=ensure_folder(&tx,&item.target_folder_path,&mut paths,&mut roots)?;
+            let mut previous_path = None;
             let id = if item.asset_id < 0 && matches!(quarantine, Some((_, true))) {
                 let id = next_id(&tx, "assets")?;
                 insert_asset(&tx, &NewCatalogAsset {
@@ -603,9 +616,9 @@ impl CatalogWriter {
                 })?;
                 id
             } else {
-                if read_asset_values(&tx, item.asset_id)?.is_none() {
-                    return Err(format!("Súbor katalógu {} sa nenašiel", item.asset_id));
-                }
+                previous_path = tx.query_row("SELECT path FROM assets WHERE id=?1 AND is_listed=1 AND ext_lower<>''", [item.asset_id], |r| r.get::<_, Option<String>>(0))
+                    .optional().map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("Súbor katalógu {} sa nenašiel", item.asset_id))?;
                 if regular_move {
                     tx.execute("UPDATE assets SET quarantined_at=NULL,quarantine_origin=NULL WHERE id=?1 AND quarantined_at IS NOT NULL",
                         [item.asset_id]).map_err(|e| e.to_string())?;
@@ -615,10 +628,12 @@ impl CatalogWriter {
                 }
                 item.asset_id
             };
-            self.track_incoming(&tx, id, &item.target_path)?;
             if let Some((source, entering)) = quarantine {
+                self.track_incoming(&tx, id, &item.target_path)?;
                 tx.execute("UPDATE assets SET quarantined_at=?2,quarantine_origin=?3,delete_suggestion=0,edit_pending_since=NULL WHERE id=?1",
                     (id, entering.then(crate::quarantine::now), entering.then_some(source))).map_err(|e| e.to_string())?;
+            } else {
+                self.track_incoming_move(&tx, id, previous_path.as_deref(), &item.target_path)?;
             }
         }
         for item in copied {
@@ -655,7 +670,7 @@ impl CatalogWriter {
                 if let Some(suffix) = matched_path_suffix(&path, &old) {
                     let target = format!("{new}{}", suffix.replace('/', "\\"));
                     update_column(&tx, table, id, "path", &target)?;
-                    if table == "assets" { self.track_incoming(&tx, id, &target)?; }
+                    if table == "assets" { self.track_incoming_move(&tx, id, Some(&path), &target)?; }
                     if table == "folders" && suffix.is_empty() {
                         update_column(&tx, table, id, "name", new.rsplit('\\').next().unwrap_or(&new))?;
                     }

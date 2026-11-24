@@ -145,38 +145,54 @@ fn normalized_catalog_path(path: &str) -> String {
 pub fn folder_previews(db: &Db, paths: &[String], formats: &FormatTable) -> rusqlite::Result<HashMap<String, Vec<FolderPreviewAsset>>> {
     let mut result: HashMap<String, Vec<FolderPreviewAsset>> = paths.iter().cloned().map(|p| (p, Vec::new())).collect();
     if result.is_empty() { return Ok(result); }
-    // The candidate list is a full scan of the catalogue (~250 ms on 90k files), so it is kept for a
-    // minute per database; previews are decoration and may lag behind catalogue changes that long.
-    type Candidates = Arc<Vec<(i64, String, Option<String>, String)>>;
-    static CACHE: Mutex<Option<(usize, std::time::Instant, Candidates)>> = Mutex::new(None);
-    let key = Arc::as_ptr(db) as usize;
-    let cached = CACHE.lock().unwrap().as_ref().filter(|(k, at, _)| *k == key && at.elapsed().as_secs() < 60).map(|(_, _, c)| c.clone());
-    let candidates: Candidates = match cached {
-        Some(c) => c,
+    // Cache the first four direct and descendant previews in the original name order.
+    #[derive(Default)]
+    struct FolderPreviews {
+        direct: Vec<Arc<FolderPreviewAsset>>,
+        descendants: Vec<Arc<FolderPreviewAsset>>,
+    }
+    type PreviewIndex = Arc<HashMap<String, FolderPreviews>>;
+    static CACHE: Mutex<Option<(std::sync::Weak<Mutex<Connection>>, std::time::Instant, PreviewIndex)>> = Mutex::new(None);
+    let key = Arc::downgrade(db);
+    let cached = CACHE.lock().unwrap().as_ref()
+        .filter(|(cached_db, at, _)| cached_db.ptr_eq(&key) && at.elapsed().as_secs() < 60)
+        .map(|(_, _, index)| index.clone());
+    let index = match cached {
+        Some(index) => index,
         None => {
             let rows = {
                 let conn = db.lock().unwrap();
                 let visual_extensions = formats.sql_in("ext_lower", &["image", "raw"]);
                 let sql = format!("SELECT id,path,file_modified,ext FROM assets WHERE is_listed=1 AND path IS NOT NULL AND {visual_extensions} ORDER BY name COLLATE NOCASE");
                 let mut stmt = conn.prepare(&sql)?;
-                let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, String>(3)?)))?;
+                let rows = stmt.query_map([], |r| Ok((FolderPreviewAsset { id: r.get(0)?, path: r.get(1)?, file_modified: r.get(2)? }, r.get::<_, String>(3)?)))?;
                 rows.collect::<rusqlite::Result<Vec<_>>>()?
             };
-            let list: Candidates = Arc::new(rows.into_iter()
-                .filter(|(_, _, _, ext)| matches!(formats.group(ext), Some("image" | "raw")))
-                .map(|(id,path,file_modified,_)| { let key = normalized_catalog_path(&path); (id,path,file_modified,key) }).collect());
-            *CACHE.lock().unwrap() = Some((key, std::time::Instant::now(), list.clone()));
-            list
+            let mut index = HashMap::<String, FolderPreviews>::new();
+            for (preview, ext) in rows {
+                if !matches!(formats.group(&ext), Some("image" | "raw")) { continue; }
+                let path = normalized_catalog_path(&preview.path);
+                let Some((parent, _)) = path.rsplit_once('/') else { continue; };
+                let preview = Arc::new(preview);
+                let direct = &mut index.entry(parent.to_owned()).or_default().direct;
+                if direct.len() < 4 { direct.push(preview.clone()); }
+                let mut ancestor = parent;
+                while let Some((next, _)) = ancestor.rsplit_once('/') {
+                    let descendants = &mut index.entry(next.to_owned()).or_default().descendants;
+                    if descendants.len() < 4 { descendants.push(preview.clone()); }
+                    ancestor = next;
+                }
+            }
+            let index = Arc::new(index);
+            *CACHE.lock().unwrap() = Some((key, std::time::Instant::now(), index.clone()));
+            index
         }
     };
-    for requested in paths {
-        let folder = normalized_catalog_path(requested);
-        let direct = candidates.iter().filter(|(_, _, _, candidate)| candidate.rsplit_once('/').map(|(parent, _)| parent) == Some(folder.as_str())).take(4).collect::<Vec<_>>();
-        let selected = if direct.is_empty() {
-            let prefix = format!("{folder}/");
-            candidates.iter().filter(|(_, _, _, candidate)| candidate.starts_with(&prefix)).take(4).collect::<Vec<_>>()
-        } else { direct };
-        result.insert(requested.clone(), selected.into_iter().map(|(id,path,file_modified,_)| FolderPreviewAsset { id:*id, path:path.clone(), file_modified:file_modified.clone() }).collect());
+    for (requested, previews) in &mut result {
+        if let Some(folder) = index.get(&normalized_catalog_path(requested)) {
+            let selected = if folder.direct.is_empty() { &folder.descendants } else { &folder.direct };
+            previews.extend(selected.iter().map(|preview| preview.as_ref().clone()));
+        }
     }
     Ok(result)
 }
@@ -344,7 +360,7 @@ pub fn date_column(source: Option<&str>) -> Option<&'static str> {
 }
 
 pub fn valid_date_sql(column: &str) -> String {
-    format!("{column} IS NOT NULL AND length({column})>=10 AND substr({column},1,4) GLOB '[0-9][0-9][0-9][0-9]' AND substr({column},1,4)>='1900' AND substr({column},5,1)='-' AND CAST(substr({column},6,2) AS INTEGER) BETWEEN 1 AND 12 AND substr({column},8,1)='-' AND CAST(substr({column},9,2) AS INTEGER) BETWEEN 1 AND 31")
+    format!("{column} IS NOT NULL AND length({column})>=10 AND substr({column},1,4) GLOB '[0-9][0-9][0-9][0-9]' AND substr({column},1,4)>='1900' AND substr({column},5,1)='-' AND CAST(substr({column},6,2) AS INTEGER) BETWEEN 1 AND 12 AND substr({column},8,1)='-' AND CAST(substr({column},9,2) AS INTEGER) BETWEEN 1 AND 31 AND coalesce(date(substr({column},1,10),'+0 days')=substr({column},1,10),0)")
 }
 
 pub fn next_date(date: &str) -> Option<String> {
@@ -1165,15 +1181,36 @@ mod feature_tests {
         Arc::new(Mutex::new(c))
     }
     #[test]
+    fn invalid_calendar_dates_are_included_in_no_date() {
+        let conn = Connection::open_in_memory().unwrap();
+        let valid = valid_date_sql("?1");
+        for (date, expected) in [
+            (Some("2020-02-29T12:00:00"), true),
+            (Some("2020-02-31"), false),
+            (Some("1900-02-29"), false),
+            (Some("2020-04-31"), false),
+            (Some("2020-2x-01"), false),
+            (None, false),
+        ] {
+            let undated = conn.query_row(&format!("SELECT NOT ({valid})"), [date], |row| row.get::<_, bool>(0)).unwrap();
+            assert_eq!(undated, !expected, "{date:?}");
+        }
+    }
+
+    #[test]
     fn folder_previews_use_direct_images_then_descendants() {
         let db = test_db();
-        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,path,file_modified) VALUES (1,'one.jpg','jpg','jpg',1,'C:/photos/one.jpg','2025-01-01'),(2,'two.png','png','png',1,'C:/photos/empty/inner/two.png','2025-01-02'),(3,'clip.mp4','mp4','mp4',1,'C:/photos/clip.mp4',NULL),(4,'gone.jpg','jpg','jpg',0,'C:/photos/gone.jpg',NULL)").unwrap();
+        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,path,file_modified) VALUES (1,'one.jpg','jpg','jpg',1,'C:/photos/one.jpg','2025-01-01'),(2,'two.png','png','png',1,'C:/photos/empty/inner/two.png','2025-01-02'),(3,'clip.mp4','mp4','mp4',1,'C:/photos/clip.mp4',NULL),(4,'gone.jpg','jpg','jpg',0,'C:/photos/gone.jpg',NULL),
+            (5,'ba.jpg','jpg','jpg',1,'C:/photos/empty/other/ba.jpg',NULL),
+            (6,'a.jpg','jpg','jpg',1,'C:/photos/empty/inner/deep/a.jpg',NULL),
+            (7,'zz.jpg','jpg','jpg',1,'C:/photos/empty/other/zz.jpg',NULL),
+            (8,'09.jpg','jpg','jpg',1,'C:/photos/empty/x/y/09.jpg',NULL)").unwrap();
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
         let result = folder_previews(&db, &["C:\\photos".into(), "C:\\empty".into()], &formats).unwrap();
         assert_eq!(result["C:\\photos"].iter().map(|a| a.id).collect::<Vec<_>>(), vec![1]);
         assert_eq!(result["C:\\empty"].len(), 0);
         let descendants = folder_previews(&db, &["C:\\photos\\empty".into()], &formats).unwrap();
-        assert_eq!(descendants["C:\\photos\\empty"][0].id, 2);
+        assert_eq!(descendants["C:\\photos\\empty"].iter().map(|a| a.id).collect::<Vec<_>>(), vec![8, 6, 5, 2]);
     }
     fn test_filter(kind:&str,value:&str)->AssetFilter { AssetFilter{kind:kind.into(),id:None,root_id:None,include_children:false,folder_path:None,ids:None,value:Some(value.into()),query:None,sort:"name".into(),descending:false,offset:0,limit:10,rating_mode:None,rating_value:None,label_filter:None,tagged_only:false,include_categories:false,include_keywords:false,date_from:None,date_to:None,date_source:None,date_no_date:false,file_group:None} }
     #[test]

@@ -54,7 +54,7 @@ pub fn run() {
     let raw_plugin = paths.ai_python.clone().zip(paths.ai_script.parent().and_then(|p| p.parent()).map(|p| p.join("raw").join("ddreams_raw.py")))
         .filter(|(python, script)| python.is_file() && script.is_file())
         .map(|(python, script)| thumbs::RawPluginConfig { python, script });
-    let thumbs = thumbs::ThumbService::new(db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone(), raw_plugin);
+    let thumbs = thumbs::ThumbService::new(background_db.clone(), listing.clone(), exif.clone(), formats.clone(), paths.cache.clone(), raw_plugin);
     let writer = Arc::new(journal::CatalogWriter::new(db.clone(), !paths.readonly));
     let _ = writer.folder_rules();
     let ai_service = ai::AiService::new(paths.clone(), db.clone(), formats.clone(), writer.clone(), exif.clone());

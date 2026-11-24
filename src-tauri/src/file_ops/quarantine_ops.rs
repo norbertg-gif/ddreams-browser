@@ -589,7 +589,7 @@ impl FileManager {
             if let Err(error) = self.fs.recycle_delete(&files) {
                 return Err(combine_error(
                     error,
-                    self.rollback_quarantine_recycle(&files),
+                    self.restore_recycled_files(&files, true),
                 ));
             }
         } else {
@@ -618,7 +618,7 @@ impl FileManager {
             if recycle {
                 return Err(combine_error(
                     error,
-                    self.rollback_quarantine_recycle(&files),
+                    self.restore_recycled_files(&files, false),
                 ));
             }
             outcome.deleted += 1;
@@ -644,11 +644,11 @@ impl FileManager {
         Ok(())
     }
 
-    fn rollback_quarantine_recycle(&self, files: &[PathBuf]) -> Result<(), String> {
+    pub(super) fn restore_recycled_files(&self, files: &[PathBuf], skip_existing: bool) -> Result<(), String> {
         let errors = files
             .iter()
-            .filter(|path| !self.fs.exists(path))
-            .filter_map(|path| self.fs.restore_recycled(path).err())
+            .filter(|path| !skip_existing || !self.fs.exists(path))
+            .filter_map(|path| self.fs.restore_recycled(path).err().map(|error| format!("{}: {error}", path.display())))
             .collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(())

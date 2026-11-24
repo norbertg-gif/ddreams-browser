@@ -438,6 +438,8 @@ input[type=checkbox]{accent-color:var(--accent)}
 .viewer-bar>*{flex:none}
 .viewer-bar button,.viewer-bar select{height:32px;padding:0 12px;border:1px solid var(--line);border-radius:9px;background:var(--panel);color:var(--text)}
 .viewer-bar button:hover:not(:disabled){background:var(--hover)}
+.viewer-bar .viewer-triage{height:28px;padding:0 8px}
+.viewer-bar .viewer-triage[aria-pressed="true"]{border-color:var(--accent);color:var(--accent)}
 .viewer-bar .primary{background:var(--accent);border-color:var(--accent);color:#06121f;font-weight:650}
 .viewer-bar .primary:hover:not(:disabled){background:#6db3f5}
 .viewer-bar label{display:flex;align-items:center;gap:8px}

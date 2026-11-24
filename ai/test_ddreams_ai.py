@@ -29,6 +29,43 @@ class FakePhoto:
 def set_vectors(service, vectors):
     service._vectors = VectorIndex(list(vectors), np.stack(list(vectors.values())))
 
+class ShutdownTests(unittest.TestCase):
+    def test_stop_notifies_waiters_before_shutting_down_pools(self):
+        service = AIService.__new__(AIService)
+        service._condition = threading.Condition()
+        service._stop = False
+        service._loader = service._worker = service._face_worker = None
+        service.faces_db = None
+        service.db_lock = threading.Lock()
+        service.db = MagicMock()
+        waiting = threading.Event()
+        woken = threading.Event()
+
+        def wait_for_stop():
+            with service._condition:
+                waiting.set()
+                if service._condition.wait_for(lambda: service._stop, timeout=5):
+                    woken.set()
+
+        def check_stop(*_args, **_kwargs):
+            self.assertTrue(service._stop)
+            self.assertTrue(woken.wait(1))
+
+        service._query_pool = SimpleNamespace(shutdown=check_stop)
+        service._vector_pool = SimpleNamespace(shutdown=check_stop)
+        service._folder_catalog = SimpleNamespace(close=check_stop)
+        waiter = threading.Thread(target=wait_for_stop, daemon=True)
+        waiter.start()
+        try:
+            self.assertTrue(waiting.wait(1))
+            service.stop()
+        finally:
+            with service._condition:
+                service._stop = True
+                service._condition.notify_all()
+            waiter.join(1)
+
+
 class SiglipLockTests(unittest.TestCase):
     def test_preprocessing_is_unlocked_but_model_and_tokenizer_are_serialized(self):
         embedder = SiglipEmbedder.__new__(SiglipEmbedder)

@@ -2936,13 +2936,13 @@ class AIService:
             self.stop()
 
     def stop(self) -> None:
+        with self._condition:
+            self._stop = True
+            self._condition.notify_all()
         self._query_pool.shutdown(wait=True)
         self._vector_pool.shutdown(wait=True)
         if self._folder_catalog is not None:
             self._folder_catalog.close()
-        with self._condition:
-            self._stop = True
-            self._condition.notify_all()
         if self._loader and self._loader is not threading.current_thread():
             self._loader.join()
         if self._worker and self._worker is not threading.current_thread():

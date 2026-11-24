@@ -4,7 +4,7 @@ import { launchEditor, useEditors, type Editor } from "./editors";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createPortal } from "react-dom";
-import AssetGrid, { formatBytes, formatFor, labelText, thumbUrl } from "./components/AssetGrid";
+import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch } from "./components/AssetGrid";
 import MapView from "./components/MapView";
 import LeftPanel from "./components/LeftPanel";
 import RightPanel from "./components/RightPanel";
@@ -157,6 +157,17 @@ export default function App() {
   const [folderDeleteConfirm,setFolderDeleteConfirm]=useState<{path:string;info:{files:number;folders:number;catalogued:number;bytes:number;recycleAvailable:boolean}}|null>(null);
   const [operationProgress,setOperationProgress]=useState("");
   const [viewer, setViewer] = useState<{ asset: Asset; index: number } | null>(null);
+  const currentViewer = useRef(viewer);
+  const viewerValuePatches = useRef(new Map<number, AssetValuePatch>());
+  currentViewer.current = viewer;
+  const grid = useRef<AssetGridHandle>(null);
+  const valueWrites = useRef(Promise.resolve());
+  // A photo that just received a catalogue ID is still the same selection.
+  const valueAliases = useRef(new Map<number, number>());
+  const [valueTokens, setValueTokens] = useState({ rating: 0, label: 0, special: 0 });
+  const [primaryValueEdit, setPrimaryValueEdit] = useState<{ patch: AssetValuePatch; refreshTick: number }>();
+  const valueContext = useRef({ primaryId, refreshTick, historyOpen });
+  valueContext.current = { primaryId, refreshTick, historyOpen };
   const [slideshow, setSlideshow] = useState(false);
   const [slideshowSeconds, setSlideshowSeconds] = useState(5);
   const [viewerFit,setViewerFit]=useState(true);
@@ -169,11 +180,28 @@ export default function App() {
   const [formats,setFormats]=useState<FormatTable>({version:0,formats:[]});
   const [viewerCanvasSize,setViewerCanvasSize]=useState({width:0,height:0});
   const viewerCanvasRef=useRef<HTMLDivElement>(null);
+  const viewerOverlayRef = useRef<HTMLDivElement>(null);
+  const viewerOpen = viewer !== null;
+  useEffect(() => {
+    if (!viewerOpen) return;
+    const priorFocus = document.activeElement;
+    viewerOverlayRef.current?.focus({ preventScroll: true });
+    return () => {
+      viewerValuePatches.current.clear();
+      if (priorFocus instanceof HTMLElement && priorFocus.isConnected) priorFocus.focus({ preventScroll: true });
+    };
+  }, [viewerOpen]);
 
   useEffect(() => { const timer = window.setTimeout(() => setQueryDebounced(query), 180); return () => window.clearTimeout(timer); }, [query]);
   useEffect(() => { setZoom(readStored("ddreams.zoom",168)); const path=readStored("ddreams.lastFolder",DEFAULT_PATH); void invoke<Folder | null>("find_folder_path", { path }).then(folder => { const v=folder?{kind:"folder" as const,id:folder.id,ids:folder.folderIds,title:folder.path??folder.name,folderPath:folder.path??undefined}:{kind:"folder" as const,id:-1,title:DEFAULT_PATH,folderPath:DEFAULT_PATH};viewResolved.current=performance.now();void invoke("startup_mark",{label:"initial folder resolved"}).catch(()=>{});setView(v);setHistory([v]);setHistoryIndex(0); }).catch(() => { viewResolved.current=performance.now(); const v={kind:"folder" as const,id:-1,title:DEFAULT_PATH,folderPath:DEFAULT_PATH};setView(v);setHistory([v]);setHistoryIndex(0); }); }, []);
   useEffect(()=>{void invoke<FormatTable>("get_formats").then(setFormats).catch(error=>console.error("Format table failed to load",error));},[]);
-  useEffect(()=>{void invoke<ValueCount[]>("get_catalog_values",{kind:"label",offset:0,limit:500}).then(setAvailableLabels).catch(()=>setAvailableLabels([]))},[]);
+  useEffect(() => {
+    let active = true;
+    void invoke<ValueCount[]>("get_catalog_values", { kind: "label", offset: 0, limit: 500 })
+      .then(labels => { if (active) setAvailableLabels(labels); })
+      .catch(() => { if (active) setAvailableLabels([]); });
+    return () => { active = false; };
+  }, [refreshTick, valueTokens.label]);
   useEffect(() => writeStored("ddreams.zoom",zoom),[zoom]);
   useEffect(() => writeStored("ddreams.overlay",overlayMode),[overlayMode]);
   useEffect(() => writeStored("ddreams.hover",hoverMode),[hoverMode]);
@@ -182,6 +210,9 @@ export default function App() {
   useEffect(()=>writeStored("ddreams.aiEnabled",aiEnabled),[aiEnabled]);
   useEffect(()=>writeStored("ddreams.aiLoadModelAtStart",aiLoadModelAtStart),[aiLoadModelAtStart]);
   const selectedList=useMemo(()=>[...selectedIds],[selectedIds]);
+  const selectedReadIds = useMemo(() => selectedList.map(id => valueAliases.current.get(id) ?? id), [selectedList]);
+  const primaryReadId = primaryId == null ? null : valueAliases.current.get(primaryId) ?? primaryId;
+  const viewerReadId = viewer ? valueAliases.current.get(viewer.asset.id) ?? viewer.asset.id : null;
   const [aiTick,setAiTick]=useState(0);
   useEffect(()=>{if(aiStatus.state!=="indexing")return;const timer=window.setInterval(()=>setAiTick(v=>v+1),20000);return()=>window.clearInterval(timer)},[aiStatus.state]);
   useEffect(()=>{if(view.kind!=="ai"||!view.title.startsWith("AI:"))return;const base=view.title.replace(/ · prehľadané [\d\s\u00a0]+ z [\d\s\u00a0]+$/u,"");const suffix=aiStatus.indexed<aiStatus.total?` · prehľadané ${aiStatus.indexed.toLocaleString("sk-SK")} z ${aiStatus.total.toLocaleString("sk-SK")}`:"";const title=base+suffix;if(title!==view.title)setView(current=>current===view?{...current,title}:current)},[aiStatus.indexed,aiStatus.total,view]);
@@ -197,6 +228,8 @@ export default function App() {
   };
   const assetFilter = useMemo(() => buildAssetFilter(view, queryDebounced, sort, descending, queryFilters, includeChildren),
     [view, queryDebounced, sort, descending, queryFilters, includeChildren]);
+  const currentAssetFilter = useRef(assetFilter);
+  currentAssetFilter.current = assetFilter;
   const [ready, setReady] = useState(false);
   useEffect(() => {
     if (!ready || !appInfo) return;
@@ -238,8 +271,18 @@ export default function App() {
   }, [selectedIds, primaryId]);
   const selectRange = useCallback((ids: number[], asset: Asset, _index: number, add = false) => { setSelectedIds(current => new Set(add ? [...current, ...ids] : ids)); setPrimaryId(asset.id); setPrimaryAsset(asset); }, []);
   const selectAll = useCallback(async (ids: number[]) => { setSelectedIds(new Set(ids)); if (!ids.length) {setPrimaryId(null);setPrimaryAsset(null);return;} const wanted=new Set(ids);const page = await invoke<Page>("get_assets", { filter: {...assetFilter, offset:0, limit:500} }); const asset=page.items.find(a=>wanted.has(a.id));if(asset){setPrimaryId(asset.id);setPrimaryAsset(asset);} }, [assetFilter]);
-  const updateViewport = useCallback(() => { setEpoch(v => { const next=v+1;void invoke("set_thumbnail_epoch",{epoch:next});return next; }); }, []);
-  useEffect(()=>{updateViewport()},[view,updateViewport]);
+  const epochCounter = useRef(epoch);
+  const updateViewport = useCallback(() => {
+    const next = ++epochCounter.current;
+    setEpoch(next);
+    void invoke("set_thumbnail_epoch", { epoch: next });
+  }, []);
+  const viewportView = useRef<View | null>(null);
+  useEffect(() => {
+    if (viewportView.current === view) return;
+    viewportView.current = view;
+    updateViewport();
+  }, [view, updateViewport]);
   const up = useCallback(async()=>{if(view.kind!=="folder")return;const p=view.folderPath??view.title;const parts=p.split(/[\\/]/).filter(Boolean);if(parts.length<=1)return;parts.pop();let parent=parts.join("\\");if(/^[A-Za-z]:$/.test(parent))parent+="\\";const f=await invoke<Folder|null>("find_folder_path",{path:parent}).catch(()=>null);if(f)navigate({kind:"folder",id:f.id,ids:f.folderIds,title:f.path??f.name,folderPath:f.path??undefined});},[view,navigate]);
   const refresh = useCallback(()=>{if(view.kind==="folder"&&view.id!=null)void invoke("refresh_folder_listing",{folderId:view.id});setRefreshTick(v=>v+1);setTreeRefreshPaths([]);setTreeRefreshTick(v=>v+1);updateViewport();},[view,updateViewport]);
   const loadRecentChanges=useCallback(()=>{void invoke<RecentChange[]>("get_recent_changes",{limit:20}).then(setRecentChanges).catch(()=>setRecentChanges([]));},[]);
@@ -266,18 +309,88 @@ export default function App() {
       window.setTimeout(() => setToast(""), 4000);
     }
   };
-  const setAssetValues=useCallback(async(ids:number[],changes:Record<string,unknown>)=>{
-    if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");window.setTimeout(()=>setToast(""),2200);return;}
-    if(!ids.length)return;
-    try{
-      const result=await invoke<{changeId:number|null;summary:string;remappedIds:{oldId:number;newId:number}[];assets:{id:number;rating:number|null;label:string|null;tagged:boolean;editPendingSince:number|null}[]}>("set_asset_values",{assetIds:ids,changes});
-      const remap=new Map(result.remappedIds.map(item=>[item.oldId,item.newId]));
-      setSelectedIds(previous=>new Set([...previous].map(id=>remap.get(id)??id)));
-      const nextPrimary=primaryId==null?null:remap.get(primaryId)??primaryId;
-      if(nextPrimary!=null){const state=result.assets.find(asset=>asset.id===nextPrimary);if(state){setPrimaryId(nextPrimary);setPrimaryAsset(previous=>previous?{...previous,id:nextPrimary,rating:state.rating,label:state.label,tagged:state.tagged?1:0,...("editPending" in changes?{editPendingSince:state.editPendingSince}:{})}:previous);}}
-      setToast(result.summary);refreshAfterWrite();window.setTimeout(()=>setToast(""),6000);
-    }catch(error){const message=String(error);setToast(message.toLowerCase().includes("read-only")?"Katalóg je iba na čítanie":message);window.setTimeout(()=>setToast(""),3000);}
-  },[appInfo,primaryId,refreshAfterWrite]);
+  const setAssetValues = useCallback((ids: number[], changes: Record<string, unknown>) => {
+    if (appInfo?.readonly) { setToast("Katalóg je iba na čítanie"); window.setTimeout(() => setToast(""), 2200); return; }
+    if (!ids.length) return;
+    const ratingEdited = "rating" in changes, labelEdited = "label" in changes;
+    const taggedEdited = "tagged" in changes, pendingEdited = "editPending" in changes;
+    const write = async () => {
+      try {
+        const result = await invoke<{
+          changeId: number | null;
+          summary: string;
+          remappedIds: { oldId: number; newId: number }[];
+          assets: { id: number; rating: number | null; label: string | null; tagged: boolean; editPendingSince: number | null }[];
+        }>("set_asset_values", { assetIds: ids, changes });
+        const patches = new Map<number, AssetValuePatch>(result.assets.map(asset => [asset.id, {
+          id: asset.id, rating: asset.rating, label: asset.label, tagged: Number(asset.tagged),
+          ...(pendingEdited ? { editPendingSince: asset.editPendingSince } : {}),
+        }]));
+        const remap = new Map(result.remappedIds.map(({ oldId, newId }) => [oldId, newId]));
+        for (const [oldId, newId] of remap) {
+          const patch = patches.get(newId);
+          if (patch) patches.set(oldId, patch);
+        }
+        if (remap.size) {
+          for (const [oldId, newId] of remap) valueAliases.current.set(newId, oldId);
+          setSelectedIds(previous => [...previous].some(id => remap.has(id))
+            ? new Set([...previous].map(id => remap.get(id) ?? id)) : previous);
+          setPrimaryId(id => id == null ? id : remap.get(id) ?? id);
+        }
+        const patchAsset = (asset: Asset) => {
+          const patch = patches.get(asset.id);
+          return patch ? { ...asset, ...patch } : asset;
+        };
+        if (currentViewer.current) {
+          for (const [id, patch] of patches) {
+            viewerValuePatches.current.set(id, { ...viewerValuePatches.current.get(id), ...patch });
+          }
+        }
+        setPrimaryAsset(previous => previous && patchAsset(previous));
+        setViewer(previous => {
+          if (!previous) return previous;
+          const asset = patchAsset(previous.asset);
+          return asset === previous.asset ? previous : { ...previous, asset };
+        });
+        const context = valueContext.current;
+        const patch = context.primaryId == null ? undefined : patches.get(context.primaryId);
+        if (patch) {
+          setPrimaryValueEdit(previous => ({
+            patch: {
+              ...(previous?.refreshTick === context.refreshTick && previous.patch.id === patch.id ? previous.patch : {}),
+              ...patch,
+            },
+            refreshTick: context.refreshTick,
+          }));
+        }
+        if (result.changeId != null) {
+          const filter = currentAssetFilter.current;
+          const reloadListing =
+            (ratingEdited && (filter.kind === "rating" || !!filter.ratingMode || filter.sort === "rating")) ||
+            (labelEdited && (filter.kind === "label" || !!filter.labelFilter || filter.sort === "label")) ||
+            (taggedEdited && (filter.taggedOnly || (filter.kind === "special" && filter.value === "tagged"))) ||
+            (pendingEdited && filter.kind === "special" && filter.value === "edit_pending");
+          grid.current?.applyValues(patches, reloadListing);
+          setValueTokens(tokens => ({
+            rating: tokens.rating + Number(ratingEdited || !!remap.size),
+            label: tokens.label + Number(labelEdited || !!remap.size),
+            special: tokens.special + Number(taggedEdited || pendingEdited || !!remap.size),
+          }));
+          if (context.historyOpen) loadRecentChanges();
+        } else {
+          grid.current?.applyValues(patches, false);
+        }
+        setToast(result.summary);
+        window.setTimeout(() => setToast(""), 6000);
+      } catch (error) {
+        const message = String(error);
+        setToast(message.toLowerCase().includes("read-only") ? "Katalóg je iba na čítanie" : message);
+        window.setTimeout(() => setToast(""), 3000);
+      }
+    };
+    valueWrites.current = valueWrites.current.then(write);
+    return valueWrites.current;
+  }, [appInfo?.readonly, loadRecentChanges]);
   const setAssetColors=useCallback(async(ids:number[],color:string,state:boolean|null)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}try{const count=await invoke<number>("set_asset_colors",{assetIds:ids,color,state});if(count){setToast(`Farba ${color} opravená`);refreshAfterWrite();window.setTimeout(()=>setRefreshTick(v=>v+1),2400);window.setTimeout(()=>setToast(""),6000)}}catch(error){setToast(String(error));window.setTimeout(()=>setToast(""),3500)}},[appInfo,refreshAfterWrite]);
   const setAssetCategories=useCallback(async(ids:number[],categoryId:number,assign:boolean):Promise<boolean>=>{
     if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");window.setTimeout(()=>setToast(""),2200);return false;}
@@ -331,6 +444,61 @@ export default function App() {
     setSelectedIds(new Set(ids));if(ids.length){const page=await invoke<Page>("get_assets",{filter:{...filter,offset:0,limit:500}});const asset=page.items.find(item=>item.id===ids[0]);if(asset){setPrimaryId(asset.id);setPrimaryAsset(asset);}}
   },[assetFilter]);
   const copyCurrentResult=useCallback(async()=>{let lines:string[]=[];for(let offset=0;offset<total;offset+=500){const p=await invoke<Page>("get_assets",{filter:{...assetFilter,offset,limit:500}});for(const a of p.items)if(!a.isDirectory)lines.push([a.name,a.size??"",a.ext,a.fileModified??"",a.width&&a.height?`${a.width} × ${a.height}`:"",a.caption??"",a.rating??""].join("\t"));if(p.items.length<500)break;}await navigator.clipboard.writeText(lines.join("\n"));setToast(`Skopírované: ${slovakItems(lines.length)}`);window.setTimeout(()=>setToast(""),1600);},[assetFilter,total]);
+  const showViewerAsset = useCallback((asset: Asset, index: number) => {
+    const patch = viewerValuePatches.current.get(asset.id);
+    const shown = patch ? { ...asset, ...patch } : asset;
+    const next = { asset: shown, index };
+    currentViewer.current = next;
+    setViewer(next);
+    setViewerDimensions(null);
+    setPrimaryId(shown.id);
+    setPrimaryAsset(shown);
+    setSelectedIds(new Set([shown.id]));
+    if (!viewerLock) {
+      setViewerFit(true);
+      setViewerZoom(1);
+      setViewerPan({ x: 0, y: 0 });
+    }
+  }, [viewerLock]);
+
+  const advanceAfterRemoval = useCallback(async (removedIds: number[]) => {
+    const shown = currentViewer.current;
+    if (!shown || !removedIds.includes(shown.asset.id)) return;
+    const filter = currentAssetFilter.current;
+    const stillShowing = () => currentViewer.current?.asset.id === shown.asset.id && currentAssetFilter.current === filter;
+    const canShow = (asset: Asset) => !removedIds.includes(asset.id) && !asset.isDirectory
+      && !asset.offline && !asset.missing && !!asset.path && isImage(asset, formats);
+    const pageSize = 60;
+    try {
+      let total = 0;
+      for (let offset = shown.index; ; offset += pageSize) {
+        const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: pageSize } });
+        if (!stillShowing()) return;
+        total = page.total;
+        const index = page.items.findIndex(canShow);
+        if (index !== -1) { showViewerAsset(page.items[index], offset + index); return; }
+        if (offset + pageSize >= total) break;
+      }
+      for (let end = Math.min(shown.index, total); end > 0;) {
+        const offset = Math.max(0, end - pageSize);
+        const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: end - offset } });
+        if (!stillShowing()) return;
+        for (let index = page.items.length - 1; index >= 0; index--) {
+          if (canShow(page.items[index])) { showViewerAsset(page.items[index], offset + index); return; }
+        }
+        end = offset;
+      }
+    } finally {
+      if (stillShowing()) {
+        currentViewer.current = null;
+        setViewer(null);
+      }
+    }
+  }, [formats, showViewerAsset]);
+
+  const requestQuarantineMove = (ids: number[]) => {
+    if (!appInfo?.readonly && !quarantineBusy) setQuarantineConfirm({ ids, action: "move" });
+  };
   const folderActionRef=useRef<((action:"rename"|"delete",path:string)=>Promise<void>)|null>(null);
   const runQuarantine = async (command: string, args: Record<string, unknown>) => {
     if (quarantineRunning.current) return;
@@ -351,6 +519,16 @@ export default function App() {
         setPrimaryId(null);
         setPrimaryAsset(null);
         refreshAfterWrite(true, result.affectedFolderPaths);
+        if ((command === "move_to_quarantine" || command === "delete_from_quarantine") && Array.isArray(args.assetIds)) {
+          const failures = new Set(result.failures.flatMap(error => {
+            const match = /^Položka (-?\d+):/.exec(error);
+            return match ? [Number(match[1])] : [];
+          }));
+          const successfulIds = (args.assetIds as number[]).filter(id => !failures.has(id));
+          const count = command === "move_to_quarantine" ? result.moved : result.deleted;
+          if (count === successfulIds.length) await advanceAfterRemoval(successfulIds);
+          else if (args.assetIds.length === 1 && count === 1) await advanceAfterRemoval(args.assetIds as number[]);
+        }
       }
       setQuarantineFailures(result.failures);
       window.setTimeout(() => setToast(""), 8000);
@@ -402,7 +580,22 @@ export default function App() {
   folderActionRef.current=folderAction;
   const submitFolderRename=useCallback(async(name:string)=>{if(!folderRenameOp)return;const {path}=folderRenameOp;setFolderRenameOp(null);try{const result=await invoke<any>("rename_folder",{path,newName:name});setToast(result.summary);const newPath=result.newPath as string|undefined;if(newPath)window.dispatchEvent(new CustomEvent("ddreams-folder-path-changed",{detail:{oldPath:path,newPath}}));refreshAfterWrite(true,newPath?[path,newPath]:[path]);if(newPath&&view.kind==="folder"&&view.folderPath){const norm=(v:string)=>v.replace(/[\\/]+$/g,"").toLowerCase();const cur=norm(view.folderPath),old=norm(path);if(cur===old||cur.startsWith(old+"\\")){const moved=newPath+view.folderPath.slice(path.replace(/[\\/]+$/g,"").length);const folder=await invoke<Folder|null>("find_folder_path",{path:moved}).catch(()=>null);if(folder)navigate({kind:"folder",id:folder.id,ids:folder.folderIds,title:folder.path??folder.name,folderPath:folder.path??undefined});}}window.setTimeout(()=>setToast(""),6000)}catch(error){setToast(String(error))}},[folderRenameOp,refreshAfterWrite,view,navigate]);
   const confirmFolderDelete=useCallback(async()=>{if(!folderDeleteConfirm)return;const {path}=folderDeleteConfirm;setFolderDeleteConfirm(null);try{const result=await invoke<any>("delete_folder",{path});setToast(result.summary);refreshAfterWrite(true,result.affectedFolderPaths??[path]);const current=view.folderPath??"";const norm=(v:string)=>v.replace(/[\\/]+$/g,"").toLowerCase();if(current&&(norm(current)===norm(path)||norm(current).startsWith(norm(path)+"\\"))){const parent=folderParentPath(path);const folder=parent?await invoke<Folder|null>("find_folder_path",{path:parent}).catch(()=>null):null;if(folder)navigate({kind:"folder",id:folder.id,ids:folder.folderIds,title:folder.path??folder.name,folderPath:folder.path??undefined});else navigate({kind:"special",value:"all_photos",title:"Všetky fotky"})}window.setTimeout(()=>setToast(""),6000)}catch(error){setToast(String(error));}},[folderDeleteConfirm,refreshAfterWrite,view.folderPath,navigate]);
-  const runDelete=useCallback(async(ids:number[],permanent:boolean,confirmedNoBinDrives:string[])=>{setDeleteConfirm(null);try{const result=await invoke<any>("delete_files",{assetIds:ids,permanent,confirmedNoBinDrives});setToast(result.summary);setSelectedIds(prev=>new Set([...prev].filter(id=>!ids.includes(id))));if(primaryId!=null&&ids.includes(primaryId)){setPrimaryId(null);setPrimaryAsset(null);}refreshAfterWrite(false,result.affectedFolderPaths??[]);window.setTimeout(()=>setToast(""),8000);}catch(error){setToast(String(error));window.setTimeout(()=>setToast(""),6000);}},[primaryId,refreshAfterWrite]);
+  const runDelete = useCallback(async (ids: number[], permanent: boolean, confirmedNoBinDrives: string[]) => {
+    setDeleteConfirm(null);
+    try {
+      const result = await invoke<{ summary: string; affectedIds: number[]; affectedFolderPaths: string[] }>(
+        "delete_files", { assetIds: ids, permanent, confirmedNoBinDrives },
+      );
+      setToast(result.summary);
+      const removed = new Set(result.affectedIds);
+      setSelectedIds(prev => new Set([...prev].filter(id => !removed.has(id))));
+      setPrimaryId(id => id != null && removed.has(id) ? null : id);
+      setPrimaryAsset(asset => asset && removed.has(asset.id) ? null : asset);
+      refreshAfterWrite(false, result.affectedFolderPaths);
+      await advanceAfterRemoval(result.affectedIds);
+      window.setTimeout(() => setToast(""), 8000);
+    } catch (error) { setToast(String(error)); window.setTimeout(() => setToast(""), 6000); }
+  }, [refreshAfterWrite, advanceAfterRemoval]);
   const createFolder=useCallback((parentPath:string)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}setFileOp(null);setNameOp({kind:"folder",parentPath});},[appInfo]);
   const submitName=useCallback(async(name:string)=>{if(!nameOp)return;const result=await invoke<any>(nameOp.kind==="rename"?"rename_file":"create_folder",nameOp.kind==="rename"?{assetId:nameOp.assetId,newBaseName:name}:{parentPath:nameOp.parentPath,name});setNameOp(null);setToast(result.summary);setOperationProgress("");const paths=result.affectedFolderPaths??(nameOp.kind==="folder"?[nameOp.parentPath]:primaryAsset?.path?[primaryAsset.path.substring(0,primaryAsset.path.lastIndexOf("\\"))]:[]);refreshAfterWrite(true,paths);window.setTimeout(()=>setToast(""),6000);},[nameOp,primaryAsset,refreshAfterWrite]);
   useEffect(()=>{let unlisten:(()=>void)|undefined;void listen<{operation:string;done:number;total:number}>("file-operation-progress",event=>{if(event.payload.done>=event.payload.total)setOperationProgress("");else setOperationProgress(`${event.payload.operation} ${event.payload.done} / ${event.payload.total}…`)}).then(fn=>{unlisten=fn});return()=>unlisten?.()},[]);
@@ -410,27 +603,28 @@ export default function App() {
   useEffect(()=>{if(!aiOpen)return;const outside=(event:PointerEvent)=>{if(event.target instanceof Node&&!aiRef.current?.contains(event.target))setAiOpen(false)};const escape=(event:globalThis.KeyboardEvent)=>{if(event.key==="Escape"){event.stopPropagation();setAiOpen(false)}};document.addEventListener("pointerdown",outside);window.addEventListener("keydown",escape);return()=>{document.removeEventListener("pointerdown",outside);window.removeEventListener("keydown",escape)}},[aiOpen]);
   useEffect(()=>{const key=(e:globalThis.KeyboardEvent)=>{
     if(e.key==="Shift")window.__ddreamsShift=true;
+    if (e.defaultPrevented || document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]")) return;
     const target=e.target instanceof HTMLElement?e.target:null;const active=document.activeElement instanceof HTMLElement?document.activeElement:null;
     const editable=(el:HTMLElement|null)=>!!el&&(["INPUT","SELECT","TEXTAREA"].includes(el.tagName)||el.isContentEditable);
     if(editable(target)||editable(active))return;
     if(e.ctrlKey&&e.altKey&&!e.shiftKey&&e.code==="KeyX"){if(document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]"))return;e.preventDefault();if(editors[0])openEditor(editors[0],viewer?(!viewer.asset.offline&&!viewer.asset.isDirectory?[viewer.asset.id]:[]):[...selectedIds]);return;}
-    const ids=[...selectedIds];const targets=ids.length?ids:primaryId==null?[]:[primaryId];
+    const ids=[...selectedIds];const targets=viewer?[viewer.asset.id]:ids.length?ids:primaryId==null?[]:[primaryId];
     if(!e.ctrlKey&&!e.metaKey&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==="u"){
-      if(e.repeat||!targets.length||document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]"))return;
+      if (e.repeat || !targets.length) return;
       e.preventDefault();void setAssetValues(targets,{editPending:"toggle"});return;
     }
-    if(e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key>="1"&&e.key<="5"){e.preventDefault();void setAssetValues(targets,{rating:Number(e.key)});return;}
-    if(e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key==="0"){e.preventDefault();void setAssetValues(targets,{rating:null});return;}
-    if(e.altKey&&!e.ctrlKey&&!e.shiftKey&&e.key>="1"&&e.key<="6"){e.preventDefault();const labels=["Red","Yellow","Green","Blue","Purple","Gray"];void setAssetValues(targets,{label:labels[Number(e.key)-1]});return;}
-    if(e.altKey&&!e.ctrlKey&&!e.shiftKey&&e.key==="0"){e.preventDefault();void setAssetValues(targets,{label:null});return;}
-    if(!e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==="x"){if(document.querySelector(".modal-backdrop,[role='dialog'],[role='alertdialog']")||!targets.length)return;e.preventDefault();void invoke<[number,string|null][]>("get_asset_labels",{assetIds:targets}).then(rows=>{if(rows.length!==targets.length)return;const allGray=rows.every(([,label])=>label?.toLowerCase()==="gray");void setAssetValues(targets,{label:allGray?null:"Gray"})});return;}
-    if(!e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key==="\\"){e.preventDefault();void setAssetValues(targets,{tagged:"toggle"});return;}
-    const inGrid=!!target?.closest(".asset-scroll,.tile-context-menu")||!!active?.closest(".asset-scroll,.tile-context-menu");const inViewer=!!viewer&&!!target?.closest(".viewer-overlay");if(!inGrid&&!inViewer)return;
+    if(e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key>="1"&&e.key<="5"){e.preventDefault();if(!e.repeat)void setAssetValues(targets,{rating:Number(e.key)});return;}
+    if(e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key==="0"){e.preventDefault();if(!e.repeat)void setAssetValues(targets,{rating:null});return;}
+    if(e.altKey&&!e.ctrlKey&&!e.shiftKey&&e.key>="1"&&e.key<="6"){e.preventDefault();const labels=["Red","Yellow","Green","Blue","Purple","Gray"];if(!e.repeat)void setAssetValues(targets,{label:labels[Number(e.key)-1]});return;}
+    if(e.altKey&&!e.ctrlKey&&!e.shiftKey&&e.key==="0"){e.preventDefault();if(!e.repeat)void setAssetValues(targets,{label:null});return;}
+    if(!e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key.toLowerCase()==="x"){if(document.querySelector(".modal-backdrop,[role='dialog'],[role='alertdialog']")||!targets.length||e.repeat)return;e.preventDefault();void invoke<[number,string|null][]>("get_asset_labels",{assetIds:targets}).then(rows=>{if(rows.length!==targets.length)return;const allGray=rows.every(([,label])=>label?.toLowerCase()==="gray");void setAssetValues(targets,{label:allGray?null:"Gray"})});return;}
+    if(!e.ctrlKey&&!e.altKey&&!e.shiftKey&&e.key==="\\"){e.preventDefault();if(!e.repeat)void setAssetValues(targets,{tagged:"toggle"});return;}
+    const inGrid=!!target?.closest(".asset-scroll,.tile-context-menu")||!!active?.closest(".asset-scroll,.tile-context-menu");const inViewer=!!viewer;if(!inGrid&&!inViewer)return;
     if(e.ctrlKey&&e.key.toLowerCase()==="x"){e.preventDefault();setFileClipboard({ids:targets,mode:"move"});setFolderClipboard(null);setCutIds(targets);return;}
     if(e.ctrlKey&&e.key.toLowerCase()==="c"&&!e.shiftKey){e.preventDefault();setFileClipboard({ids:targets,mode:"copy"});setFolderClipboard(null);setCutIds([]);return;}
     if(e.ctrlKey&&e.key.toLowerCase()==="v"){e.preventDefault();if(view.kind==="folder"&&view.folderPath&&fileClipboard)void dropFiles(fileClipboard.ids,view.folderPath,fileClipboard.mode==="copy");else if(view.kind==="folder"&&view.folderPath&&folderClipboard)void folderAction("paste",view.folderPath);return;}
     if(e.key==="F2"&&primaryId!=null){e.preventDefault();beginFileOperation(targets,"rename");return;}
-    if(e.key==="Delete"&&!e.ctrlKey&&!e.altKey&&targets.length){e.preventDefault();beginFileOperation(targets,e.shiftKey?"delete-permanent":"delete");return;}
+    if(e.key==="Delete"&&!e.ctrlKey&&!e.altKey&&targets.length){e.preventDefault();if(!e.repeat)beginFileOperation(targets,e.shiftKey?"delete-permanent":"delete",viewer?.asset);return;}
     if(e.ctrlKey&&e.key==="\\"){e.preventDefault();void selectTaggedInView();return;}
     if(e.ctrlKey&&e.key.toLowerCase()==="g"){e.preventDefault();void copyCurrentResult()}
     else if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==="o"&&primaryId!=null){e.preventDefault();void invoke("asset_action",{assetId:primaryId,action:"open"})}
@@ -449,11 +643,11 @@ export default function App() {
       const page = await invoke<Page>("get_assets", { filter: {...assetFilter, offset:index, limit:1} });
       const asset=page.items[0];
       if (!asset) break;
-      if (!asset.isDirectory && ["image", "raw"].includes(formatFor(asset, formats)?.group ?? "")) { setViewer({asset,index});setViewerDimensions(null);setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));if(!viewerLock){setViewerFit(true);setViewerZoom(1);setViewerPan({x:0,y:0})} return; }
+      if (!asset.isDirectory && isImage(asset, formats)) { showViewerAsset(asset, index); return; }
       index += delta;
     }
     setSlideshow(false);
-  }, [viewer,total,assetFilter,viewerLock,formats]);
+  }, [viewer,total,assetFilter,showViewerAsset,formats]);
   useEffect(() => { if (!viewer) setSlideshow(false); }, [viewer]);
   useEffect(() => {
     if (!slideshow || !viewer) return;
@@ -463,7 +657,7 @@ export default function App() {
   }, [slideshow, viewer, total, slideshowSeconds, moveViewer]);
   useEffect(() => {
     if (!viewer) return;
-    const key = (event: globalThis.KeyboardEvent) => { if (event.key === "Escape"||event.key==="Enter") setViewer(null); else if(viewerFit&&event.key==="ArrowRight")void moveViewer(1);else if(viewerFit&&event.key==="ArrowLeft")void moveViewer(-1);else if(viewerFit&&event.code==="Space"){event.preventDefault();void moveViewer(1)}else if(viewerFit&&event.key==="Backspace"){event.preventDefault();void moveViewer(-1)}else if(!viewerFit&&event.key.startsWith("Arrow")){const step=event.ctrlKey?120:event.shiftKey?12:48;setViewerPan(p=>({...p,x:p.x+(event.key==="ArrowRight"?-step:event.key==="ArrowLeft"?step:0),y:p.y+(event.key==="ArrowDown"?-step:event.key==="ArrowUp"?step:0)}))}else if(event.key==="+"||event.key==="="){setViewerFit(false);setViewerZoom(z=>Math.min(8,z*1.2))}else if(event.key==="-"){setViewerFit(false);setViewerZoom(z=>Math.max(.1,z/1.2))} };
+    const key = (event: globalThis.KeyboardEvent) => { if (event.defaultPrevented || document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]")) return; if (event.key === "Escape"||event.key==="Enter") setViewer(null); else if(viewerFit&&event.key==="ArrowRight")void moveViewer(1);else if(viewerFit&&event.key==="ArrowLeft")void moveViewer(-1);else if(viewerFit&&event.code==="Space"){event.preventDefault();void moveViewer(1)}else if(viewerFit&&event.key==="Backspace"){event.preventDefault();void moveViewer(-1)}else if(!viewerFit&&event.key.startsWith("Arrow")){const step=event.ctrlKey?120:event.shiftKey?12:48;setViewerPan(p=>({...p,x:p.x+(event.key==="ArrowRight"?-step:event.key==="ArrowLeft"?step:0),y:p.y+(event.key==="ArrowDown"?-step:event.key==="ArrowUp"?step:0)}))}else if(event.key==="+"||event.key==="="){setViewerFit(false);setViewerZoom(z=>Math.min(8,z*1.2))}else if(event.key==="-"){setViewerFit(false);setViewerZoom(z=>Math.max(.1,z/1.2))} };
     window.addEventListener("keydown",key); return () => window.removeEventListener("keydown",key);
   }, [viewer,moveViewer,viewerFit]);
   useEffect(()=>{if(!viewer||!viewerCanvasRef.current)return;const el=viewerCanvasRef.current;const update=()=>setViewerCanvasSize({width:el.clientWidth,height:el.clientHeight});update();const observer=new ResizeObserver(update);observer.observe(el);return()=>observer.disconnect()},[viewer]);
@@ -471,7 +665,7 @@ export default function App() {
   // The zoomed photo is centred in the viewer; panning is limited so it never leaves a gap it could fill.
   const clampViewerPan=(pan:{x:number;y:number},zoom:number)=>{const el=viewerCanvasRef.current,d=viewerDimensions;if(!el||!d)return pan;const mx=Math.max(0,(d.width*zoom-el.clientWidth)/2),my=Math.max(0,(d.height*zoom-el.clientHeight)/2);return{x:Math.max(-mx,Math.min(mx,pan.x)),y:Math.max(-my,Math.min(my,pan.y))};};
   const wheelViewer=(e:ReactWheelEvent<HTMLDivElement>)=>{e.preventDefault();const r=e.currentTarget.getBoundingClientRect();const cx=(e.clientX-r.left-r.width/2)/uiScale,cy=(e.clientY-r.top-r.height/2)/uiScale;const from=viewerFit?(Math.min(1,viewerFitPercent/100)||1):viewerZoom,pan=viewerFit?{x:0,y:0}:viewerPan;const to=Math.max(.05,Math.min(8,from*(e.deltaY<0?1.12:.89))),k=to/from;setViewerFit(false);setViewerZoom(to);setViewerPan(clampViewerPan({x:cx-(cx-pan.x)*k,y:cy-(cy-pan.y)*k},to));};
-  useEffect(()=>{if(!viewer)return;let active=true;setViewerPreviewSource(null);setViewerBroken(false);void invoke<string>("get_preview_source",{assetId:viewer.asset.id,epoch}).then(source=>{if(active)setViewerPreviewSource(source)}).catch(()=>{});for(const d of [-1,1]){const i=viewer.index+d;if(i>=0&&i<total)void invoke<Page>("get_assets",{filter:{...assetFilter,offset:i,limit:1}}).then(p=>{const a=p.items[0];if(a&&!a.isDirectory&&a.path){const im=new Image();im.src=thumbUrl(a,0,epoch)}})}return()=>{active=false}},[viewer?.asset.id,viewer?.index,assetFilter,total,epoch]);
+  useEffect(()=>{if(!viewer)return;let active=true;setViewerPreviewSource(null);setViewerBroken(false);void invoke<string>("get_preview_source",{assetId:viewer.asset.id,epoch}).then(source=>{if(active)setViewerPreviewSource(source)}).catch(()=>{});for(const d of [-1,1]){const i=viewer.index+d;if(i>=0&&i<total)void invoke<Page>("get_assets",{filter:{...assetFilter,offset:i,limit:1}}).then(p=>{const a=p.items[0];if(a&&!a.isDirectory&&a.path){const im=new Image();im.src=thumbUrl(a,0,epoch)}})}return()=>{active=false}},[viewerReadId,viewer?.index,assetFilter,total,epoch]);
 
   const crumbs = useMemo(() => view.kind === "folder" ? (view.folderPath ?? view.title).split(/[\\/]/).filter(Boolean) : ["Katalóg", view.title], [view]);
   const aiChipText=aiStatus.modelState==="error"?"Chyba AI modelu":aiStatus.state==="loading"?"AI sa načítava…":aiStatus.state==="indexing"?`AI indexuje ${aiStatus.indexed.toLocaleString("sk-SK")} / ${aiStatus.total.toLocaleString("sk-SK")}${aiStatus.etaS!=null?` · ~${Math.max(1,Math.round(aiStatus.etaS/3600))} h`:""}`:aiStatus.state==="ready"?"AI pripravené":aiStatus.state==="paused"?"AI pozastavené":aiStatus.state==="error"?"AI chyba":"AI vypnuté";
@@ -496,7 +690,7 @@ export default function App() {
     <header className="topbar"><div className="top-left"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><nav className="top-crumbs">{crumbs.map((crumb,i)=><span key={`${crumb}-${i}`} className="crumb-item">{i>0&&<i>›</i>}<button onClick={()=>void openCrumb(i)}>{crumb}</button></span>)}{Object.values(filters).some(Boolean)&&<span className="active-filters">{filters.ratingMode&&`Hodnotenie ${filters.ratingMode} ${filters.ratingValue??""}`} {filters.labelFilter&&`Farebný štítok: ${labelText(filters.labelFilter)}`} {filters.taggedOnly&&"Označené"} {filters.fileGroup&&`Typ: ${filters.fileGroup==="all"?"všetky súbory":filters.fileGroup}`}<button onClick={()=>setFilters({})}>×</button></span>}</nav><span className="count-pill">{slovakItems(total)}</span></div><label className="search-box"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filtrovať v zobrazení…"/><kbd>Ctrl+F</kbd></label><div className="top-right"><DockLayoutMenu layout={dockLayout} setLayout={setDockLayout}/><div className="ai-anchor" ref={aiRef}><button className={`ai-chip ai-${aiStatus.state}`} title={!aiStatus.available?aiStatus.reason??"AI modul nie je nainštalovaný":aiStatus.lastError??"AI index a vyhľadávanie"} onClick={()=>setAiOpen(v=>!v)}>{aiChipText}</button>{aiOpen&&<div className="ai-popover"><b>AI katalóg</b><div><span>Zaindexované</span><strong>{aiStatus.indexed.toLocaleString("sk-SK")}</strong></div><div><span>Vo fronte</span><strong>{aiStatus.queued.toLocaleString("sk-SK")}</strong></div><div><span>Čaká na spracovanie</span><strong>{aiStatus.waiting.toLocaleString("sk-SK")}</strong></div><div><span>AI model</span><strong>{({unloaded:"nenačítaný",loading:"načítava sa",ready:"pripravený",error:"chyba"} as Record<string,string>)[aiStatus.modelState]??aiStatus.modelState}</strong></div>{aiStatus.modelState==="unloaded"&&<button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_load_model")}>Spracovať čakajúce fotografie <small>vyžaduje AI model</small></button>}<div><span>Offline</span><strong>{aiStatus.offline.toLocaleString("sk-SK")}</strong></div><div><span>Chyby</span><strong>{aiStatus.failed.toLocaleString("sk-SK")}</strong></div>{aiStatus.lastError&&<small>{aiStatus.lastError}</small>}<button disabled={!aiStatus.available||!aiEnabled||aiStatus.state==="loading"} onClick={()=>void updateAiStatus(aiStatus.state==="paused"?"ai_resume":"ai_pause")}>{aiStatus.state==="paused"?"Pokračovať":"Pozastaviť"}</button><button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_reindex")}>Aktualizovať index</button><button onClick={()=>void toggleAi()}>{aiEnabled?"Vypnúť AI":"Zapnúť AI"}</button></div>}</div><div className="history-anchor" ref={historyRef}><button className="catalog-label" title={catalogTooltip} onClick={()=>{setHistoryOpen(v=>!v);loadRecentChanges()}}><span className="status-light"/>{appInfo?.readonly ? "Katalóg iba na čítanie" : "Katalóg"}</button>{historyOpen&&<div className="change-history"><div className="change-history-head"><b>História zmien</b></div>{recentChanges.length?recentChanges.map(change=><div key={change.id}><time>{new Date(change.ts).toLocaleString("sk-SK")}</time><span>{change.summary}</span></div>):<small>Žiadne zmeny</small>}</div>}</div><button className="settings-button" title="Pomocník (F1)" onClick={()=>setHelpOpen(true)}>?</button><button className="settings-button" title="Nastavenia" onClick={()=>setSettingsOpen(true)}>⚙</button></div></header>
     <div className="workspace">
       <LeftPanel hosts={dockHosts} onNavigate={navigate} activeFolderId={view.kind === "folder" ? view.id ?? null : null} activeFolderIds={view.kind === "folder" ? view.ids : []} activeView={view} calendarRefreshToken={refreshTick} refreshToken={treeRefreshTick} refreshPaths={treeRefreshPaths} onFileDrop={dropFiles} onCreateFolder={createFolder} onFolderRule={(path,mode)=>void changeFolderRule(path,mode)} onFolderAction={(action,path)=>void folderAction(action,path)} clipboardPath={folderClipboard?.mode==="move"?folderClipboard.path:null} clipboardAvailable={!!folderClipboard||!!fileClipboard} onToast={message=>{setToast(message);window.setTimeout(()=>setToast(""),3000)}}/>
-      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
+      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
         aiReady={aiReady} aiReason={!aiEnabled?"AI je vypnutá":aiStatus.reason??aiStatus.lastError??"AI sa pripravuje"}
         readOnly={!!appInfo?.readonly} indexRevision={aiStatus.state==="indexing"?0:aiStatus.indexed}
         refreshToken={refreshTick} onMove={path=>void dropFiles(selectedList,path,false)}
@@ -532,13 +726,19 @@ export default function App() {
           <button onClick={() => { setQuarantineReview(null); setReviewInGrid(false); }}>Teraz nie</button>
         </div>}
         {centerMode==="map"?<MapView epoch={epoch} selectedIds={selectedIds} onSelect={select} onNavigate={(ids,title)=>navigate({kind:"people",ids,title})} onGrid={()=>setCenterMode("grid")} onOpenNeighborhood={ids=>void openMapNeighborhood(ids)}/>:<>
-        <AssetGrid view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={ids => { if (!quarantineBusy) setQuarantineConfirm({ ids, action: "move" }); }} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} uiScale={uiScale} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
+        <AssetGrid ref={grid} view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={requestQuarantineMove} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} uiScale={uiScale} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
         </>}
         {operationProgress&&<div className="grid-footer"><span>{operationProgress}</span></div>}
-        {viewer && <div className="viewer-overlay"><div className="viewer-bar"><button onClick={()=>setViewer(null)}>‹ Zavrieť</button>{deletionSuggestions.has(viewer.asset.id)&&<>
+        {viewer && <div className="viewer-overlay" ref={viewerOverlayRef} tabIndex={-1}><div className="viewer-bar"><button onClick={()=>setViewer(null)}>‹ Zavrieť</button>
+          {!viewer.asset.isDirectory && isImage(viewer.asset, formats) && viewer.asset.quarantinedAt == null && <>
+            <button type="button" className="viewer-triage" title="U" aria-pressed={viewer.asset.editPendingSince != null} disabled={!!appInfo?.readonly}
+              onClick={() => void setAssetValues([viewer.asset.id], { editPending: "toggle" })}>Na úpravu</button>
+            <button type="button" className="viewer-triage" disabled={!!appInfo?.readonly || quarantineBusy || viewer.asset.offline || viewer.asset.missing}
+              onClick={() => requestQuarantineMove([viewer.asset.id])}>Do karantény</button>
+          </>}{deletionSuggestions.has(viewer.asset.id)&&<>
           <span className="deletion-suggestion-badge" title="Návrh na vymazanie" aria-label="Návrh na vymazanie">✕</span>
           <button disabled={!!appInfo?.readonly} onClick={()=>void runDeletionAction("keep_suggested_assets",[viewer.asset.id])}>Odmietnuť návrh na vymazanie</button>
-        </>}{editors.map((editor,index)=><button key={editor.path} title={`${editor.path}${index===0?" (Ctrl+Alt+X)":""}`} disabled={viewer.asset.offline||viewer.asset.isDirectory} onClick={()=>openEditor(editor,[viewer.asset.id])}>Otvoriť v: {editor.name}</button>)}<button className="primary" onClick={()=>setSlideshow(v=>!v)} disabled={total<2}>{slideshow?"❚❚ Pozastaviť":"▶ Spustiť prezentáciu"}</button><label>Interval <select aria-label="Interval prezentácie" value={slideshowSeconds} onChange={e=>setSlideshowSeconds(Number(e.target.value))}>{[2,3,5,10,15,30].map(seconds=><option key={seconds} value={seconds}>{seconds} s</option>)}</select></label><button title="Prepnúť medzi prispôsobením oknu a skutočnou veľkosťou" onClick={()=>{setViewerFit(v=>!v);setViewerZoom(1);setViewerPan({x:0,y:0})}}>{viewerFit?"100 %":"Prispôsobiť"}</button><button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">{viewerFit?`${viewerFitPercent} %`:`${Math.round(viewerZoom*100)} %`}{viewerDimensions&&<> · {viewerDimensions.width} × {viewerDimensions.height}{formatFor(viewer.asset,formats)?.group==="raw"?" \u00b7 vložený náhľad":""}{viewerPreviewSource?` \u00b7 zdroj: ${viewerPreviewSource}`:""}</>}</span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onPointerDown={e=>{if(!viewerFit)e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit)setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{!viewer.asset.isDirectory&&!viewerBroken?<img className="viewer-image" style={viewerFit?{maxWidth:"100%",maxHeight:"100%",objectFit:"contain"}:{maxWidth:"none",maxHeight:"none",transformOrigin:"center",flex:"none",transform:`translate(${viewerPan.x}px,${viewerPan.y}px) scale(${viewerZoom})`}} src={thumbUrl(viewer.asset,0,epoch)} alt={viewer.asset.name} onLoad={e=>setViewerDimensions({width:e.currentTarget.naturalWidth,height:e.currentTarget.naturalHeight})} onError={()=>setViewerBroken(true)}/>:<div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}<button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div><Filmstrip filter={assetFilter} index={viewer.index} total={total} epoch={epoch} onPick={(asset,index)=>{if(asset.isDirectory||!["image","raw"].includes(formatFor(asset,formats)?.group??""))return;setViewer({asset,index});setViewerDimensions(null);setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));if(!viewerLock){setViewerFit(true);setViewerZoom(1);setViewerPan({x:0,y:0})}}}/><div className="viewer-footer">{viewer.asset.path}</div></div>}
+        </>}{editors.map((editor,index)=><button key={editor.path} title={`${editor.path}${index===0?" (Ctrl+Alt+X)":""}`} disabled={viewer.asset.offline||viewer.asset.isDirectory} onClick={()=>openEditor(editor,[viewer.asset.id])}>Otvoriť v: {editor.name}</button>)}<button className="primary" onClick={()=>setSlideshow(v=>!v)} disabled={total<2}>{slideshow?"❚❚ Pozastaviť":"▶ Spustiť prezentáciu"}</button><label>Interval <select aria-label="Interval prezentácie" value={slideshowSeconds} onChange={e=>setSlideshowSeconds(Number(e.target.value))}>{[2,3,5,10,15,30].map(seconds=><option key={seconds} value={seconds}>{seconds} s</option>)}</select></label><button title="Prepnúť medzi prispôsobením oknu a skutočnou veľkosťou" onClick={()=>{setViewerFit(v=>!v);setViewerZoom(1);setViewerPan({x:0,y:0})}}>{viewerFit?"100 %":"Prispôsobiť"}</button><button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">{viewerFit?`${viewerFitPercent} %`:`${Math.round(viewerZoom*100)} %`}{viewerDimensions&&<> · {viewerDimensions.width} × {viewerDimensions.height}{formatFor(viewer.asset,formats)?.group==="raw"?" \u00b7 vložený náhľad":""}{viewerPreviewSource?` \u00b7 zdroj: ${viewerPreviewSource}`:""}</>}</span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onPointerDown={e=>{if(!viewerFit)e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit)setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{!viewer.asset.isDirectory&&!viewerBroken?<img className="viewer-image" style={viewerFit?{maxWidth:"100%",maxHeight:"100%",objectFit:"contain"}:{maxWidth:"none",maxHeight:"none",transformOrigin:"center",flex:"none",transform:`translate(${viewerPan.x}px,${viewerPan.y}px) scale(${viewerZoom})`}} src={thumbUrl(viewer.asset,0,epoch)} alt={viewer.asset.name} onLoad={e=>setViewerDimensions({width:e.currentTarget.naturalWidth,height:e.currentTarget.naturalHeight})} onError={()=>setViewerBroken(true)}/>:<div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}<button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div><Filmstrip key={refreshTick} filter={assetFilter} index={viewer.index} total={total} epoch={epoch} onPick={(asset,index)=>{if(!asset.isDirectory && isImage(asset, formats)) showViewerAsset(asset, index);}}/><div className="viewer-footer">{viewer.asset.path}</div></div>}
       </section>
       <DockSide side="right" layout={dockLayout} setLayout={setDockLayout} hosts={dockHosts} hideNav={!!viewer} dragging={dockDragging} controls={dockControls} sectionPresence={dockPresence}/>
     </div>

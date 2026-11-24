@@ -15,9 +15,11 @@ import { fetchFaceThumbs, type CategoryMutation, type FacePerson, type FaceRevie
   type FaceUnknownCluster, type KeywordMutation } from "./rightPanelData";
 import "./CategoryManagement.css";
 
+export type CatalogValueTokens = { rating: number; label: number; special: number };
+
 type CategoryIconTarget = { id: number; isRoot: boolean; iconKey: string | null };
 
-function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeChildren, onIncludeChildrenChange, primaryId, selectedIds, onSetCategory, onSetKeyword, onCategoryChanged, onKeywordChanged, onCategoryError, refreshToken, colorToken = 0,aiAvailable,aiReady,facePersons,faceStatus,onRefreshFacePersons,onNotice,readOnly }: { activeColors?: string; activeQuality?: string; header?: ReactNode; onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; primaryId: number | null; selectedIds:number[]; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void;refreshToken: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;facePersons:FacePerson[];faceStatus:FaceStatus;onRefreshFacePersons:()=>Promise<void>;onNotice:(message:string)=>void;readOnly:boolean }) {
+function useCatalogPanelModel({ selectionReadKey, labelCounts, links, valueTokens, activeColors = "", header, onNavigate, includeChildren, onIncludeChildrenChange, selectedIds, onSetCategory, onSetKeyword, onCategoryChanged, onKeywordChanged, onCategoryError, refreshToken, colorToken = 0,aiAvailable,aiReady,facePersons,faceStatus,onRefreshFacePersons,onNotice,readOnly }: { selectionReadKey: string; labelCounts: ValueCount[]; links: CatalogAssetLinks | null; valueTokens: CatalogValueTokens; activeColors?: string; activeQuality?: string; header?: ReactNode; onNavigate: (view: View) => void; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; selectedIds:number[]; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>void; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; onCategoryError:(error:unknown)=>void;refreshToken: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;facePersons:FacePerson[];faceStatus:FaceStatus;onRefreshFacePersons:()=>Promise<void>;onNotice:(message:string)=>void;readOnly:boolean }) {
   const [roots,setRoots]=useState<Root[]>([]);
   const [openCategories, setOpenCategories] = usePersistentSet<string>("ddreams.ui.catalog.categories", "");
   const { openRoots, openCats } = useMemo(() => {
@@ -61,11 +63,10 @@ function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeCh
   const [keywordTopDrop,setKeywordTopDrop]=useState(false);
   const [keywordQuery,setKeywordQuery]=useState("");
   const [ratings,setRatings]=useState<ValueCount[]>([]);
-  const [labels,setLabels]=useState<ValueCount[]>([]);
+  const labels = useMemo(() => labelCounts.slice(0, 100), [labelCounts]);
   const [colorCounts,setColorCounts]=useState<{value:string;name:string;hex:string;count:number}[]>([]);
 
   const [special,setSpecial]=useState<ValueCount[]>([]);
-  const [links,setLinks]=useState<CatalogAssetLinks|null>(null);
   const [autoGroups,setAutoGroups]=useState<{key:string;name:string;values:{value:string;label:string;count:number}[]}[]>([]);
   const [autoProgress,setAutoProgress]=useState<{done:number;total:number;running:boolean;error:string|null}|null>(null);
   useEffect(()=>{let cancelled=false;const load=()=>void invoke<[{key:string;name:string;values:{value:string;label:string;count:number}[]}[],{done:number;total:number;running:boolean;error:string|null}]>("auto_categories").then(([groups,progress])=>{if(!cancelled){setAutoGroups(groups);setAutoProgress(progress)}}).catch(error=>{if(!cancelled)setAutoProgress({done:0,total:0,running:false,error:String(error)})});load();const timer=window.setInterval(load,5000);return()=>{cancelled=true;window.clearInterval(timer)}},[]);
@@ -87,7 +88,6 @@ function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeCh
   const [highlightCategory,setHighlightCategory]=useState<number|null>(null);
   const [dropTarget,setDropTarget]=useState<number|null>(null);
   const [topDropActive,setTopDropActive]=useState(false);
-  const linksRequest=useRef(0);
   const labelTimer=useRef<number|undefined>(undefined);
 
   useEffect(()=>writeStored("ddreams.showAssignSquares",showAssignSquares),[showAssignSquares]);
@@ -95,16 +95,8 @@ function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeCh
   useEffect(()=>{if(highlightKeyword==null)return;const timer=window.setTimeout(()=>setHighlightKeyword(null),2400);return()=>window.clearTimeout(timer)},[highlightKeyword]);
   useEffect(()=>{const handle=(event:globalThis.KeyboardEvent)=>{if(event.key!=="F2"||!activeCategory)return;const target=event.target instanceof HTMLElement?event.target:null;if(target?.closest("input,textarea,select,[contenteditable='true']"))return;event.preventDefault();setCategoryDialog({kind:"rename",id:activeCategory.id,name:activeCategory.name});};window.addEventListener("keydown",handle);return()=>window.removeEventListener("keydown",handle)},[activeCategory]);
   useEffect(()=>{const handle=(event:globalThis.KeyboardEvent)=>{if(event.key!=="F2"||!activeKeyword)return;const target=event.target instanceof HTMLElement?event.target:null;if(target?.closest("input,textarea,select,[contenteditable='true']"))return;event.preventDefault();setKeywordDialog({kind:"rename",id:activeKeyword.id,name:activeKeyword.name});};window.addEventListener("keydown",handle);return()=>window.removeEventListener("keydown",handle)},[activeKeyword]);
-  useEffect(()=>{let active=true;if(!selectedIds.length){setSelectionCounts({totalFiles:0,assigned:{}});return;}void invoke<{totalFiles:number;assigned:Record<number,number>}>("get_category_selection_counts",{assetIds:selectedIds}).then(value=>{if(active)setSelectionCounts(value)}).catch(()=>{if(active)setSelectionCounts({totalFiles:0,assigned:{}})});return()=>{active=false}},[selectedIds,refreshToken]);
-  useEffect(()=>{let active=true;if(!selectedIds.length){setKeywordSelectionCounts({totalFiles:0,assigned:{}});return;}void invoke<{totalFiles:number;assigned:Record<number,number>}>('get_keyword_selection_counts',{assetIds:selectedIds}).then(value=>{if(active)setKeywordSelectionCounts(value)}).catch(()=>{if(active)setKeywordSelectionCounts({totalFiles:0,assigned:{}})});return()=>{active=false}},[selectedIds,refreshToken]);
-  useEffect(()=>{
-    const request=++linksRequest.current;
-    setLinks(null);
-    if(primaryId==null)return;
-    void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(value=>{if(linksRequest.current===request)setLinks(value)}).catch(()=>{if(linksRequest.current===request)setLinks(null)});
-    return()=>{linksRequest.current++};
-  },[primaryId,refreshToken]);
-
+  useEffect(()=>{let active=true;if(!selectedIds.length){setSelectionCounts({totalFiles:0,assigned:{}});return;}void invoke<{totalFiles:number;assigned:Record<number,number>}>("get_category_selection_counts",{assetIds:selectedIds}).then(value=>{if(active)setSelectionCounts(value)}).catch(()=>{if(active)setSelectionCounts({totalFiles:0,assigned:{}})});return()=>{active=false}},[selectionReadKey,refreshToken]);
+  useEffect(()=>{let active=true;if(!selectedIds.length){setKeywordSelectionCounts({totalFiles:0,assigned:{}});return;}void invoke<{totalFiles:number;assigned:Record<number,number>}>('get_keyword_selection_counts',{assetIds:selectedIds}).then(value=>{if(active)setKeywordSelectionCounts(value)}).catch(()=>{if(active)setKeywordSelectionCounts({totalFiles:0,assigned:{}})});return()=>{active=false}},[selectionReadKey,refreshToken]);
   // Colour counts change while the AI indexes; they refresh on their own slow tick instead of reloading the whole panel.
   useEffect(()=>{let active=true;void invoke<{value:string;name:string;hex:string;count:number}[]>("get_color_counts",{}).then(v=>{if(active)setColorCounts(v)}).catch(()=>{});return()=>{active=false}},[refreshToken,colorToken]);
 
@@ -113,29 +105,31 @@ function useCatalogPanelModel({ activeColors = "", header, onNavigate, includeCh
     let active=true;
     const load=<T,>(promise:Promise<T>, apply:(value:T)=>void)=>{void promise.then(value=>{if(active)apply(value)});};
     load(invoke<Root[]>("get_category_roots",{includeChildren,offset:0,limit:500}),setRoots);
-    load(invoke<ValueCount[]>("get_catalog_values",{kind:"rating",offset:0,limit:20}),values=>{const counts=new Map(values.map(v=>[v.value,v.count]));setRatings(["unrated","1","2","3","4","5"].map(value=>({value,count:counts.get(value)??0})));});
-    load(invoke<ValueCount[]>("get_catalog_values",{kind:"label",offset:0,limit:100}),setLabels);
     load(invoke<CatalogNode[]>("get_catalog_nodes",{kind:"keyword",parentId:null,rootId:null,includeChildren,offset:0,limit:500}),setKeywords);
     return()=>{active=false};
   },[includeChildren,refreshToken]);
 
   useEffect(() => {
-    let latest = 0;
     let active = true;
-    const refresh = () => {
+    void invoke<ValueCount[]>("get_catalog_values", { kind: "rating", offset: 0, limit: 20 }).then(values => {
       if (!active) return;
-      const request = ++latest;
-      void invoke<ValueCount[]>("get_catalog_values", { kind: "special", offset: 0, limit: 20 })
-        .then(values => { if (active && request === latest) setSpecial(values); })
-        .catch(() => {});
-    };
-    const subscription = listen("folder-catalogue-changed", refresh);
-    void subscription.then(refresh, refresh);
-    return () => {
-      active = false;
-      void subscription.then(unlisten => unlisten()).catch(() => {});
-    };
-  }, [refreshToken]);
+      const counts = new Map(values.map(v => [v.value, v.count]));
+      setRatings(["unrated", "1", "2", "3", "4", "5"].map(value => ({ value, count: counts.get(value) ?? 0 })));
+    }).catch(() => {});
+    return () => { active = false; };
+  }, [refreshToken, valueTokens.rating]);
+
+  const [folderCatalogueTick, setFolderCatalogueTick] = useState(0);
+  useEffect(() => {
+    const subscription = listen("folder-catalogue-changed", () => setFolderCatalogueTick(tick => tick + 1));
+    return () => { void subscription.then(unlisten => unlisten()).catch(() => {}); };
+  }, []);
+  useEffect(() => {
+    let active = true;
+    void invoke<ValueCount[]>("get_catalog_values", { kind: "special", offset: 0, limit: 20 })
+      .then(values => { if (active) setSpecial(values); }).catch(() => {});
+    return () => { active = false; };
+  }, [refreshToken, valueTokens.special, folderCatalogueTick]);
 
   useEffect(()=>{
     if(!keywordQuery.trim()){setKeywordResults([]);setCategoryResults([]);return;}
