@@ -106,7 +106,7 @@ export const helpTopics: HelpTopic[] = [
       ["Ctrl+A / Ctrl+Shift+A", "V mriežke vybrať všetky položky / všetky súbory."], ["Ctrl+I / Ctrl+Shift+I / Ctrl+Shift+D", "V mriežke vybrať fotografie / obrátiť výber / zrušiť výber."],
       ["Šípky, Home, End, Page Up, Page Down", "V mriežke presunúť výber; Ctrl presúva zameranie, Shift rozširuje rozsah."], ["Ctrl+medzerník / Enter", "V mriežke prepnúť výber zameranej položky / otvoriť vybranú položku."],
       ["Enter / Esc", "V prehliadači zavrieť fotografiu; Enter na vybranom bode mapy otvorí fotografiu."],
-      ["← / → / medzerník / Backspace", "V prehliadači pri prispôsobení oknu predchádzajúca / nasledujúca fotografia."], ["+ alebo = / −", "V prehliadači priblížiť / oddialiť."], ["Šípky / Ctrl+šípky / Shift+šípky", "V priblíženej fotografii posúvať pohľad bežným / väčším / menším krokom."],
+      ["← / → / medzerník / Backspace", "V prehliadači predchádzajúca / nasledujúca fotografia, aj pri priblížení."], ["+ alebo = / −", "V prehliadači priblížiť / oddialiť."], ["↑ / ↓ / Ctrl+šípky (so Shift jemnejšie)", "V priblíženej fotografii posúvať pohľad."],
       ["Shift+← / Shift+→", "V paneli Kalendár prejsť na predchádzajúci alebo nasledujúci deň či mesiac s fotografiami."],
       ["Ctrl+A / Ctrl+C", "V paneli Vlastnosti vybrať všetky riadky / kopírovať vybrané riadky."], ["Enter / Esc v dialógoch", "Podľa dialógu potvrdiť alebo zrušiť zadávanie."]
     ] }
