@@ -129,6 +129,10 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   const paramsKey = JSON.stringify(params);
   const paramsKeyRef = useRef(paramsKey);
   paramsKeyRef.current = paramsKey;
+  const primaryIdRef = useRef(primaryId);
+  primaryIdRef.current = primaryId;
+  const previousParams = useRef<typeof params | null>(null);
+  const [sortReveal, setSortReveal] = useState<{ index: number; id: number; version: number; key: string } | null>(null);
   const tileWidth = zoom + 26;
   const infoLineCount = thumbnailInfo.fields.reduce((sum, field) => sum + field.lines, 0);
   const infoHeight = Math.max(27, 8 + infoLineCount * 14);
@@ -151,6 +155,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
       onCounts(result.total, result.totalSize);
       if (listingOnly) setValuesVersion(v => v + 1);
       else setItemsVersion(v => v + 1);
+      return result.total;
     } catch (error) {
       if (version === requestVersion.current) pages.current.delete(pageNo);
       console.error("Katalóg sa nepodarilo načítať", error);
@@ -163,13 +168,27 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, [params, onCounts, storePage]);
 
   useEffect(() => {
-    requestVersion.current++;
+    const prior = previousParams.current;
+    previousParams.current = params;
+    const onlySortChanged = prior && (prior.sort !== params.sort || prior.descending !== params.descending)
+      && JSON.stringify({ ...prior, sort: params.sort, descending: params.descending }) === paramsKey;
+    const id = onlySortChanged ? primaryIdRef.current : null;
+    const version = ++requestVersion.current;
     cache.current.clear(); pages.current.clear(); valuePatches.current.clear(); setTotal(0); setFocusIndex(null); anchorIndex.current = 0; setItemsVersion(v => v + 1);
     folderPreviewGeneration.current++; folderPreviewCache.current.clear(); setFolderPreviews(new Map());
     setTileMetadata(new Map());
     scrollRef.current?.scrollTo({ top: 0 });
-    void fetchPage(0, requestVersion.current);
-  }, [paramsKey, fetchPage]);
+    const firstPage = fetchPage(0, version);
+    if (id != null) {
+      const isCurrent = () => version === requestVersion.current && paramsKey === paramsKeyRef.current && id === primaryIdRef.current;
+      void firstPage.then(async count => {
+        if (!count || !isCurrent()) return;
+        const index = await invoke<number | null>("locate_asset", { filter: { ...params, offset: 0, limit: PAGE_SIZE }, id });
+        if (index != null && index < count && isCurrent()) setSortReveal({ index, id, version, key: paramsKey });
+      }).catch(error => console.error("Fotografiu sa nepodarilo nájsť", error));
+    }
+    return () => { if (version === requestVersion.current) requestVersion.current++; };
+  }, [params, paramsKey, fetchPage]);
 
   const refreshTokenRef = useRef(refreshToken);
   useEffect(() => {
@@ -185,25 +204,33 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
     void fetchPage(firstVisible, requestVersion.current);
   }, [refreshToken, fetchPage, rowHeight, columns]);
 
+  const reveal = useCallback((index: number) => {
+    if (!total) return;
+    const next = Math.max(0, Math.min(total - 1, index));
+    anchorIndex.current = next;
+    setFocusIndex(next);
+    // Leaving the full-screen viewer can resize the grid; scroll once the column count has settled.
+    const version = requestVersion.current;
+    const key = paramsKeyRef.current;
+    const scroll = () => {
+      if (version === requestVersion.current && key === paramsKeyRef.current) {
+        virtualizerRef.current?.scrollToIndex(Math.floor(next / columnsRef.current), { align: "center" });
+      }
+    };
+    scroll();
+    requestAnimationFrame(() => requestAnimationFrame(scroll));
+    scrollRef.current?.focus({ preventScroll: true });
+  }, [total]);
+
   useImperativeHandle(ref, () => ({
-    reveal(index) {
-      if (!total) return;
-      const next = Math.max(0, Math.min(total - 1, index));
-      anchorIndex.current = next;
-      setFocusIndex(next);
-      // Leaving the full-screen viewer can resize the grid; scroll once the column count has settled.
-      const scroll = () => virtualizerRef.current?.scrollToIndex(Math.floor(next / columnsRef.current), { align: "center" });
-      scroll();
-      requestAnimationFrame(() => requestAnimationFrame(scroll));
-      scrollRef.current?.focus({ preventScroll: true });
-    },
-    reloadListing() {
+    reveal,
+    async reloadListing() {
       const scroll = scrollRef.current;
       const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
       const version = ++requestVersion.current;
       diskReload.current = { version, pending: true };
       pages.current.clear();
-      return fetchPage(firstVisible, version, false, (page, offset) => {
+      await fetchPage(firstVisible, version, false, (page, offset) => {
         // Keep the previous page on-screen until its replacement arrives.
         const previous = cache.current;
         const findIndex = (index: number) => {
@@ -239,7 +266,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
         void fetchPage(firstVisible, requestVersion.current, true);
       }
     },
-  }), [fetchPage, rowHeight, columns, total]);
+  }), [fetchPage, rowHeight, columns, reveal]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -252,12 +279,21 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   const virtualizer = useVirtualizer({ count: rowCount, getScrollElement: () => scrollRef.current, estimateSize: () => rowHeight, overscan: 4 });
   virtualizerRef.current = virtualizer;
   const virtualRows = virtualizer.getVirtualItems();
+  const renderedVersion = requestVersion.current;
   useEffect(() => {
-    if (!virtualRows.length) return;
+    if (!sortReveal) return;
+    setSortReveal(null);
+    if (sortReveal.version === requestVersion.current && sortReveal.key === paramsKey
+      && sortReveal.id === primaryIdRef.current && sortReveal.index < total) {
+      reveal(sortReveal.index);
+    }
+  }, [sortReveal, paramsKey, total, reveal]);
+  useEffect(() => {
+    if (renderedVersion !== requestVersion.current || !virtualRows.length) return;
     const start = virtualRows[0].index * columns;
     const end = Math.min(total, (virtualRows[virtualRows.length - 1].index + 1) * columns);
     for (let offset = Math.floor(start / PAGE_SIZE) * PAGE_SIZE; offset < end; offset += PAGE_SIZE) void fetchPage(offset, requestVersion.current);
-  }, [virtualRows, columns, total, fetchPage, itemsVersion]);
+  }, [virtualRows, columns, total, fetchPage, itemsVersion, renderedVersion]);
   useEffect(() => {
     if (!virtualRows.length) return;
     const generation = folderPreviewGeneration.current;

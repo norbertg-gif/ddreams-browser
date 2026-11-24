@@ -432,7 +432,7 @@ fn add_view_filters(where_sql: &mut String, args: &mut Vec<rusqlite::types::Valu
 fn order_clause(sort: &str, descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     let (expr, empty) = match sort {
-        "date" | "dateTaken" => ("coalesce(a.exif_date,a.file_modified)", "coalesce(a.exif_date,a.file_modified) IS NULL OR coalesce(a.exif_date,a.file_modified)=''"),
+        "date" | "dateTaken" => ("coalesce(nullif(a.exif_date,''),nullif(a.file_modified,''))", "coalesce(nullif(a.exif_date,''),nullif(a.file_modified,'')) IS NULL"),
         "captureTime" => ("a.exif_date", "a.exif_date IS NULL OR a.exif_date=''"),
         "modified" => ("a.file_modified", "a.file_modified IS NULL OR a.file_modified=''"),
         "size" => ("a.size", "a.size IS NULL"), "type" => ("a.ext_lower", "a.ext_lower IS NULL OR a.ext_lower=''"),
@@ -467,8 +467,15 @@ pub fn compare_assets(a: &Asset, b: &Asset, sort: &str, descending: bool) -> std
     use std::cmp::Ordering;
     let empty_a; let empty_b;
     let (cmp, ea, eb) = match sort {
-        "date" | "dateTaken" => { let av=a.exif_date.as_ref().or(a.file_modified.as_ref()); let bv=b.exif_date.as_ref().or(b.file_modified.as_ref()); (av.cmp(&bv), av.is_none(), bv.is_none()) },
-        "captureTime" => (a.exif_date.cmp(&b.exif_date), a.exif_date.as_deref().is_none_or(str::is_empty), b.exif_date.as_deref().is_none_or(str::is_empty)),
+        "date" | "dateTaken" => {
+            let av = capture_date(a).or(a.file_modified.as_deref().filter(|date| !date.is_empty()));
+            let bv = capture_date(b).or(b.file_modified.as_deref().filter(|date| !date.is_empty()));
+            (av.cmp(&bv), av.is_none(), bv.is_none())
+        },
+        "captureTime" => {
+            let (av, bv) = (capture_date(a), capture_date(b));
+            (av.cmp(&bv), av.is_none(), bv.is_none())
+        },
         "modified" => (a.file_modified.cmp(&b.file_modified), a.file_modified.is_none(), b.file_modified.is_none()),
         "size" => (a.size.partial_cmp(&b.size).unwrap_or(Ordering::Equal), a.size.is_none(), b.size.is_none()),
         "type" => (a.ext.to_lowercase().cmp(&b.ext.to_lowercase()), a.ext.is_empty(), b.ext.is_empty()),
@@ -483,6 +490,10 @@ pub fn compare_assets(a: &Asset, b: &Asset, sort: &str, descending: bool) -> std
     if empty_a != empty_b { return empty_a.cmp(&empty_b); }
     let directed=if descending {cmp.reverse()} else {cmp};
     directed.then(a.name.to_lowercase().cmp(&b.name.to_lowercase())).then(a.id.cmp(&b.id))
+}
+
+fn capture_date(asset: &Asset) -> Option<&str> {
+    asset.exif_date.as_deref().filter(|date| !date.is_empty())
 }
 
 pub fn folder_disk_context(db: &Db, ids: &[i64]) -> rusqlite::Result<Vec<(i64, String, Vec<Asset>)>> {
@@ -687,6 +698,12 @@ fn catalog_order(conn: &Connection, filter: &AssetFilter) -> rusqlite::Result<St
         return Ok("a.edit_pending_since ASC,a.id ASC".into());
     }
     Ok(order_clause(&filter.sort, filter.descending))
+}
+
+pub(crate) fn locate_asset(db: &Db, filter: &AssetFilter, formats: &FormatTable, id: i64) -> rusqlite::Result<Option<usize>> {
+    let conn = db.lock().unwrap();
+    let (ids, _) = catalog_ordered_ids(db, &conn, filter, formats)?;
+    Ok(ids.iter().position(|&asset_id| asset_id == id))
 }
 
 fn collect_ordered_ids(conn: &Connection, filter: CatalogAssetFilter, order: &str) -> rusqlite::Result<(Arc<Vec<i64>>, f64)> {
@@ -1175,6 +1192,21 @@ mod feature_tests {
         assert!(!asset_filter_matches(&rated, &f, &formats));
     }
     #[test] fn sort_keeps_empty_values_last_in_both_directions(){let empty=asset(1,"empty",None,None);let full=asset(2,"full",Some(5.0),Some(4));for desc in [false,true]{assert_eq!(compare_assets(&full,&empty,"size",desc),Ordering::Less);}}
+    #[test]
+    fn date_sorts_prefer_capture_time_to_newer_mtime() {
+        let mut later = asset(1, "a.jpg", None, None);
+        later.exif_date = Some("2026-08-31T17:00:00".into());
+        let mut copied = asset(2, "b.dng", None, None);
+        copied.file_modified = Some("2026-11-24T00:00:00Z".into());
+        copied.exif_date = crate::incoming::catalog_capture_date("2026-08-31 16:16:00");
+        for sort in ["date", "dateTaken", "captureTime"] {
+            assert_eq!(compare_assets(&copied, &later, sort, false), Ordering::Less);
+            assert_eq!(compare_assets(&copied, &later, sort, true), Ordering::Greater);
+        }
+        copied.exif_date = Some(String::new());
+        assert_eq!(compare_assets(&copied, &later, "date", false), Ordering::Greater);
+        assert_eq!(compare_assets(&copied, &later, "captureTime", true), Ordering::Greater);
+    }
     fn test_db() -> Db {
         let c=Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,folder_id INTEGER,name TEXT,ext TEXT,ext_lower TEXT,is_listed INTEGER,size REAL,width INTEGER,height INTEGER,bpp INTEGER,caption TEXT,notes TEXT,author TEXT,rating INTEGER,tagged INTEGER,label TEXT,file_modified TEXT,exif_date TEXT,acdsee_date TEXT,md_dirty REAL,is_orphan INTEGER,path TEXT);CREATE TABLE categories(id INTEGER PRIMARY KEY,parent_id INTEGER,root_id INTEGER,name TEXT);CREATE TABLE category_roots(id INTEGER PRIMARY KEY,name TEXT);CREATE TABLE keywords(id INTEGER PRIMARY KEY,parent_id INTEGER,name TEXT);CREATE TABLE asset_categories(asset_id INTEGER,category_id INTEGER,PRIMARY KEY(asset_id,category_id));CREATE TABLE asset_keywords(asset_id INTEGER,keyword_id INTEGER,PRIMARY KEY(asset_id,keyword_id));CREATE INDEX idx_asset_categories_category_asset ON asset_categories(category_id,asset_id);CREATE INDEX idx_asset_keywords_keyword_asset ON asset_keywords(keyword_id,asset_id);CREATE INDEX idx_categories_parent_id ON categories(parent_id);CREATE INDEX idx_keywords_parent_id ON keywords(parent_id);").unwrap();
@@ -1194,6 +1226,28 @@ mod feature_tests {
         ] {
             let undated = conn.query_row(&format!("SELECT NOT ({valid})"), [date], |row| row.get::<_, bool>(0)).unwrap();
             assert_eq!(undated, !expected, "{date:?}");
+        }
+    }
+
+    #[test]
+    fn locate_catalog_asset_uses_full_filtered_order() {
+        let db = test_db();
+        db.lock().unwrap().execute_batch("INSERT INTO assets(id,name,ext,ext_lower,is_listed,exif_date,file_modified) VALUES
+            (1,'keep.dng','dng','dng',1,'2026-08-31T16:16:00','2026-11-24T00:00:00Z'),
+            (2,'keep.jpg','jpg','jpg',1,'2026-09-01T12:00:00',NULL),
+            (3,'skip.jpg','jpg','jpg',1,'2026-08-01T00:00:00',NULL)").unwrap();
+        let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
+        let mut filter = test_filter("special", "all_photos");
+        filter.query = Some("keep".into());
+        filter.sort = "dateTaken".into();
+        filter.offset = 1;
+        filter.limit = 1;
+        for descending in [false, true] {
+            filter.descending = descending;
+            assert_eq!(locate_asset(&db, &filter, &formats, 1).unwrap(), Some(usize::from(descending)));
+            assert_eq!(locate_asset(&db, &filter, &formats, 3).unwrap(), None);
+            let page = assets_page(&db, &filter, &formats).unwrap();
+            assert_eq!(locate_asset(&db, &filter, &formats, page.items[0].id).unwrap(), Some(1));
         }
     }
 

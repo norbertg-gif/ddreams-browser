@@ -49,6 +49,7 @@ pub fn run() {
     let metadata_view = metadata_view::MetadataView::load_selected(paths.metadata_view.as_deref());
     let display_metadata = display_metadata::DisplayMetadataCache::new(paths.cache.clone());
     let listing = listing::ListingService::new(db.clone(), formats.clone());
+    listing.set_exif_tool(exif.clone());
     let calendar = calendar::CalendarService::new(background_db.clone(), formats.clone());
     // RAW plugin lives next to the AI module (modules/raw or <repo>/raw) and uses the same Python runtime.
     let raw_plugin = paths.ai_python.clone().zip(paths.ai_script.parent().and_then(|p| p.parent()).map(|p| p.join("raw").join("ddreams_raw.py")))
@@ -243,6 +244,7 @@ pub fn run() {
             commands::search_keyword_options,
             commands::get_calendar_aggregate,
             commands::get_assets,
+            commands::locate_asset,
             commands::get_folder_previews,
             commands::get_formats,
             commands::get_preview_source,

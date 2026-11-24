@@ -193,6 +193,23 @@ pub(crate) fn fill_capture_dates(exif: &crate::exiftool::ExifTool, photos: &mut 
     });
 }
 
+pub(crate) fn catalog_capture_date(value: &str) -> Option<String> {
+    let value = exif_capture(value)?;
+    let value = value.get(..19)?;
+    crate::commands::exif_date_seconds(value)?;
+    Some(format!("{}T{}", &value[..10], &value[11..]))
+}
+
+#[cfg(test)]
+#[test]
+fn catalog_capture_date_uses_local_time_with_t_separator() {
+    let expected = Some("2026-08-31T16:16:00");
+    assert_eq!(catalog_capture_date("2026:08:31 16:16:00").as_deref(), expected);
+    assert_eq!(catalog_capture_date("2026-08-31 16:16:00").as_deref(), expected);
+    assert_eq!(catalog_capture_date("2026-08-31T16:16:00+02:00").as_deref(), expected);
+    assert_eq!(catalog_capture_date("2026-02-31T16:16:00"), None);
+}
+
 fn fill_cached_capture_dates(
     cache: &Mutex<CaptureCache>,
     photos: &mut [Photo],

@@ -183,6 +183,14 @@ impl CatalogWriter {
     /// Adds files found in an included folder in a single catalogue transaction.
     /// Files already catalogued (by path) are skipped. Returns listing id → new catalogue id.
     pub fn catalog_listed_assets(&self, listed:&[ListedAsset]) -> Result<Vec<AssetIdRemap>, String> {
+        self.catalog_listed_assets_with_dates(listed, &Default::default())
+    }
+
+    pub(crate) fn is_writable(&self) -> bool { self.writable }
+
+    pub(crate) fn catalog_listed_assets_with_dates(
+        &self, listed: &[ListedAsset], dates: &std::collections::HashMap<i64, String>,
+    ) -> Result<Vec<AssetIdRemap>, String> {
         self.require_write()?;
         if listed.is_empty() { return Ok(Vec::new()); }
         let mut connection=self.db.lock().map_err(|_|"catalog lock poisoned")?;
@@ -194,7 +202,7 @@ impl CatalogWriter {
             if candidate.ext.trim().is_empty() || find_asset_by_path(&tx,&candidate.path)?.is_some() { continue; }
             let folder_id=ensure_folder(&tx,&candidate.folder_path,&mut folder_paths,&mut folder_roots)?;
             let id=next_id(&tx,"assets")?;
-            insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false})?;
+            insert_asset(&tx,&NewCatalogAsset{id,folder_id,name:candidate.name.clone(),ext:candidate.ext.clone(),size:candidate.size,file_modified:candidate.file_modified.clone(),path:candidate.path.clone(),rating:None,label:None,tagged:false,exif_date:dates.get(&candidate.temporary_id).cloned()})?;
             self.track_incoming(&tx, id, &candidate.path)?;
             if has_edit_pending { fulfil_edit_with_sibling(&tx, folder_id, candidate)?; }
             remaps.push(AssetIdRemap{old_id:candidate.temporary_id,new_id:id});
@@ -204,6 +212,23 @@ impl CatalogWriter {
         record_change(&tx, "auto_catalog", &summary)?;
         tx.commit().map_err(|e|e.to_string())?;
         Ok(remaps)
+    }
+
+    pub(crate) fn backfill_capture_dates(&self, dates: &std::collections::HashMap<i64, String>) -> Result<usize, String> {
+        self.require_write()?;
+        if dates.is_empty() { return Ok(0); }
+        let mut conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        let mut count = 0;
+        {
+            let mut update = tx.prepare("UPDATE assets SET exif_date=?2
+                WHERE id=?1 AND is_listed=1 AND (exif_date IS NULL OR exif_date='')").map_err(|e| e.to_string())?;
+            for (id, date) in dates {
+                count += update.execute((id, date)).map_err(|e| e.to_string())?;
+            }
+        }
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(count)
     }
 
     pub(crate) fn fulfil_edits_from_listing(&self, assets: &[crate::db::Asset]) -> Result<usize, String> {
@@ -612,7 +637,7 @@ impl CatalogWriter {
                 insert_asset(&tx, &NewCatalogAsset {
                     id, folder_id: folder, name: item.name.clone(), ext: item.ext.clone(), size: Some(item.size),
                     file_modified: item.file_modified.clone(), path: item.target_path.clone(),
-                    rating: None, label: None, tagged: false,
+                    rating: None, label: None, tagged: false, exif_date: None,
                 })?;
                 id
             } else {
@@ -836,6 +861,7 @@ struct NewCatalogAsset {
     ext: String,
     size: Option<f64>,
     file_modified: Option<String>,
+    exif_date: Option<String>,
     path: String,
     rating: Option<i64>,
     label: Option<String>,
@@ -957,8 +983,8 @@ fn keyword_delete_info(connection:&rusqlite::Connection,id:i64)->Result<KeywordD
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
     transaction.execute(
-        "INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) VALUES(?1,?2,?3,?4,?5,1,?6,NULL,NULL,NULL,NULL,NULL,NULL,?7,?8,?9,?10,NULL,NULL,NULL,NULL,?11)",
-        (asset.id, asset.folder_id, &asset.name, &asset.ext, asset.ext.to_lowercase(), asset.size, asset.rating, i64::from(asset.tagged), &asset.label, &asset.file_modified, &asset.path),
+        "INSERT INTO assets(id,folder_id,name,ext,ext_lower,is_listed,size,width,height,bpp,caption,notes,author,rating,tagged,label,file_modified,exif_date,acdsee_date,md_dirty,is_orphan,path) VALUES(?1,?2,?3,?4,?5,1,?6,NULL,NULL,NULL,NULL,NULL,NULL,?7,?8,?9,?10,?11,NULL,NULL,NULL,?12)",
+        (asset.id, asset.folder_id, &asset.name, &asset.ext, asset.ext.to_lowercase(), asset.size, asset.rating, i64::from(asset.tagged), &asset.label, &asset.file_modified, &asset.exif_date, &asset.path),
     ).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -1165,7 +1191,7 @@ fn resolve_write_assets(
                     insert_asset(tx, &NewCatalogAsset {
                         id, folder_id, name: candidate.name.clone(), ext: candidate.ext.clone(), size: candidate.size,
                         file_modified: candidate.file_modified.clone(), path: candidate.path.clone(),
-                        rating: None, label: None, tagged: false,
+                        rating: None, label: None, tagged: false, exif_date: None,
                     })?;
                     track(tx, id, &candidate.path)?;
                     inserted += 1;
@@ -1400,11 +1426,36 @@ mod tests {
     fn auto_catalog_adds_listed_files_once(){
         let db=scope_fixture();let writer=CatalogWriter::new(db.clone(),true);
         let listed=|id:i64,name:&str|ListedAsset{temporary_id:id,name:name.into(),ext:"jpg".into(),size:Some(5.0),file_modified:None,path:format!("F:\\Inbox\\{name}"),folder_path:"F:\\Inbox".into()};
-        let remaps=writer.catalog_listed_assets(&[listed(-10,"a.jpg"),listed(-11,"b.jpg")]).unwrap();
+        let date = "2026-08-31T16:16:00";
+        let remaps=writer.catalog_listed_assets_with_dates(
+            &[listed(-10,"a.jpg"),listed(-11,"b.jpg")], &std::collections::HashMap::from([(-10, date.to_owned())]),
+        ).unwrap();
         assert_eq!(remaps.len(),2);
+        let stored: String = db.lock().unwrap().query_row("SELECT exif_date FROM assets WHERE id=?1",
+            [remaps[0].new_id], |row| row.get(0)).unwrap();
+        assert_eq!(stored, date);
         assert!(writer.catalog_listed_assets(&[listed(-12,"a.jpg")]).unwrap().is_empty(),"already catalogued by path");
         let summary:String=db.lock().unwrap().query_row("SELECT summary FROM ddreams_changes ORDER BY id DESC LIMIT 1",[],|r|r.get(0)).unwrap();
         assert_eq!(summary,"Pridané do katalógu: 2 súbory");
+    }
+
+    #[test]
+    fn backfill_capture_dates_updates_only_missing_values() {
+        let db = scope_fixture();
+        let writer = CatalogWriter::new(db.clone(), true);
+        db.lock().unwrap().execute_batch("UPDATE assets SET exif_date='' WHERE id=2;
+            UPDATE assets SET exif_date='2025-01-01T00:00:00' WHERE id=3").unwrap();
+        let new_date = "2026-08-31T16:16:00";
+        let dates = [1, 2, 3].into_iter().map(|id| (id, new_date.to_owned())).collect();
+        assert!(CatalogWriter::new(db.clone(), false).backfill_capture_dates(&dates).is_err());
+        assert_eq!(writer.backfill_capture_dates(&dates).unwrap(), 2);
+        assert_eq!(writer.backfill_capture_dates(&dates).unwrap(), 0);
+        let conn = db.lock().unwrap();
+        for (id, expected) in [(1, new_date), (2, new_date), (3, "2025-01-01T00:00:00")] {
+            let stored: String = conn.query_row("SELECT exif_date FROM assets WHERE id=?1",
+                [id], |row| row.get(0)).unwrap();
+            assert_eq!(stored, expected);
+        }
     }
 
     #[test]

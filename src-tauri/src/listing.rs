@@ -40,6 +40,7 @@ impl TemporaryEntries {
 pub struct ListingService {
     db: Db,
     formats: std::sync::Arc<FormatTable>,
+    exif: std::sync::OnceLock<Arc<crate::exiftool::ExifTool>>,
     temporary: std::sync::Mutex<TemporaryEntries>,
     listings: std::sync::Mutex<HashMap<String, CachedListing>>,
     checking: std::sync::Mutex<HashSet<String>>,
@@ -80,7 +81,29 @@ struct PreparedListing {
 
 impl ListingService {
     pub fn new(db: Db, formats: std::sync::Arc<FormatTable>) -> std::sync::Arc<Self> {
-        std::sync::Arc::new(Self { db, formats, temporary: std::sync::Mutex::new(TemporaryEntries::default()), listings: std::sync::Mutex::new(HashMap::new()), checking: std::sync::Mutex::new(HashSet::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000), revision: AtomicU64::new(0) })
+        std::sync::Arc::new(Self { db, formats, exif: Default::default(), temporary: std::sync::Mutex::new(TemporaryEntries::default()), listings: std::sync::Mutex::new(HashMap::new()), checking: std::sync::Mutex::new(HashSet::new()), prepared: std::sync::Mutex::new(None), next_id: AtomicI64::new(-10_000_000), revision: AtomicU64::new(0) })
+    }
+
+    pub(crate) fn set_exif_tool(&self, exif: Arc<crate::exiftool::ExifTool>) {
+        self.exif.get_or_init(|| exif);
+    }
+
+    pub(crate) fn missing_capture_dates<'a>(&self, rows: impl IntoIterator<Item = &'a Asset>) -> HashMap<i64, String> {
+        let Some(exif) = self.exif.get() else { return HashMap::new(); };
+        let mut photos: Vec<_> = rows.into_iter().filter_map(|asset| {
+            if asset.is_directory || asset.offline || asset.missing
+                || !asset.exif_date.as_deref().is_none_or(str::is_empty)
+                || !matches!(self.formats.group(&asset.ext), Some("image" | "raw"))
+            {
+                return None;
+            }
+            Some(crate::incoming::Photo { id: asset.id, path: asset.path.clone()?, capture: None })
+        }).collect();
+        crate::incoming::fill_capture_dates(exif, &mut photos, |_| true);
+        photos.into_iter().filter_map(|photo| {
+            let date = crate::incoming::catalog_capture_date(photo.capture.as_deref()?)?;
+            Some((photo.id, date))
+        }).collect()
     }
 
     fn id(&self) -> i64 { self.next_id.fetch_sub(1, Ordering::Relaxed) }
@@ -274,6 +297,12 @@ impl ListingService {
         let dir_count = rows.iter().filter(|a| a.is_directory).count();
         let (dirs, files) = rows.split_at(dir_count);
         let mut dirs=dirs.to_vec(); let mut files=files.to_vec();
+        if matches!(filter.sort.as_str(), "date" | "dateTaken" | "captureTime") {
+            let mut dates = self.missing_capture_dates(&files);
+            for file in &mut files {
+                if let Some(date) = dates.remove(&file.id) { file.exif_date = Some(date); }
+            }
+        }
         let ordering = |a: &Asset,b: &Asset| db::compare_assets(a,b,&filter.sort,filter.descending);
         dirs.sort_by(|a,b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
         files.sort_by(ordering);
@@ -284,6 +313,11 @@ impl ListingService {
         (rows, total_size)
         };
         Ok((rows, total_size))
+    }
+
+    pub(crate) fn locate_asset(&self, filter: &AssetFilter, id: i64) -> Result<Option<usize>, String> {
+        let (rows, _) = self.ordered_rows(filter)?;
+        Ok(rows.iter().position(|asset| asset.id == id))
     }
 
     pub fn page(&self, filter: &AssetFilter) -> Result<AssetPage, String> {
@@ -359,10 +393,13 @@ mod listing_cache_tests {
         filter.offset = 2; filter.limit = 1; filter.include_categories = true;
         let second = service.page(&filter).unwrap();
         assert_eq!(second.items[0].name, "b.jpg");
+        assert_eq!(service.locate_asset(&filter, -3).unwrap(), Some(1));
         assert!(Arc::ptr_eq(&prepared, &service.prepared.lock().unwrap().as_ref().unwrap().rows));
         filter.query = Some("b.jpg".into()); filter.offset = 0;
         let filtered = service.page(&filter).unwrap();
         assert_eq!((filtered.total, filtered.total_size), (2, 20.0));
+        assert_eq!(service.locate_asset(&filter, -3).unwrap(), None);
+        assert_eq!(service.locate_asset(&filter, -2).unwrap(), Some(1));
         assert!(!Arc::ptr_eq(&prepared, &service.prepared.lock().unwrap().as_ref().unwrap().rows));
         service.invalidate_path(path).unwrap();
         assert!(service.prepared.lock().unwrap().is_none());

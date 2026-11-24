@@ -17,7 +17,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{path::{Path, PathBuf}, sync::Arc};
 use tauri::State;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use rusqlite::OptionalExtension;
 
 pub struct DatabaseState(pub Db);
@@ -585,8 +585,8 @@ pub struct MetadataResponse {
     pub rows: Vec<MetadataRow>,
 }
 
-#[tauri::command(async)]
-pub fn get_assets(
+#[tauri::command]
+pub async fn get_assets(
     app: tauri::AppHandle,
     state: State<'_, DatabaseState>,
     listing: State<'_, ListingState>,
@@ -596,23 +596,49 @@ pub fn get_assets(
     file_manager: State<'_, FileManagerState>,
     filter: AssetFilter,
 ) -> Result<db::AssetPage, String> {
-    // Opening an included folder catalogues its new photos/videos (the user's workflow: new photos land in
-    // one inbox folder). Only on the first page, so scrolling doesn't re-check; errors never block browsing.
-    if filter.kind == "folder" && filter.offset == 0 {
-        let _operation = file_manager.0.lock_operation()?;
-        if auto_catalog_folder(&listing.0, &formats.0, &writer.0, &ai.0, &filter).is_ok_and(|count| count > 0) {
-            let _ = app.emit("folder-catalogue-changed", ());
+    let (db, listing, formats, ai, writer, file_manager) = (
+        state.0.clone(), listing.0.clone(), formats.0.clone(), ai.0.clone(), writer.0.clone(), file_manager.0.clone(),
+    );
+    tauri::async_runtime::spawn_blocking(move || {
+        // Only the first page checks for new files and missing catalogue dates.
+        if filter.kind == "folder" && filter.offset == 0 && writer.is_writable() {
+            let _operation = file_manager.lock_operation()?;
+            if auto_catalog_folder(&listing, &formats, &writer, &ai, &filter).is_ok_and(|count| count > 0) {
+                let _ = app.emit("folder-catalogue-changed", ());
+            }
         }
-    }
-    if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people"
-        && !(filter.kind == "special" && filter.value.as_deref() == Some("edit_pending")) {
-        let status = ai.0.status();
-        let mut page = similarity_page(&state.0, &listing.0, &formats.0, &filter, &status, |ids| ai.0.order_by_similarity(ids))?;
+        let mut page = if filter.sort == "similarity" && filter.kind != "series" && filter.kind != "people"
+            && !(filter.kind == "special" && filter.value.as_deref() == Some("edit_pending")) {
+            similarity_page(&db, &listing, &formats, &filter, &ai.status(), |ids| ai.order_by_similarity(ids))?
+        } else if filter.kind == "folder" {
+            listing.page(&filter)?
+        } else {
+            db::assets_page(&db, &filter, &formats).map_err(|e| e.to_string())?
+        };
         classify_page(&mut page);
-        return Ok(page);
+        Ok(page)
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn locate_asset(
+    app: tauri::AppHandle,
+    filter: AssetFilter,
+    id: i64,
+) -> Option<usize> {
+    if filter.sort == "similarity" || matches!(filter.kind.as_str(), "ai" | "series" | "people") {
+        return None;
     }
-    if filter.kind == "folder" { let mut page=listing.0.page(&filter)?;classify_page(&mut page);return Ok(page); }
-    let mut page=db::assets_page(&state.0,&filter,&formats.0).map_err(|e|e.to_string())?;classify_page(&mut page);Ok(page)
+    let db = app.state::<DatabaseState>().0.clone();
+    let listing = app.state::<ListingState>().0.clone();
+    let formats = app.state::<FormatsState>().0.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        if filter.kind == "folder" {
+            listing.locate_asset(&filter, id).ok().flatten()
+        } else {
+            db::locate_asset(&db, &filter, &formats, id).ok().flatten()
+        }
+    }).await.ok().flatten()
 }
 
 #[tauri::command(async)]
@@ -624,22 +650,31 @@ fn auto_catalog_folder(listing:&ListingService,formats:&crate::formats::FormatTa
     writer.observe_incoming_folder(&path)?;
     let fulfilled = writer.fulfil_edits_from_listing(&files)?;
     if fulfilled > 0 { listing.invalidate_path(&path)?; }
-    if path.is_empty() || !files.iter().any(|asset| !asset.is_directory && asset.id < 0) { return Ok(fulfilled); }
+    let dates = listing.missing_capture_dates(files.iter().filter(|asset| asset.id > 0));
+    let backfilled = writer.backfill_capture_dates(&dates)?;
+    if backfilled > 0 { listing.invalidate_path(&path)?; }
+    let updated = backfilled + fulfilled;
+    if path.is_empty() || !files.iter().any(|asset| !asset.is_directory && asset.id < 0) { return Ok(updated); }
     let mode = writer.effective_folder_mode(&path);
     let included = mode.as_deref() == Some("include");
     if mode.as_deref() == Some("exclude") || (!included &&
         !ai.incoming_folder().is_ok_and(|folder| crate::incoming::contains_folder(&path, &folder))) {
-        return Ok(fulfilled);
+        return Ok(updated);
     }
     let candidates=files.iter().filter(|a| !a.is_directory && a.id < 0).filter(|a|match formats.group(&a.ext) {
         Some("image" | "raw") => true,
         Some("video") => included,
         _ => false,
     }).filter_map(|a|{let file_path=a.path.clone()?;let folder_path=Path::new(&file_path).parent().map(|p|p.to_string_lossy().to_string()).unwrap_or_default();Some(ListedAsset{temporary_id:a.id,name:a.name.clone(),ext:a.ext.clone(),size:a.size,file_modified:a.file_modified.clone(),path:file_path,folder_path})}).collect::<Vec<_>>();
-    if candidates.is_empty(){return Ok(fulfilled);}
-    let remaps=writer.catalog_listed_assets(&candidates)?;
+    if candidates.is_empty(){return Ok(updated);}
+    let dates = listing.missing_capture_dates(files.iter().filter(|asset| asset.id < 0));
+    let remaps = if dates.is_empty() {
+        writer.catalog_listed_assets(&candidates)?
+    } else {
+        writer.catalog_listed_assets_with_dates(&candidates, &dates)?
+    };
     if !remaps.is_empty(){let _=listing.invalidate_path(&path);ai.index_assets(&remaps.iter().map(|r|r.new_id).collect::<Vec<_>>());}
-    Ok(remaps.len() + fulfilled)
+    Ok(remaps.len() + updated)
 }
 #[tauri::command(async)]
 pub fn refresh_folder_listing(listing: State<'_, ListingState>, folder_id: i64) -> Result<(), String> {
