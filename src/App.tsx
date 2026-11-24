@@ -160,6 +160,14 @@ export default function App() {
   const currentViewer = useRef(viewer);
   const viewerValuePatches = useRef(new Map<number, AssetValuePatch>());
   currentViewer.current = viewer;
+  // Returning from the full-screen viewer: show and focus the last viewed photo in the grid.
+  const lastViewerIndex = useRef<number | null>(null);
+  useEffect(() => {
+    if (viewer) { lastViewerIndex.current = viewer.index; return; }
+    const index = lastViewerIndex.current;
+    lastViewerIndex.current = null;
+    if (index != null) requestAnimationFrame(() => grid.current?.reveal(index));
+  }, [viewer]);
   const grid = useRef<AssetGridHandle>(null);
   const valueWrites = useRef(Promise.resolve());
   // A photo that just received a catalogue ID is still the same selection.

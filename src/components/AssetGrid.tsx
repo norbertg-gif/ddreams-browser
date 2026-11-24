@@ -13,6 +13,7 @@ export type AssetValuePatch = Pick<Asset, "id" | "rating" | "label" | "tagged"> 
 export type AssetGridHandle = {
   applyValues: (patches: ReadonlyMap<number, AssetValuePatch>, reloadListing: boolean) => void;
   reloadListing: () => Promise<void>;
+  reveal: (index: number) => void;
 };
 
 type FolderPreview = Pick<Asset, "id" | "path" | "fileModified">;
@@ -97,6 +98,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, []);
   const pages = useRef(new Set<number>());
   const requestVersion = useRef(0);
+  const virtualizerRef = useRef<{ scrollToIndex: (index: number, options: { align: "center" }) => void } | null>(null);
   const diskReload = useRef<{ version: number; pending: boolean } | null>(null);
   const anchorIndex = useRef(0);
   const [focusIndex, setFocusIndex] = useState<number | null>(null);
@@ -107,6 +109,8 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   const loadingTimer = useRef<number | undefined>(undefined);
   const [itemsVersion, setItemsVersion] = useState(0);
   const [columns, setColumns] = useState(5);
+  const columnsRef = useRef(columns);
+  columnsRef.current = columns;
   const [tileMetadata, setTileMetadata] = useState(new Map<number, import("../types").TileExifMetadata>());
   const [tileQuality, setTileQuality] = useState(new Map<number, AssetQuality>());
   const qualityCache = useRef(new Map<number, AssetQuality>());
@@ -182,6 +186,17 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, [refreshToken, fetchPage, rowHeight, columns]);
 
   useImperativeHandle(ref, () => ({
+    reveal(index) {
+      if (!total) return;
+      const next = Math.max(0, Math.min(total - 1, index));
+      anchorIndex.current = next;
+      setFocusIndex(next);
+      // Leaving the full-screen viewer can resize the grid; scroll once the column count has settled.
+      const scroll = () => virtualizerRef.current?.scrollToIndex(Math.floor(next / columnsRef.current), { align: "center" });
+      scroll();
+      requestAnimationFrame(() => requestAnimationFrame(scroll));
+      scrollRef.current?.focus({ preventScroll: true });
+    },
     reloadListing() {
       const scroll = scrollRef.current;
       const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
@@ -224,7 +239,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
         void fetchPage(firstVisible, requestVersion.current, true);
       }
     },
-  }), [fetchPage, rowHeight, columns]);
+  }), [fetchPage, rowHeight, columns, total]);
 
   useEffect(() => {
     const el = scrollRef.current;
@@ -235,6 +250,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
 
   const rowCount = Math.ceil(total / columns);
   const virtualizer = useVirtualizer({ count: rowCount, getScrollElement: () => scrollRef.current, estimateSize: () => rowHeight, overscan: 4 });
+  virtualizerRef.current = virtualizer;
   const virtualRows = virtualizer.getVirtualItems();
   useEffect(() => {
     if (!virtualRows.length) return;
