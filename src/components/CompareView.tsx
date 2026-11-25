@@ -6,6 +6,8 @@ import type { Asset, AssetQuality, FormatTable } from "../types";
 import AssetContextMenu, { useAssetContextMenu } from "./AssetContextMenu";
 import { formatFor, labelColor, labelText, QUALITY_FLAG_TEXT, thumbUrl, type GridAsset } from "./AssetGrid";
 import { createFullImageQueue, useFullImage } from "./useFullImage";
+import FaceOverlay, { FaceToggle } from "./FaceOverlay";
+import type { FaceInfo } from "./rightPanelData";
 
 export type ComparedPhoto = GridAsset & { key: number };
 
@@ -18,6 +20,11 @@ type Props = {
   formats: FormatTable;
   rawDecode: boolean;
   onRawDecode: (decode: boolean) => void;
+  showFaces: boolean;
+  onShowFaces: (shown: boolean) => void;
+  facesByAsset?: ReadonlyMap<number, FaceInfo[]>;
+  faceAiAvailable: boolean;
+  faceAiReason: string;
   editors: Editor[];
   readOnly: boolean;
   aiReady: boolean;
@@ -42,6 +49,7 @@ const clamp = (value: number, min: number, max: number) => Math.min(max, Math.ma
 export default function CompareView({
   photos, initialActive, epoch, qualityToken, uiScale, formats, rawDecode, onRawDecode, editors, readOnly, aiReady, aiReason,
   onClose, onRestoreFocus, onDrop, onOpen, onSetValues, onFileOperation, onQuarantine, onFindSimilar,
+  showFaces, onShowFaces, facesByAsset, faceAiAvailable, faceAiReason,
 }: Props) {
   const [activeKey, setActiveKey] = useState(initialActive ?? photos[0].key);
   const active = photos.find(photo => photo.key === activeKey) ?? photos[0];
@@ -130,6 +138,8 @@ export default function CompareView({
       <label title="Zapnuté: plné rozlíšenie RAW (pomalšie). Vypnuté: vložený náhľad (rýchle).">
         <input type="checkbox" checked={rawDecode} onChange={event => onRawDecode(event.target.checked)} /> Dekódovať RAW
       </label>
+      <FaceToggle checked={showFaces} onChange={onShowFaces} enabled={faceAiAvailable && photos.some(photo => photo.asset.id > 0)}
+        reason={faceAiAvailable ? "Tváre sú dostupné pre fotky v katalógu" : faceAiReason} />
     </header>
     <div className={"compare-grid compare-grid-" + photos.length}>
       {photos.map(photo => <ComparePane key={photo.key} asset={photo.asset}
@@ -141,7 +151,7 @@ export default function CompareView({
         onActivate={() => setActiveKey(photo.key)}
         onContextMenu={event => { setActiveKey(photo.key); openMenu(event); }}
         onDrop={photos.length > 2 ? () => { closeMenu(); onDrop(photo.key); } : undefined}
-        quality={quality.get(photo.asset.id)} sharpest={sharpest?.assetId === photo.asset.id} />)}
+        faces={facesByAsset?.get(photo.asset.id)} quality={quality.get(photo.asset.id)} sharpest={sharpest?.assetId === photo.asset.id} />)}
     </div>
     {anchor && <AssetContextMenu anchor={anchor} onClose={closeMenu} asset={active.asset}
       actionIds={() => [active.asset.id]} offline={!!(active.asset.offline || active.asset.missing)} isPhoto
@@ -165,13 +175,15 @@ type PaneProps = {
   onContextMenu: (event: React.MouseEvent) => void;
   onDrop?: () => void;
   quality?: AssetQuality;
+  faces?: FaceInfo[];
   sharpest: boolean;
 };
 
 function ComparePane({
-  ref, asset, active, epoch, uiScale, queue, rawDecode, camera, onCamera, onActivate, onContextMenu, onDrop, quality, sharpest,
+  ref, asset, active, epoch, uiScale, queue, rawDecode, camera, onCamera, onActivate, onContextMenu, onDrop, quality, sharpest, faces,
 }: PaneProps) {
   const canvas = useRef<HTMLDivElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
   const drag = useRef<{ clientX: number; clientY: number; x: number; y: number } | null>(null);
   const [viewport, setViewport] = useState<Size>({ width: 0, height: 0 });
   useLayoutEffect(() => {
@@ -280,7 +292,7 @@ function ComparePane({
           y: maxY ? 0.5 - clamp(drag.current.y + dy, -maxY, maxY) / height : camera.y,
         });
       }}>
-      {fileKey && (frame || !ready || preview?.size) ? <img key={fileKey} className="compare-image" alt={asset.name} draggable={false}
+      {fileKey && (frame || !ready || preview?.size) ? <img key={fileKey} ref={imageRef} className="compare-image" alt={asset.name} draggable={false}
         style={size ? { width, height, transform: "translate(-50%, -50%) translate(" + x + "px," + y + "px)" } : undefined}
         src={frame?.url ?? thumbUrl(asset, 0, epoch)}
         onLoad={event => {
@@ -288,6 +300,7 @@ function ComparePane({
         }}
         onError={() => { if (!frame) setPreview({ key: fileKey, size: null }); }}
       /> : <span>Náhľad nie je k dispozícii</span>}
+      {!!faces?.length && <FaceOverlay imageRef={imageRef} faces={faces} />}
     </div>
     <footer className="compare-caption">
       <strong title={asset.path ?? asset.name}>{asset.name}</strong>

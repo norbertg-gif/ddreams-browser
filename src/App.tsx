@@ -7,6 +7,7 @@ import { createPortal } from "react-dom";
 import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch, type GridAsset } from "./components/AssetGrid";
 import AssetContextMenu, { useAssetContextMenu } from "./components/AssetContextMenu";
 import { useFullImage } from "./components/useFullImage";
+import FaceOverlay, { FaceToggle, useFaceOverlays } from "./components/FaceOverlay";
 import CompareView, { type ComparedPhoto } from "./components/CompareView";
 import MapView from "./components/MapView";
 import LeftPanel from "./components/LeftPanel";
@@ -223,6 +224,9 @@ export default function App() {
   const [viewerFallbackLayout, setViewerFallbackLayout] = useState<{ fileKey: string; width: number; height: number } | null>(null);
   const [formats,setFormats]=useState<FormatTable>({version:0,formats:[]});
   const [viewerCanvasSize,setViewerCanvasSize]=useState({width:0,height:0});
+  const [showFaces, setShowFaces] = useState(() => readStored("ddreams.showFaces", false));
+  useEffect(() => writeStored("ddreams.showFaces", showFaces), [showFaces]);
+  const viewerImageRef = useRef<HTMLImageElement>(null);
   const viewerCanvasRef=useRef<HTMLDivElement>(null);
   const viewerOverlayRef = useRef<HTMLDivElement>(null);
   const viewerOpen = viewer !== null;
@@ -292,6 +296,12 @@ export default function App() {
     embedded: "vložený náhľad", rawReduced: "RAW · polovičné rozlíšenie",
   }[viewerFull.source] : "náhľad";
   const [aiTick,setAiTick]=useState(0);
+  const faceAiAvailable = aiStatus.available && aiEnabled;
+  const faceAiReason = aiStatus.reason ?? (aiStatus.available ? "AI je vypnutá" : "AI modul nie je nainštalovaný");
+  const viewerFaceId = viewer && viewer.asset.id > 0 && isImage(viewer.asset, formats) ? viewer.asset.id : null;
+  const faceAssetIds = comparison ? comparison.map(photo => photo.asset.id) : viewerFaceId == null ? [] : [viewerFaceId];
+  const facesByAsset = useFaceOverlays(faceAssetIds, showFaces && faceAiAvailable, refreshTick, aiStatus.state + ":" + aiTick);
+  const viewerFaces = viewerFaceId == null ? undefined : facesByAsset?.get(viewerFaceId);
   useEffect(()=>{if(aiStatus.state!=="indexing")return;const timer=window.setInterval(()=>setAiTick(v=>v+1),20000);return()=>window.clearInterval(timer)},[aiStatus.state]);
   useEffect(()=>{if(view.kind!=="ai"||!view.title.startsWith("AI:"))return;const base=view.title.replace(/ · prehľadané [\d\s\u00a0]+ z [\d\s\u00a0]+$/u,"");const suffix=aiStatus.indexed<aiStatus.total?` · prehľadané ${aiStatus.indexed.toLocaleString("sk-SK")} z ${aiStatus.total.toLocaleString("sk-SK")}`:"";const title=base+suffix;if(title!==view.title)setView(current=>current===view?{...current,title}:current)},[aiStatus.indexed,aiStatus.total,view]);
   useEffect(()=>setAiSearchTarget(document.querySelector<HTMLElement>(".toolbar-left")),[]);
@@ -896,10 +906,13 @@ export default function App() {
         <label className="viewer-raw-toggle" title="Zapnuté: plné rozlíšenie RAW (pomalšie). Vypnuté: vložený náhľad (rýchle).">
           <input type="checkbox" checked={rawDecode} onChange={event => setRawDecode(event.target.checked)}
             onKeyDown={event => { if (event.code === "Space") event.stopPropagation(); }} /> Dekódovať RAW
-        </label><button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">
+        </label>
+        <FaceToggle checked={showFaces} onChange={setShowFaces} enabled={faceAiAvailable && viewerFaceId != null}
+          reason={faceAiAvailable ? "Tváre sú dostupné pre fotky v katalógu" : faceAiReason} />
+        <button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">
           {viewerDimensions && <>{viewerPercent} % · {viewerOriginal?.width} × {viewerOriginal?.height} · {viewerSourceLabel}</>}
           {viewerFullLoading && <small className="viewer-full-loading">Načítavam plné rozlíšenie…</small>}
-        </span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onContextMenu={openViewerMenu} onPointerDown={e=>{if(e.button===0&&!viewerFit&&!(e.target as HTMLElement).closest(".viewer-arrow"))e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit&&e.currentTarget.hasPointerCapture(e.pointerId))setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{viewerFileKey && (viewerFull || !preview || preview.dimensions) ? <img key={viewerFileKey} className="viewer-image"
+        </span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onContextMenu={openViewerMenu} onPointerDown={e=>{if(e.button===0&&!viewerFit&&!(e.target as HTMLElement).closest(".viewer-arrow"))e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit&&e.currentTarget.hasPointerCapture(e.pointerId))setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{viewerFileKey && (viewerFull || !preview || preview.dimensions) ? <img key={viewerFileKey} ref={viewerImageRef} className="viewer-image"
           style={viewerDimensions ? {
             width: viewerDimensions.width * viewerScale, height: viewerDimensions.height * viewerScale,
             maxWidth: "none", maxHeight: "none", objectFit: "contain", flex: "none",
@@ -911,7 +924,9 @@ export default function App() {
               dimensions: { width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight } });
           }}
           onError={() => { if (!viewerFull) setViewerPreview({ fileKey: viewerFileKey, dimensions: null }); }}
-        /> : <div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}<button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div>
+        /> : <div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}
+          {!!viewerFaces?.length && <FaceOverlay imageRef={viewerImageRef} faces={viewerFaces} />}
+          <button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div>
           {viewerMenuAnchor && <AssetContextMenu anchor={viewerMenuAnchor} onClose={closeViewerMenu} asset={viewer.asset}
             actionIds={() => [viewer.asset.id]} offline={!!(viewer.asset.offline || viewer.asset.missing)} isPhoto={isImage(viewer.asset, formats)}
             editors={editors} readOnly={!!appInfo?.readonly} aiReady={aiReady} aiReason={aiStatus.reason ?? "AI modul nie je nainštalovaný"}
@@ -924,6 +939,8 @@ export default function App() {
     <footer className="status-bar"><span>Spolu {slovakItems(total)} · {formatBytes(totalSize)}</span>{primaryAsset ? <><div className="selected-name">{selectedIds.size > 1 ? `${selectedIds.size} vybraných` : primaryAsset.name}</div><span>{formatBytes(primaryAsset.size)}</span><span>{dateText(primaryAsset.exifDate)}</span><span>{primaryAsset.width && primaryAsset.height ? `${primaryAsset.width} × ${primaryAsset.height}` : "—"}</span></> : null}</footer>
     {comparison && <CompareView photos={comparison} initialActive={primaryId} epoch={epoch} qualityToken={aiTick}
       uiScale={uiScale} formats={formats} rawDecode={rawDecode} onRawDecode={setRawDecode}
+      showFaces={showFaces} onShowFaces={setShowFaces} facesByAsset={facesByAsset}
+      faceAiAvailable={faceAiAvailable} faceAiReason={faceAiReason}
       editors={editors} readOnly={!!appInfo?.readonly} aiReady={aiReady} aiReason={aiStatus.reason ?? "AI modul nie je nainštalovaný"}
       onClose={closeComparison} onRestoreFocus={restoreGridFocus}
       onDrop={key => setComparison(current => current && current.length > 2 ? current.filter(photo => photo.key !== key) : current)}
