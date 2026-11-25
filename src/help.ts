@@ -34,9 +34,11 @@ export const helpTopics: HelpTopic[] = [
   { id: "selection", title: "Náhľady a výber", keywords: ["mriežka", "veľkosť", "označenie"], blocks: [
     { type: "bullets", items: ["Veľkosť náhľadov zmeňte posúvačom v hornej lište. Voľba Zobrazenie nastavuje náhľad pri prejdení myšou a ikonky na náhľadoch.", "V Zobrazenie → Údaje pod náhľadmi… vyberte zobrazené polia, ich poradie a počet riadkov.", "Klik vyberie položku, Ctrl+klik mení jednotlivý výber a Shift+klik vyberie rozsah. Ťahaním myši na prázdnej ploche možno vyznačiť obdĺžnik; Ctrl pridáva k výberu.", "Pravý klik na náhľad otvorí kontextovú ponuku. Vybrané súbory možno potiahnuť na priečinok v strome; s Ctrl sa kopírujú, inak presúvajú."] }
   ] },
-  { id: "viewer", title: "Prehliadač a RAW", keywords: ["fotografia", "prezentácia", "priblíženie", "filmstrip"], blocks: [
+  { id: "viewer", title: "Prehliadač a RAW", keywords: ["fotografia", "prezentácia", "priblíženie", "filmstrip", "porovnanie"], blocks: [
     { type: "paragraph", text: "Fotografiu otvoríte dvojklikom na náhľad alebo Enterom. Dolný pás náhľadov umožňuje prejsť na inú fotografiu; na posun slúžia aj šípky." },
-    { type: "bullets", items: ["Kolieskom myši alebo klávesmi + a − zmeňte priblíženie; zväčšený obrázok možno posúvať ťahaním. Tlačidlo 100 % / Prispôsobiť prepína veľkosť a zámok zachová priblíženie pri prechode.", "Spustiť prezentáciu prehráva fotografie v aktuálnom výsledku; interval nastavíte v hornej lište prehliadača.", "Voľba Dekódovať RAW v lište zapína plné rozlíšenie; po vypnutí sa rýchlejšie zobrazí najväčší vložený náhľad, ak je dostupný.", "Lišta uvádza zdroj obrázka a dostupné rozmery originálu. Pri zobrazení originálu alebo plného dekódovania zodpovedá 100 % jednému pixelu obrázka na jeden pixel CSS. Prehliadač opustíte tlačidlom Zavrieť alebo Esc."] }
+    { type: "bullets", items: ["Kolieskom myši alebo klávesmi + a − zmeňte priblíženie; zväčšený obrázok možno posúvať ťahaním. Tlačidlo 100 % / Prispôsobiť prepína veľkosť a zámok zachová priblíženie pri prechode.", "Spustiť prezentáciu prehráva fotografie v aktuálnom výsledku; interval nastavíte v hornej lište prehliadača.", "Voľba Dekódovať RAW v lište zapína plné rozlíšenie; po vypnutí sa rýchlejšie zobrazí najväčší vložený náhľad, ak je dostupný.", "Lišta uvádza zdroj obrázka a dostupné rozmery originálu. Pri zobrazení originálu alebo plného dekódovania zodpovedá 100 % jednému pixelu obrázka na jeden pixel CSS. Prehliadač opustíte tlačidlom Zavrieť alebo Esc."] },
+    { type: "paragraph", text: "V mriežke vyberte 2 až 4 fotografie a stlačte C alebo použite Porovnať vybrané v kontextovej ponuke. Koliesko a +/− približujú, dvojklik prepne medzi prispôsobením a 100 % a ťahanie posúva fotografiu. Vypnutím zámku ovládate každý panel zvlášť." },
+    { type: "paragraph", text: "Klik, šípky ←/→ alebo Tab vyberú aktívny panel. Skratky hodnotenia, štítkov, X, označenia, U a Delete platia iba pre jeho fotku. Esc zavrie porovnávací stôl a vráti fokus do mriežky." }
   ] },
   { id: "filters", title: "Hľadanie, filtre a radenie", keywords: ["vyhľadávanie", "triedenie", "typ", "hodnotenie"], blocks: [
     { type: "paragraph", text: "Pole Filtrovať v zobrazení… zužuje aktuálne zobrazenie podľa názvu a textových údajov. Výber typu nad mriežkou ponúka Všetko, Fotografie, RAW a Video." },
@@ -105,6 +107,9 @@ export const helpTopics: HelpTopic[] = [
       ["Alt+← / Alt+→ / Backspace / F5", "V mriežke alebo prehliadači: späť / dopredu / vyššie / obnoviť."], ["]", "V mriežke alebo prehliadači prepnúť ikonky na náhľadoch."],
       ["Ctrl+A / Ctrl+Shift+A", "V mriežke vybrať všetky položky / všetky súbory."], ["Ctrl+I / Ctrl+Shift+I / Ctrl+Shift+D", "V mriežke vybrať fotografie / obrátiť výber / zrušiť výber."],
       ["Šípky, Home, End, Page Up, Page Down", "V mriežke presunúť výber; Ctrl presúva zameranie, Shift rozširuje rozsah."], ["Ctrl+medzerník / Enter", "V mriežke prepnúť výber zameranej položky / otvoriť vybranú položku."],
+      ["C", "V mriežke porovnať 2 až 4 vybrané fotografie."],
+      ["← / → / Tab / Shift+Tab", "Na porovnávacom stole zmeniť aktívnu fotografiu."],
+      ["Dvojklik / + / − / Esc", "Na porovnávacom stole prepnúť prispôsobenie a 100 %, zmeniť priblíženie alebo zavrieť stôl."],
       ["Enter / Esc", "V prehliadači zavrieť fotografiu; Enter na vybranom bode mapy otvorí fotografiu."],
       ["← / → / medzerník / Backspace", "V prehliadači predchádzajúca / nasledujúca fotografia, aj pri priblížení."], ["+ alebo = / −", "V prehliadači priblížiť / oddialiť."], ["↑ / ↓ / Ctrl+šípky (so Shift jemnejšie)", "V priblíženej fotografii posúvať pohľad."],
       ["Shift+← / Shift+→", "V paneli Kalendár prejsť na predchádzajúci alebo nasledujúci deň či mesiac s fotografiami."],

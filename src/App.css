@@ -447,6 +447,28 @@ input[type=checkbox]{accent-color:var(--accent)}
 .viewer-info{font-size:11px}
 .viewer-raw-toggle{display:inline-flex;align-items:center;gap:5px}
 .viewer-full-loading{display:block;color:var(--muted)}
+
+.compare-overlay{position:fixed;inset:0;z-index:90;display:flex;flex-direction:column;gap:8px;padding:8px;background:var(--bg)}
+body:has(.compare-overlay)>.tile-context-menu{z-index:95}
+.compare-bar{display:flex;align-items:center;gap:14px;min-height:38px;padding:0 6px}
+.compare-bar strong{margin-right:auto}
+.compare-bar label{display:inline-flex;align-items:center;gap:6px}
+.compare-grid{display:grid;flex:1;min-height:0;gap:8px;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:minmax(0,1fr)}
+.compare-grid-3{grid-template-columns:repeat(3,minmax(0,1fr))}
+.compare-grid-4{grid-template-rows:repeat(2,minmax(0,1fr))}
+.compare-pane{position:relative;display:flex;flex-direction:column;min-width:0;min-height:0;overflow:hidden;border:2px solid var(--line);border-radius:6px;background:var(--panel)}
+.compare-pane.active{border-color:var(--accent)}
+.compare-canvas{position:relative;display:grid;place-items:center;flex:1;min-height:0;overflow:hidden;background:#090b0e;color:var(--muted);touch-action:none;user-select:none}
+.compare-canvas:focus{outline:none}
+.compare-image{position:absolute;top:50%;left:50%;max-width:none;max-height:none;object-fit:contain;transform:translate(-50%,-50%);pointer-events:none}
+.compare-image:not([style]){max-width:100%;max-height:100%}
+.compare-drop{position:absolute;right:8px;top:8px;z-index:1;padding:2px 8px;background:var(--panel);border:1px solid var(--line);border-radius:4px}
+.compare-caption{flex:0 0 64px;min-width:0;display:flex;align-items:center;align-content:flex-start;flex-wrap:wrap;gap:3px 9px;padding:6px 8px;overflow:auto;color:var(--muted);font-size:12px}
+.compare-caption strong{flex-basis:100%;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+.compare-label{display:inline-flex;align-items:center;gap:4px}
+.compare-label i{width:8px;height:8px;border-radius:50%}
+.compare-sharpest{padding:1px 6px;border:1px solid var(--accent);border-radius:8px;color:var(--text)}
+.compare-zoom{margin-left:auto;font-variant-numeric:tabular-nums}
 .viewer-count{padding:4px 10px;border-radius:999px;background:var(--panel2);color:var(--text);font-weight:600;font-size:11px}
 .viewer-canvas{padding:18px 14px;gap:14px}
 .viewer-image{border-radius:6px}

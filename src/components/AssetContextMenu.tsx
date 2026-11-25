@@ -28,6 +28,8 @@ type Props = {
   aiReady: boolean;
   aiReason: string;
   onOpen?: () => void;
+  onCompare?: () => void;
+  canCompare?: boolean;
   onOpenThumbnailInfo?: () => void;
   onSetValues: (ids: number[], changes: Record<string, unknown>) => void;
   onFileOperation: (ids: number[], mode: "move" | "copy" | "rename" | "delete" | "delete-permanent", asset?: Asset) => void;
@@ -37,7 +39,7 @@ type Props = {
 
 export default function AssetContextMenu({
   anchor, onClose, asset, actionIds, offline, isPhoto, editors, readOnly, aiReady, aiReason,
-  onOpen, onOpenThumbnailInfo, onSetValues, onFileOperation, onQuarantine, onFindSimilar,
+  onOpen, onCompare, canCompare, onOpenThumbnailInfo, onSetValues, onFileOperation, onQuarantine, onFindSimilar,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<{ left: number; top: number }>();
@@ -95,6 +97,7 @@ export default function AssetContextMenu({
       onContextMenu={event => { event.preventDefault(); event.stopPropagation(); }}
       onMouseLeave={onClose}>
       {onOpen && <button onClick={() => { onClose(); onOpen(); }}>Otvoriť</button>}
+      {onCompare && <button disabled={!canCompare} onClick={() => { onClose(); onCompare(); }}>Porovnať vybrané (C)</button>}
       <button disabled={offline} onClick={() => { onClose(); void invoke("asset_action", { assetId: asset.id, action: "open" }); }}>Otvoriť v predvolenom programe</button>
       {!asset.isDirectory && editors.map((editor, index) =>
         <button key={editor.path} disabled={offline} title={editor.path} onClick={() => {

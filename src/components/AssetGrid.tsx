@@ -9,9 +9,11 @@ import type { Asset, AssetQuality, CatalogAssetMetadata, FormatTable, Page, View
 import { EXIF_THUMBNAIL_FIELDS, formatKilobytes, formatSlovakDate, type ThumbnailInfoConfig } from "../thumbnailInfo";
 
 const PAGE_SIZE = 120;
-const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostrá", over:"Prepálená", under:"Tmavá" };
+export const QUALITY_FLAG_TEXT: Record<string,string> = { blur:"Neostrá", over:"Prepálená", under:"Tmavá" };
 export type AssetValuePatch = Pick<Asset, "id" | "rating" | "label" | "tagged"> & Partial<Pick<Asset, "editPendingSince">>;
+export type GridAsset = { asset: Asset; index: number };
 export type AssetGridHandle = {
+  focus: () => void;
   applyValues: (patches: ReadonlyMap<number, AssetValuePatch>, reloadListing: boolean) => void;
   reloadListing: () => Promise<void>;
   reveal: (index: number) => void;
@@ -41,6 +43,8 @@ type Props = {
   onSelect: (asset: Asset, index: number, event: MouseEvent | KeyboardEvent) => void;
   onSelectRange: (ids: number[], asset: Asset, index: number, add: boolean) => void;
   onSelectAll: (ids: number[]) => void;
+  onCompare: (photos: GridAsset[]) => void;
+  comparisonOpen: boolean;
   onOpen: (asset: Asset, index: number) => void;
   onCounts: (total: number, size: number) => void;
   onViewport: () => void;
@@ -62,7 +66,7 @@ type Props = {
   qualityToken?: number;
 };
 
-export default function AssetGrid({ ref, view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], quarantineDeleteDays, onQuarantine, deletionSuggestions, onKeepSuggested, onSelect, onSelectRange, onSelectAll, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly }: Props) {
+export default function AssetGrid({ ref, view, query, sort, descending, zoom, epoch, selectedIds, primaryId, cutIds=[], quarantineDeleteDays, onQuarantine, deletionSuggestions, onKeepSuggested, onSelect, onSelectRange, onSelectAll, onCompare, comparisonOpen, onOpen, onCounts, onViewport, filters={}, overlayMode=2, hoverMode="shift", includeChildren, refreshToken=0, qualityToken=0, formats, thumbnailInfo, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const groupsById = useMemo(() => {
     const groups = new Map<number, number>();
@@ -224,6 +228,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
 
   useImperativeHandle(ref, () => ({
     reveal,
+    focus: () => scrollRef.current?.focus({ preventScroll: true }),
     async reloadListing() {
       const scroll = scrollRef.current;
       const firstVisible = scroll ? Math.max(0, Math.floor(scroll.scrollTop / rowHeight) * columns) : 0;
@@ -359,6 +364,55 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   }, [visibleSignature, paramsKey, exifFields.join(","), rowHeight, columns, total]);
 
   const getAt = (index: number) => cache.current.get(index);
+  const currentSelection = useRef(selectedIds);
+  currentSelection.current = selectedIds;
+  const [comparisonSelection, setComparisonSelection] = useState<Set<number> | null>(null);
+  const resolveComparison = useCallback(async (): Promise<GridAsset[]> => {
+    if (selectedIds.size < 2 || selectedIds.size > 4) return [];
+    const wanted = new Set(selectedIds);
+    const entries: GridAsset[] = [];
+    const add = (asset: Asset, index: number) => {
+      if (wanted.delete(asset.id)) entries.push({ asset, index });
+    };
+    for (const [index, asset] of cache.current) {
+      add(asset, index);
+      if (!wanted.size) break;
+    }
+    const loaded = () => entries.length === selectedIds.size && entries.every(({ asset }) => !asset.isDirectory && isImage(asset, formats));
+    if (!wanted.size) return loaded() ? entries.sort((a, b) => a.index - b.index) : [];
+    if (entries.some(({ asset }) => asset.isDirectory || !isImage(asset, formats))) return [];
+    const version = requestVersion.current;
+    const filter = { ...params, offset: 0, limit: 1 };
+    const current = () => version === requestVersion.current && currentSelection.current === selectedIds;
+    if (params.sort !== "similarity" && !["ai", "series", "people"].includes(params.kind)) {
+      await Promise.all([...wanted].map(async id => {
+        const index = await invoke<number | null>("locate_asset", { filter, id });
+        if (index === null || !current()) return;
+        const { items } = await invoke<Page>("get_assets", { filter: { ...filter, offset: index } });
+        if (items[0]?.id === id) add(items[0], index);
+      }));
+    } else {
+      for (let offset = 0; wanted.size && current(); offset += 500) {
+        const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: 500 } });
+        page.items.forEach((asset, index) => add(asset, offset + index));
+        if (offset + page.items.length >= page.total || !page.items.length) break;
+      }
+    }
+    return current() && loaded() ? entries.sort((a, b) => a.index - b.index) : [];
+  }, [formats, params, selectedIds]);
+  useEffect(() => {
+    if (selectedIds.size < 2 || selectedIds.size > 4) return;
+    let active = true;
+    void resolveComparison().then(entries => {
+      if (active) setComparisonSelection(entries.length ? selectedIds : null);
+    }).catch(() => { if (active) setComparisonSelection(null); });
+    return () => { active = false; };
+  }, [resolveComparison, selectedIds, itemsVersion]);
+  const compareSelection = async () => {
+    const key = paramsKeyRef.current;
+    const entries = await resolveComparison().catch(() => []);
+    if (currentSelection.current === selectedIds && paramsKeyRef.current === key) onCompare(entries);
+  };
   const fetchIds = async (extra: Record<string,unknown> = {}) => { const ids:number[]=[];for(let offset=0;offset<total;offset+=500){const batch=await invoke<number[]>("get_asset_ids",{filter:{...params,...extra,offset:0,limit:500},offset,limit:500});ids.push(...batch);if(batch.length<500)break;}return ids; };
   const fetchAssetsForIds = async (ids:number[]) => {const wanted=new Set(ids),files:number[]=[];for(let offset=0;offset<total&&wanted.size;offset+=500){const p=await invoke<Page>("get_assets",{filter:{...params,offset,limit:500}});for(const a of p.items)if(wanted.has(a.id)){if(!a.isDirectory)files.push(a.id);wanted.delete(a.id)}if(p.items.length<500)break;}return files;};
   const selectRangeTo = async (asset: Asset, index: number, add: boolean) => {
@@ -384,6 +438,12 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   };
   const onKeyDown = async (event: KeyboardEvent<HTMLDivElement>) => {
     if (document.activeElement !== event.currentTarget || event.altKey) return;
+    if (!event.ctrlKey && !event.metaKey && !event.shiftKey && event.key.toLowerCase() === "c") {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!event.repeat) void compareSelection();
+      return;
+    }
     if (event.key === "Enter") {
       event.preventDefault();
       // The viewer listens on window and would close again on this same keypress.
@@ -442,7 +502,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
           {Array.from({ length: columns }, (_, col) => {
             const index = row.index * columns + col; const asset = getAt(index);
             if (!asset || index >= total) return <div key={col} />;
-            return <AssetTile key={asset.id} asset={asset} editors={editors} quarantineDeleteDays={quarantineDeleteDays} onQuarantine={onQuarantine} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={groupsById.get(asset.id)} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
+            return <AssetTile key={asset.id} asset={asset} editors={editors} quarantineDeleteDays={quarantineDeleteDays} onQuarantine={onQuarantine} deletionSuggested={deletionSuggestions.has(asset.id)} onKeepSuggested={onKeepSuggested} folderPreviews={asset.path ? folderPreviews.get(asset.path) ?? [] : []} groupNumber={groupsById.get(asset.id)} best={view.kind==="series"&&view.bestIds?.includes(asset.id)} size={zoom} epoch={epoch} selected={selectedIds.has(asset.id)} primary={asset.id === primaryId} focused={focusIndex === null ? asset.id === primaryId : index === focusIndex} cut={cutIds.includes(asset.id)} selectedIds={selectedIds} shiftDown={shiftDown} dismissTilePopup={dismissTilePopup} overlayMode={overlayMode} hoverMode={hoverMode} formats={formats} infoFields={thumbnailInfo.fields} tileMetadata={tileMetadata.get(asset.id)} quality={tileQuality.get(asset.id)} onOpenThumbnailInfo={onOpenThumbnailInfo} onSetValues={onSetValues} onFileOperation={onFileOperation} onFindSimilar={onFindSimilar} aiReady={aiReady} aiReason={aiReason} readOnly={readOnly} comparisonOpen={comparisonOpen} onCompare={() => void compareSelection()} canCompare={selectedIds.has(asset.id) && comparisonSelection === selectedIds} onClick={e => void handleTileClick(e,asset,index)} onContextMenu={() => { if (!selectedIds.has(asset.id)) { anchorIndex.current=index; setFocusIndex(index); onSelect(asset,index,{ctrlKey:false,metaKey:false,shiftKey:false} as MouseEvent); } scrollRef.current?.focus({preventScroll:true}); }} onDoubleClick={() => onOpen(asset, index)} />;
           })}
         </div>)}
       </div>
@@ -450,7 +510,7 @@ export default function AssetGrid({ ref, view, query, sort, descending, zoom, ep
   </div>;
 }
 
-function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletionSuggested, onKeepSuggested, folderPreviews, groupNumber, best, size, epoch, selected, primary, focused, cut, onClick, onContextMenu, onDoubleClick, overlayMode, hoverMode, selectedIds, shiftDown, dismissTilePopup, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly }: { asset: Asset; editors: Editor[]; quarantineDeleteDays?: number; onQuarantine: (ids: number[]) => void; deletionSuggested: boolean; onKeepSuggested: (id: number) => void; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; focused: boolean; cut:boolean; selectedIds:ReadonlySet<number>; shiftDown:boolean; dismissTilePopup:{current:(()=>void)|null}; onClick: (event: MouseEvent<HTMLDivElement>) => void; onContextMenu: () => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean }) {
+function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletionSuggested, onKeepSuggested, folderPreviews, groupNumber, best, size, epoch, selected, primary, focused, cut, onClick, onContextMenu, onDoubleClick, overlayMode, hoverMode, selectedIds, shiftDown, dismissTilePopup, formats, infoFields, tileMetadata, quality, onOpenThumbnailInfo, onSetValues, onFileOperation, onFindSimilar, aiReady, aiReason, readOnly, comparisonOpen, onCompare, canCompare }: { asset: Asset; editors: Editor[]; quarantineDeleteDays?: number; onQuarantine: (ids: number[]) => void; deletionSuggested: boolean; onKeepSuggested: (id: number) => void; folderPreviews: FolderPreview[]; groupNumber?:number; best?:boolean; size: number; epoch: number; selected: boolean; primary: boolean; focused: boolean; cut:boolean; selectedIds:ReadonlySet<number>; shiftDown:boolean; dismissTilePopup:{current:(()=>void)|null}; onClick: (event: MouseEvent<HTMLDivElement>) => void; onContextMenu: () => void; onDoubleClick: () => void; overlayMode:number; hoverMode:"off"|"hover"|"shift"; formats: FormatTable; infoFields: ThumbnailInfoConfig["fields"]; tileMetadata?: import("../types").TileExifMetadata; quality?: AssetQuality; onOpenThumbnailInfo: () => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onFileOperation:(ids:number[],mode:"move"|"copy"|"rename"|"delete"|"delete-permanent",asset?:Asset)=>void; onFindSimilar:(asset:Asset)=>void; aiReady:boolean; aiReason:string; readOnly:boolean; comparisonOpen:boolean; onCompare: () => void; canCompare: boolean }) {
   // The epoch a tile was mounted with stays in its thumbnail URL, so later epoch bumps (far scroll, new
   // view) do not reload thumbnails that are already on screen; only a "stale" answer picks up the new one.
   const [tileEpoch,setTileEpoch]=useState(epoch); const latestEpoch=useRef(epoch); latestEpoch.current=epoch;
@@ -492,6 +552,7 @@ function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletio
     }
   };
   const { anchor: menuAnchor, open: openMenu, close: closeMenu } = useAssetContextMenu();
+  useLayoutEffect(() => { if (comparisonOpen) closeMenu(); }, [comparisonOpen, closeMenu]);
   const [hoverMetadata,setHoverMetadata]=useState<CatalogAssetMetadata|null>(null);
   const [hover,setHover]=useState(false);const [popup,setPopup]=useState(false);const timer=useRef<number|undefined>(undefined);
   const tileRef=useRef<HTMLDivElement>(null);const popupRef=useRef<HTMLDivElement>(null);
@@ -541,9 +602,9 @@ function AssetTile({ asset, editors, quarantineDeleteDays, onQuarantine, deletio
       {!asset.isDirectory && !hasSizeLine && <span className="size-badge">{formatBytes(asset.size)}</span>}
     </div>
     <div className="tile-info-lines">{(asset.isDirectory ? [{id:"name",lines:1 as const}] : infoFields).map((field,index) => { const text=displayValue(field.id); return <div key={`${field.id}:${index}`} className={`tile-info-line ${field.id === "name" ? "tile-name" : ""}`} style={{ WebkitLineClamp: field.lines, maxHeight: field.lines * 14 }} title={text}>{text || "\u00a0"}</div>; })}</div>
-    {menuAnchor && <AssetContextMenu anchor={menuAnchor} onClose={closeMenu} asset={asset} actionIds={actionIds}
+    {!comparisonOpen && menuAnchor && <AssetContextMenu anchor={menuAnchor} onClose={closeMenu} asset={asset} actionIds={actionIds}
       offline={!!asset.offline || offline} isPhoto={isImage(asset, formats)} editors={editors} readOnly={readOnly}
-      aiReady={aiReady} aiReason={aiReason} onOpen={onDoubleClick} onOpenThumbnailInfo={onOpenThumbnailInfo}
+      aiReady={aiReady} aiReason={aiReason} onOpen={onDoubleClick} onCompare={onCompare} canCompare={canCompare} onOpenThumbnailInfo={onOpenThumbnailInfo}
       onSetValues={onSetValues} onFileOperation={onFileOperation} onQuarantine={onQuarantine} onFindSimilar={onFindSimilar} />}
     {popup && createPortal(
       <div ref={popupRef} className="hover-card" style={{ position: "fixed", left: popupPosition?.left ?? -10000, top: popupPosition?.top ?? -10000, maxHeight: popupPosition?.maxHeight ?? "80vh", overflowY: "auto" }}>

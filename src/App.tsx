@@ -4,9 +4,10 @@ import { launchEditor, useEditors, type Editor } from "./editors";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createPortal } from "react-dom";
-import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch } from "./components/AssetGrid";
+import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch, type GridAsset } from "./components/AssetGrid";
 import AssetContextMenu, { useAssetContextMenu } from "./components/AssetContextMenu";
 import { useFullImage } from "./components/useFullImage";
+import CompareView, { type ComparedPhoto } from "./components/CompareView";
 import MapView from "./components/MapView";
 import LeftPanel from "./components/LeftPanel";
 import RightPanel from "./components/RightPanel";
@@ -164,6 +165,33 @@ export default function App() {
   const [folderDeleteConfirm,setFolderDeleteConfirm]=useState<{path:string;info:{files:number;folders:number;catalogued:number;bytes:number;recycleAvailable:boolean}}|null>(null);
   const [operationProgress,setOperationProgress]=useState("");
   const [viewer, setViewer] = useState<{ asset: Asset; index: number } | null>(null);
+  const [comparison, setComparison] = useState<ComparedPhoto[] | null>(null);
+  const closeComparison = useCallback(() => setComparison(null), []);
+  const closeIfCompared = useCallback((ids: number[]) => {
+    setComparison(current => current?.some(photo => ids.includes(photo.asset.id)) ? null : current);
+  }, []);
+  const restoreGridFocus = useCallback(() => {
+    requestAnimationFrame(() => {
+      if (!currentViewer.current && !document.querySelector(".compare-overlay")) grid.current?.focus();
+    });
+  }, []);
+  const removeCompared = useCallback((ids: number[]) => {
+    if (!ids.length) return;
+    const removed = new Set(ids);
+    setComparison(current => {
+      if (!current) return current;
+      const remaining = current.filter(photo => !removed.has(photo.asset.id));
+      return remaining.length < 2 ? null : remaining.length === current.length ? current : remaining;
+    });
+  }, []);
+  const openComparison = (photos: GridAsset[]) => {
+    if (photos.length < 2 || photos.length > 4) {
+      setToast("Porovnať sa dá 2 až 4 fotografie.");
+      window.setTimeout(() => setToast(""), 3000);
+      return;
+    }
+    setComparison(photos.map(photo => ({ ...photo, key: photo.asset.id })));
+  };
   const currentViewer = useRef(viewer);
   const viewerValuePatches = useRef(new Map<number, AssetValuePatch>());
   currentViewer.current = viewer;
@@ -435,6 +463,10 @@ export default function App() {
           const asset = patchAsset(previous.asset);
           return asset === previous.asset ? previous : { ...previous, asset };
         });
+        setComparison(current => current?.map(photo => {
+          const asset = patchAsset(photo.asset);
+          return asset === photo.asset ? photo : { ...photo, asset };
+        }) ?? null);
         const context = valueContext.current;
         const patch = context.primaryId == null ? undefined : patches.get(context.primaryId);
         if (patch) {
@@ -543,7 +575,19 @@ export default function App() {
     }
   }, [viewerLock]);
 
+  const openComparedPhoto = (photo: ComparedPhoto) => {
+    closeComparison();
+    showViewerAsset(photo.asset, photo.index);
+    const shown = currentViewer.current;
+    const filter = currentAssetFilter.current;
+    void invoke<number | null>("locate_asset", { filter: { ...filter, offset: 0, limit: 1 }, id: photo.asset.id }).then(index => {
+      if (index === null || index === photo.index || currentAssetFilter.current !== filter) return;
+      setViewer(current => current && current === shown ? { ...current, index } : current);
+    }).catch(() => {});
+  };
+
   const advanceAfterRemoval = useCallback(async (removedIds: number[]) => {
+    removeCompared(removedIds);
     const shown = currentViewer.current;
     if (!shown || !removedIds.includes(shown.asset.id)) return;
     const filter = currentAssetFilter.current;
@@ -576,7 +620,7 @@ export default function App() {
         setViewer(null);
       }
     }
-  }, [formats, showViewerAsset]);
+  }, [formats, removeCompared, showViewerAsset]);
 
   const requestQuarantineMove = (ids: number[]) => {
     if (!appInfo?.readonly && !quarantineBusy) setQuarantineConfirm({ ids, action: "move" });
@@ -597,20 +641,30 @@ export default function App() {
       ].filter(Boolean).join(" · ");
       setToast(summary || "Karanténa bez zmien");
       if (result.affectedFolderPaths.length) {
-        setSelectedIds(new Set());
-        setPrimaryId(null);
-        setPrimaryAsset(null);
-        refreshAfterWrite(true, result.affectedFolderPaths);
+        let removed: number[] = [];
         if ((command === "move_to_quarantine" || command === "delete_from_quarantine") && Array.isArray(args.assetIds)) {
+          const ids = args.assetIds as number[];
           const failures = new Set(result.failures.flatMap(error => {
             const match = /^Položka (-?\d+):/.exec(error);
             return match ? [Number(match[1])] : [];
           }));
-          const successfulIds = (args.assetIds as number[]).filter(id => !failures.has(id));
+          const successfulIds = ids.filter(id => !failures.has(id));
           const count = command === "move_to_quarantine" ? result.moved : result.deleted;
-          if (count === successfulIds.length) await advanceAfterRemoval(successfulIds);
-          else if (args.assetIds.length === 1 && count === 1) await advanceAfterRemoval(args.assetIds as number[]);
+          if (count === successfulIds.length) removed = successfulIds;
+          else if (ids.length === 1 && count === 1) removed = ids;
         }
+        if (comparison) {
+          const ids = new Set(removed);
+          setSelectedIds(current => new Set([...current].filter(id => !ids.has(id))));
+          setPrimaryId(id => id != null && ids.has(id) ? null : id);
+          setPrimaryAsset(asset => asset && ids.has(asset.id) ? null : asset);
+        } else {
+          setSelectedIds(new Set());
+          setPrimaryId(null);
+          setPrimaryAsset(null);
+        }
+        refreshAfterWrite(true, result.affectedFolderPaths);
+        if (removed.length) await advanceAfterRemoval(removed);
       }
       setQuarantineFailures(result.failures);
       window.setTimeout(() => setToast(""), 8000);
@@ -655,7 +709,7 @@ export default function App() {
           return;
         }
       }
-      const result=await invoke<any>(mode==="move"?"move_files":"copy_files",{assetIds:ids,targetFolderPath:path,conflict});setFileConflict(null);setOperationProgress("");setToast(result.summary);setCutIds([]);if(mode==="move")setFileClipboard(null);if(result.changedCount>0)refreshAfterWrite(true,result.affectedFolderPaths??[view.folderPath,path].filter(Boolean));if(mode==="move"&&result.changedCount>0&&view.kind==="folder"&&path.toLowerCase()!==(view.folderPath??"").toLowerCase()){setSelectedIds(prev=>new Set([...prev].filter(id=>!ids.includes(id))));if(primaryId!=null&&ids.includes(primaryId)){setPrimaryId(null);setPrimaryAsset(null)}}window.setTimeout(()=>setToast(""),result.changedCount?6000:2400);}catch(error){setOperationProgress("");setToast(String(error));window.setTimeout(()=>setToast(""),4000)}finally{setOperationProgress("")}},[refreshAfterWrite,view,primaryId]);
+      const result=await invoke<any>(mode==="move"?"move_files":"copy_files",{assetIds:ids,targetFolderPath:path,conflict});setFileConflict(null);setOperationProgress("");setToast(result.summary);setCutIds([]);if(mode==="move"){setFileClipboard(null);if(result.changedCount>0)closeIfCompared(result.affectedIds??[]);}if(result.changedCount>0)refreshAfterWrite(true,result.affectedFolderPaths??[view.folderPath,path].filter(Boolean));if(mode==="move"&&result.changedCount>0&&view.kind==="folder"&&path.toLowerCase()!==(view.folderPath??"").toLowerCase()){setSelectedIds(prev=>new Set([...prev].filter(id=>!ids.includes(id))));if(primaryId!=null&&ids.includes(primaryId)){setPrimaryId(null);setPrimaryAsset(null)}}window.setTimeout(()=>setToast(""),result.changedCount?6000:2400);}catch(error){setOperationProgress("");setToast(String(error));window.setTimeout(()=>setToast(""),4000)}finally{setOperationProgress("")}},[refreshAfterWrite,view,primaryId,closeIfCompared]);
   const chooseOperationTarget=useCallback(async(path:string)=>{if(!fileOp)return;try{const count=await invoke<number>("get_file_operation_conflicts",{assetIds:fileOp.ids,targetFolderPath:path});const pending={...fileOp,path,count};setFileOp(null);if(count)setFileConflict(pending);else void runFileOperation(fileOp.ids,fileOp.mode,path,"cancel");}catch(error){setToast(String(error));setFileOp(null)}},[fileOp,runFileOperation]);
   const dropFiles=useCallback(async(ids:number[],path:string,copy:boolean)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}const mode=copy?"copy":"move";try{const count=await invoke<number>("get_file_operation_conflicts",{assetIds:ids,targetFolderPath:path});if(count)setFileConflict({ids,mode,path,count});else void runFileOperation(ids,mode,path,"cancel");}catch(error){setToast(String(error));}},[appInfo,runFileOperation]);
   const folderAction=useCallback(async(action:"reveal"|"copyPath"|"rename"|"delete"|"cut"|"copy"|"paste",path:string)=>{if(action==="copyPath"){await navigator.clipboard.writeText(path);setToast("Cesta skopírovaná");window.setTimeout(()=>setToast(""),1800);return;}if(action==="reveal"){try{await invoke("reveal_in_explorer",{path})}catch(error){setToast(String(error))}return;}if(action==="cut"||action==="copy"){setFolderClipboard({path,mode:action==="cut"?"move":"copy"});setFileClipboard(null);setCutIds([]);return;}if(action==="delete"){try{const info=await invoke<{files:number;folders:number;catalogued:number;bytes:number;recycleAvailable:boolean}>("delete_folder_info",{path});if(!info.recycleAvailable){setToast("Na tomto disku nie je dostupný Kôš");return;}setFolderDeleteConfirm({path,info})}catch(error){setToast(String(error))}return;}if(action==="rename"){const name=path.split(/[\\/]/).filter(Boolean).pop()??path;setFolderRenameOp({path,name});return;}if(action==="paste"&&fileClipboard){void dropFiles(fileClipboard.ids,path,fileClipboard.mode==="copy");return;}if(action==="paste"&&folderClipboard){try{const result=await invoke<any>(folderClipboard.mode==="move"?"move_folder":"copy_folder",{path:folderClipboard.path,target:path});setToast(result.summary);if(folderClipboard.mode==="move"){const newPath=(result.affectedFolderPaths as string[]|undefined)?.[1]; if(newPath)window.dispatchEvent(new CustomEvent("ddreams-folder-path-changed",{detail:{oldPath:folderClipboard.path,newPath}}));setFolderClipboard(null);}refreshAfterWrite(true,result.affectedFolderPaths??[path,folderClipboard.path]);}catch(error){setToast(String(error))}}},[folderClipboard,fileClipboard,dropFiles,refreshAfterWrite]);
@@ -679,11 +733,12 @@ export default function App() {
     } catch (error) { setToast(String(error)); window.setTimeout(() => setToast(""), 6000); }
   }, [refreshAfterWrite, advanceAfterRemoval]);
   const createFolder=useCallback((parentPath:string)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}setFileOp(null);setNameOp({kind:"folder",parentPath});},[appInfo]);
-  const submitName=useCallback(async(name:string)=>{if(!nameOp)return;const result=await invoke<any>(nameOp.kind==="rename"?"rename_file":"create_folder",nameOp.kind==="rename"?{assetId:nameOp.assetId,newBaseName:name}:{parentPath:nameOp.parentPath,name});setNameOp(null);setToast(result.summary);setOperationProgress("");const paths=result.affectedFolderPaths??(nameOp.kind==="folder"?[nameOp.parentPath]:primaryAsset?.path?[primaryAsset.path.substring(0,primaryAsset.path.lastIndexOf("\\"))]:[]);refreshAfterWrite(true,paths);window.setTimeout(()=>setToast(""),6000);},[nameOp,primaryAsset,refreshAfterWrite]);
+  const submitName=useCallback(async(name:string)=>{if(!nameOp)return;const result=await invoke<any>(nameOp.kind==="rename"?"rename_file":"create_folder",nameOp.kind==="rename"?{assetId:nameOp.assetId,newBaseName:name}:{parentPath:nameOp.parentPath,name});if(nameOp.kind==="rename"&&result.changedCount>0)closeIfCompared([nameOp.assetId]);setNameOp(null);setToast(result.summary);setOperationProgress("");const paths=result.affectedFolderPaths??(nameOp.kind==="folder"?[nameOp.parentPath]:primaryAsset?.path?[primaryAsset.path.substring(0,primaryAsset.path.lastIndexOf("\\"))]:[]);refreshAfterWrite(true,paths);window.setTimeout(()=>setToast(""),6000);},[nameOp,primaryAsset,refreshAfterWrite,closeIfCompared]);
   useEffect(()=>{let unlisten:(()=>void)|undefined;void listen<{operation:string;done:number;total:number}>("file-operation-progress",event=>{if(event.payload.done>=event.payload.total)setOperationProgress("");else setOperationProgress(`${event.payload.operation} ${event.payload.done} / ${event.payload.total}…`)}).then(fn=>{unlisten=fn});return()=>unlisten?.()},[]);
   useEffect(()=>{if(!historyOpen)return;const outside=(event:PointerEvent)=>{if(event.target instanceof Node&&!historyRef.current?.contains(event.target))setHistoryOpen(false)};const escape=(event:globalThis.KeyboardEvent)=>{if(event.key==="Escape"){event.stopPropagation();setHistoryOpen(false)}};document.addEventListener("pointerdown",outside);window.addEventListener("keydown",escape);return()=>{document.removeEventListener("pointerdown",outside);window.removeEventListener("keydown",escape)}},[historyOpen]);
   useEffect(()=>{if(!aiOpen)return;const outside=(event:PointerEvent)=>{if(event.target instanceof Node&&!aiRef.current?.contains(event.target))setAiOpen(false)};const escape=(event:globalThis.KeyboardEvent)=>{if(event.key==="Escape"){event.stopPropagation();setAiOpen(false)}};document.addEventListener("pointerdown",outside);window.addEventListener("keydown",escape);return()=>{document.removeEventListener("pointerdown",outside);window.removeEventListener("keydown",escape)}},[aiOpen]);
   useEffect(()=>{const key=(e:globalThis.KeyboardEvent)=>{
+    if (comparison) return;
     if(e.key==="Shift")window.__ddreamsShift=true;
     if (viewerMenuOpen && e.key.startsWith("Arrow")) { e.preventDefault(); return; }
     if (e.defaultPrevented || document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]")) return;
@@ -717,7 +772,7 @@ export default function App() {
     else if(e.key==="F5"){e.preventDefault();refresh()}
     else if(e.key==="]"){setOverlayMode(v=>v===0?2:0)}
   };
-  const keyup=(e:globalThis.KeyboardEvent)=>{if(e.key==="Shift")window.__ddreamsShift=false};const zoomer=(e:Event)=>setZoom(v=>Math.max(80,Math.min(400,v+(e as CustomEvent<number>).detail)));const mouse=(e:globalThis.MouseEvent)=>{if(e.button===3){e.preventDefault();travel(historyIndex-1)}else if(e.button===4){e.preventDefault();travel(historyIndex+1)}};window.addEventListener("keydown",key);window.addEventListener("keyup",keyup);window.addEventListener("ddreams-zoom",zoomer);window.addEventListener("mouseup",mouse);return()=>{window.removeEventListener("keydown",key);window.removeEventListener("keyup",keyup);window.removeEventListener("ddreams-zoom",zoomer);window.removeEventListener("mouseup",mouse)}},[travel,historyIndex,up,refresh,copyCurrentResult,primaryId,viewer,selectedIds,setAssetValues,selectTaggedInView,view,fileClipboard,folderClipboard,folderAction,dropFiles,beginFileOperation,editors,viewerMenuOpen]);
+  const keyup=(e:globalThis.KeyboardEvent)=>{if(e.key==="Shift")window.__ddreamsShift=false};const zoomer=(e:Event)=>setZoom(v=>Math.max(80,Math.min(400,v+(e as CustomEvent<number>).detail)));const mouse=(e:globalThis.MouseEvent)=>{if(comparison)return;if(e.button===3){e.preventDefault();travel(historyIndex-1)}else if(e.button===4){e.preventDefault();travel(historyIndex+1)}};window.addEventListener("keydown",key);window.addEventListener("keyup",keyup);window.addEventListener("ddreams-zoom",zoomer);window.addEventListener("mouseup",mouse);return()=>{window.removeEventListener("keydown",key);window.removeEventListener("keyup",keyup);window.removeEventListener("ddreams-zoom",zoomer);window.removeEventListener("mouseup",mouse)}},[travel,historyIndex,up,refresh,copyCurrentResult,primaryId,viewer,selectedIds,setAssetValues,selectTaggedInView,view,fileClipboard,folderClipboard,folderAction,dropFiles,beginFileOperation,editors,viewerMenuOpen,comparison]);
 
   const moveViewer = useCallback(async (delta: number) => {
     if (!viewer) return;
@@ -783,7 +838,7 @@ export default function App() {
   };
   return <main className="app-shell" style={{zoom:uiScale}}>
     <header className="topbar"><div className="top-left"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><nav className="top-crumbs">{crumbs.map((crumb,i)=><span key={`${crumb}-${i}`} className="crumb-item">{i>0&&<i>›</i>}<button onClick={()=>void openCrumb(i)}>{crumb}</button></span>)}{Object.values(filters).some(Boolean)&&<span className="active-filters">{filters.ratingMode&&`Hodnotenie ${filters.ratingMode} ${filters.ratingValue??""}`} {filters.labelFilter&&`Farebný štítok: ${labelText(filters.labelFilter)}`} {filters.taggedOnly&&"Označené"} {filters.fileGroup&&`Typ: ${filters.fileGroup==="all"?"všetky súbory":filters.fileGroup}`}<button onClick={()=>setFilters({})}>×</button></span>}</nav><span className="count-pill">{slovakItems(total)}</span></div><label className="search-box"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filtrovať v zobrazení…"/><kbd>Ctrl+F</kbd></label><div className="top-right"><DockLayoutMenu layout={dockLayout} setLayout={setDockLayout}/><div className="ai-anchor" ref={aiRef}><button className={`ai-chip ai-${aiStatus.state}`} title={!aiStatus.available?aiStatus.reason??"AI modul nie je nainštalovaný":aiStatus.lastError??"AI index a vyhľadávanie"} onClick={()=>setAiOpen(v=>!v)}>{aiChipText}</button>{aiOpen&&<div className="ai-popover"><b>AI katalóg</b><div><span>Zaindexované</span><strong>{aiStatus.indexed.toLocaleString("sk-SK")}</strong></div><div><span>Vo fronte</span><strong>{aiStatus.queued.toLocaleString("sk-SK")}</strong></div><div><span>Čaká na spracovanie</span><strong>{aiStatus.waiting.toLocaleString("sk-SK")}</strong></div><div><span>AI model</span><strong>{({unloaded:"nenačítaný",loading:"načítava sa",ready:"pripravený",error:"chyba"} as Record<string,string>)[aiStatus.modelState]??aiStatus.modelState}</strong></div>{aiStatus.modelState==="unloaded"&&<button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_load_model")}>Spracovať čakajúce fotografie <small>vyžaduje AI model</small></button>}<div><span>Offline</span><strong>{aiStatus.offline.toLocaleString("sk-SK")}</strong></div><div><span>Chyby</span><strong>{aiStatus.failed.toLocaleString("sk-SK")}</strong></div>{aiStatus.lastError&&<small>{aiStatus.lastError}</small>}<button disabled={!aiStatus.available||!aiEnabled||aiStatus.state==="loading"} onClick={()=>void updateAiStatus(aiStatus.state==="paused"?"ai_resume":"ai_pause")}>{aiStatus.state==="paused"?"Pokračovať":"Pozastaviť"}</button><button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_reindex")}>Aktualizovať index</button><button onClick={()=>void toggleAi()}>{aiEnabled?"Vypnúť AI":"Zapnúť AI"}</button></div>}</div><div className="history-anchor" ref={historyRef}><button className="catalog-label" title={catalogTooltip} onClick={()=>{setHistoryOpen(v=>!v);loadRecentChanges()}}><span className="status-light"/>{appInfo?.readonly ? "Katalóg iba na čítanie" : "Katalóg"}</button>{historyOpen&&<div className="change-history"><div className="change-history-head"><b>História zmien</b></div>{recentChanges.length?recentChanges.map(change=><div key={change.id}><time>{new Date(change.ts).toLocaleString("sk-SK")}</time><span>{change.summary}</span></div>):<small>Žiadne zmeny</small>}</div>}</div><button className="settings-button" title="Pomocník (F1)" onClick={()=>setHelpOpen(true)}>?</button><button className="settings-button" title="Nastavenia" onClick={()=>setSettingsOpen(true)}>⚙</button></div></header>
-    <div className="workspace">
+    <div className="workspace" inert={!!comparison}>
       <LeftPanel hosts={dockHosts} onNavigate={navigate} activeFolderId={view.kind === "folder" ? view.id ?? null : null} activeFolderIds={view.kind === "folder" ? view.ids : []} activeView={view} calendarRefreshToken={refreshTick + calendarCatalogueTick} refreshToken={treeRefreshTick} refreshPaths={treeRefreshPaths} onFileDrop={dropFiles} onCreateFolder={createFolder} onFolderRule={(path,mode)=>void changeFolderRule(path,mode)} onFolderAction={(action,path)=>void folderAction(action,path)} clipboardPath={folderClipboard?.mode==="move"?folderClipboard.path:null} clipboardAvailable={!!folderClipboard||!!fileClipboard} onToast={message=>{setToast(message);window.setTimeout(()=>setToast(""),3000)}}/>
       <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
         aiReady={aiReady} aiReason={!aiEnabled?"AI je vypnutá":aiStatus.reason??aiStatus.lastError??"AI sa pripravuje"}
@@ -821,7 +876,7 @@ export default function App() {
           <button onClick={() => { setQuarantineReview(null); setReviewInGrid(false); }}>Teraz nie</button>
         </div>}
         {centerMode==="map"?<MapView epoch={epoch} selectedIds={selectedIds} onSelect={select} onNavigate={(ids,title)=>navigate({kind:"people",ids,title})} onGrid={()=>setCenterMode("grid")} onOpenNeighborhood={ids=>void openMapNeighborhood(ids)}/>:<>
-        <AssetGrid ref={grid} view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={requestQuarantineMove} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
+        <AssetGrid ref={grid} view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={requestQuarantineMove} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onCompare={openComparison} comparisonOpen={!!comparison} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
         </>}
         {operationProgress&&<div className="grid-footer"><span>{operationProgress}</span></div>}
         {viewer && <div className="viewer-overlay" ref={viewerOverlayRef} tabIndex={-1}><div className="viewer-bar"><button onClick={()=>setViewer(null)}>‹ Zavrieť</button>
@@ -867,6 +922,14 @@ export default function App() {
       <DockSide side="right" layout={dockLayout} setLayout={setDockLayout} hosts={dockHosts} hideNav={!!viewer} dragging={dockDragging} controls={dockControls} sectionPresence={dockPresence}/>
     </div>
     <footer className="status-bar"><span>Spolu {slovakItems(total)} · {formatBytes(totalSize)}</span>{primaryAsset ? <><div className="selected-name">{selectedIds.size > 1 ? `${selectedIds.size} vybraných` : primaryAsset.name}</div><span>{formatBytes(primaryAsset.size)}</span><span>{dateText(primaryAsset.exifDate)}</span><span>{primaryAsset.width && primaryAsset.height ? `${primaryAsset.width} × ${primaryAsset.height}` : "—"}</span></> : null}</footer>
+    {comparison && <CompareView photos={comparison} initialActive={primaryId} epoch={epoch} qualityToken={aiTick}
+      uiScale={uiScale} formats={formats} rawDecode={rawDecode} onRawDecode={setRawDecode}
+      editors={editors} readOnly={!!appInfo?.readonly} aiReady={aiReady} aiReason={aiStatus.reason ?? "AI modul nie je nainštalovaný"}
+      onClose={closeComparison} onRestoreFocus={restoreGridFocus}
+      onDrop={key => setComparison(current => current && current.length > 2 ? current.filter(photo => photo.key !== key) : current)}
+      onOpen={openComparedPhoto}
+      onSetValues={setAssetValues} onFileOperation={beginFileOperation} onQuarantine={requestQuarantineMove}
+      onFindSimilar={asset => { closeComparison(); void findSimilar(asset); }} />}
     {thumbnailInfoOpen&&<ThumbnailInfoDialog value={thumbnailInfo} onSave={value=>{setThumbnailInfo(normalizeThumbnailInfo(value));setThumbnailInfoOpen(false);}} onClose={()=>setThumbnailInfoOpen(false)}/> }
     {fileOp&&<FileOperationDialog mode={fileOp.mode} initialPath={view.kind==="folder"?(view.folderPath??""):""} onChoose={path=>void chooseOperationTarget(path)} onClose={()=>setFileOp(null)} onCreate={createFolder}/>}
     {moveWarning&&<div className="modal-backdrop">
