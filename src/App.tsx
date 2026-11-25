@@ -6,6 +6,7 @@ import { listen } from "@tauri-apps/api/event";
 import { createPortal } from "react-dom";
 import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch } from "./components/AssetGrid";
 import AssetContextMenu, { useAssetContextMenu } from "./components/AssetContextMenu";
+import { useFullImage } from "./components/useFullImage";
 import MapView from "./components/MapView";
 import LeftPanel from "./components/LeftPanel";
 import RightPanel from "./components/RightPanel";
@@ -188,9 +189,10 @@ export default function App() {
   const [viewerZoom,setViewerZoom]=useState(1);
   const [viewerPan,setViewerPan]=useState({x:0,y:0});
   const [viewerLock,setViewerLock]=useState(false);
-  const [viewerDimensions,setViewerDimensions]=useState<{width:number;height:number}|null>(null);
-  const [viewerPreviewSource,setViewerPreviewSource]=useState<string|null>(null);
-  const [viewerBroken,setViewerBroken]=useState(false);
+  const [rawDecode, setRawDecode] = useState(() => readStored("ddreams.rawDecode", true));
+  useEffect(() => writeStored("ddreams.rawDecode", rawDecode), [rawDecode]);
+  const [viewerPreview, setViewerPreview] = useState<{ fileKey: string; dimensions: { width: number; height: number } | null } | null>(null);
+  const [viewerFallbackLayout, setViewerFallbackLayout] = useState<{ fileKey: string; width: number; height: number } | null>(null);
   const [formats,setFormats]=useState<FormatTable>({version:0,formats:[]});
   const [viewerCanvasSize,setViewerCanvasSize]=useState({width:0,height:0});
   const viewerCanvasRef=useRef<HTMLDivElement>(null);
@@ -230,6 +232,37 @@ export default function App() {
   const selectedReadIds = useMemo(() => selectedList.map(id => valueAliases.current.get(id) ?? id), [selectedList]);
   const primaryReadId = primaryId == null ? null : valueAliases.current.get(primaryId) ?? primaryId;
   const viewerReadId = viewer ? valueAliases.current.get(viewer.asset.id) ?? viewer.asset.id : null;
+  const viewerFileKey = viewer?.asset.path && !viewer.asset.isDirectory
+    ? JSON.stringify([viewerReadId, viewer.asset.path, viewer.asset.fileModified, viewer.asset.size]) : null;
+  const viewerIsRaw = !!viewer && formatFor(viewer.asset, formats)?.group === "raw";
+  const preview = viewerPreview?.fileKey === viewerFileKey ? viewerPreview : null;
+  const fullAssetId = viewer && isImage(viewer.asset, formats) && !viewer.asset.offline && !viewer.asset.missing ? viewer.asset.id : null;
+  const { frame: viewerFull, loading: viewerFullLoading } = useFullImage(viewerFileKey, fullAssetId, !!preview, viewerIsRaw && rawDecode);
+  useLayoutEffect(() => {
+    if (!viewerFileKey) {
+      setViewerPreview(null);
+      setViewerFallbackLayout(null);
+    } else if (viewerFull && !preview?.dimensions) {
+      setViewerFallbackLayout(current => current?.fileKey === viewerFileKey ? current
+        : { fileKey: viewerFileKey, width: viewerFull.width, height: viewerFull.height });
+    }
+  }, [viewerFileKey, preview, viewerFull]);
+  // Use the first viewable frame as the layout reference, even when the source resolution changes.
+  const viewerDimensions = preview?.dimensions
+    ?? (viewerFallbackLayout?.fileKey === viewerFileKey ? viewerFallbackLayout : null) ?? viewerFull;
+  const viewerOriginal = viewerFull ? { width: viewerFull.originalWidth, height: viewerFull.originalHeight } : viewerDimensions;
+  const viewerPixelRatio = viewerDimensions && viewerOriginal
+    ? uiScale * Math.min(viewerDimensions.width / viewerOriginal.width, viewerDimensions.height / viewerOriginal.height) : 1;
+  const viewerFitScale = viewerDimensions && viewerCanvasSize.width > 140 && viewerCanvasSize.height > 36
+    ? Math.min(1, (viewerCanvasSize.width - 140) / viewerDimensions.width, (viewerCanvasSize.height - 36) / viewerDimensions.height) : 1;
+  const viewerScale = viewerFit ? viewerFitScale : viewerZoom;
+  const viewerPercent = Math.round(viewerScale * viewerPixelRatio * 100);
+  const viewerMaxZoom = Math.max(8, 8 / viewerPixelRatio);
+  const viewerMinZoom = Math.min(0.05, viewerFitScale);
+  const viewerSourceLabel = viewerFull ? {
+    original: "originál", pillow: "plné rozlíšenie", rawFull: "RAW · plné rozlíšenie",
+    embedded: "vložený náhľad", rawReduced: "RAW · polovičné rozlíšenie",
+  }[viewerFull.source] : "náhľad";
   const [aiTick,setAiTick]=useState(0);
   useEffect(()=>{if(aiStatus.state!=="indexing")return;const timer=window.setInterval(()=>setAiTick(v=>v+1),20000);return()=>window.clearInterval(timer)},[aiStatus.state]);
   useEffect(()=>{if(view.kind!=="ai"||!view.title.startsWith("AI:"))return;const base=view.title.replace(/ · prehľadané [\d\s\u00a0]+ z [\d\s\u00a0]+$/u,"");const suffix=aiStatus.indexed<aiStatus.total?` · prehľadané ${aiStatus.indexed.toLocaleString("sk-SK")} z ${aiStatus.total.toLocaleString("sk-SK")}`:"";const title=base+suffix;if(title!==view.title)setView(current=>current===view?{...current,title}:current)},[aiStatus.indexed,aiStatus.total,view]);
@@ -270,7 +303,7 @@ export default function App() {
   useEffect(() => { void invoke("startup_mark", { label: "ui mounted" }).catch(() => {}); const timer = window.setTimeout(() => markReady("timeout 20 s"), 20000); return () => window.clearTimeout(timer); }, [markReady]);
   useEffect(()=>{if(!ready||!aiEnabled)return;const timer=window.setTimeout(()=>{void invoke<AiStatus>("ai_status").then(status=>{if(status.available&&status.state==="off")void invoke<AiStatus>("ai_start",{lazyModel:!aiLoadModelAtStart}).then(setAiStatus).catch(error=>setAiStatus(s=>({...s,state:"error",lastError:String(error)})));}).catch(()=>{});},4000);return()=>window.clearTimeout(timer);},[ready]);
   const navigate = useCallback((next: View) => { setView(next);setHistory(h=>{const base=h.slice(0,historyIndex+1);base.push(next);setHistoryIndex(base.length-1);return base;}); setQuery(""); setQueryDebounced(""); setFilters({});setSelectedIds(new Set()); setPrimaryId(null); setPrimaryAsset(null); setViewer(null);if(next.kind==="folder")writeStored("ddreams.lastFolder",next.folderPath??next.title); }, [historyIndex]);
-  const openMapNeighborhood=useCallback(async(ids:number[])=>{if(!ids.length)return;const next:View={kind:"people",ids,title:"Okolie na mape"};navigate(next);try{const page=await invoke<Page>("get_assets",{filter:{...buildAssetFilter(next, "", "name", false, effectiveViewFilters({}, showOtherFiles), false), offset:0, limit:1}});const asset=page.items[0];if(asset){setViewer({asset,index:0});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));setViewerDimensions(null)}}catch(error){setToast(String(error))}},[navigate,showOtherFiles]);
+  const openMapNeighborhood=useCallback(async(ids:number[])=>{if(!ids.length)return;const next:View={kind:"people",ids,title:"Okolie na mape"};navigate(next);try{const page=await invoke<Page>("get_assets",{filter:{...buildAssetFilter(next, "", "name", false, effectiveViewFilters({}, showOtherFiles), false), offset:0, limit:1}});const asset=page.items[0];if(asset){setViewer({asset,index:0});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]))}}catch(error){setToast(String(error))}},[navigate,showOtherFiles]);
   const travel = useCallback((index:number)=>{const next=history[index];if(!next)return;setHistoryIndex(index);setView(next);setQuery("");setFilters({});setSelectedIds(new Set());setPrimaryId(null);setPrimaryAsset(null);setViewer(null);},[history]);
   const select = useCallback((asset: Asset, _index: number, event: ReactMouseEvent | ReactKeyboardEvent) => {
     if (event.ctrlKey || event.metaKey) {
@@ -500,7 +533,6 @@ export default function App() {
     const next = { asset: shown, index };
     currentViewer.current = next;
     setViewer(next);
-    setViewerDimensions(null);
     setPrimaryId(shown.id);
     setPrimaryAsset(shown);
     setSelectedIds(new Set([shown.id]));
@@ -708,15 +740,27 @@ export default function App() {
   }, [slideshow, viewer, total, slideshowSeconds, moveViewer]);
   useEffect(() => {
     if (!viewer) return;
-    const key = (event: globalThis.KeyboardEvent) => { if (viewerMenuOpen || event.defaultPrevented || document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]")) return; if (event.key === "Escape"||event.key==="Enter") setViewer(null); else if(!viewerFit&&event.key.startsWith("Arrow")&&(event.ctrlKey||event.key==="ArrowUp"||event.key==="ArrowDown")){event.preventDefault();const step=event.shiftKey?12:48;setViewerPan(p=>clampViewerPan({x:p.x+(event.key==="ArrowRight"?-step:event.key==="ArrowLeft"?step:0),y:p.y+(event.key==="ArrowDown"?-step:event.key==="ArrowUp"?step:0)},viewerZoom))}else if(event.key==="ArrowRight"&&!event.altKey)void moveViewer(1);else if(event.key==="ArrowLeft"&&!event.altKey)void moveViewer(-1);else if(event.code==="Space"){event.preventDefault();void moveViewer(1)}else if(event.key==="Backspace"){event.preventDefault();void moveViewer(-1)}else if(event.key==="+"||event.key==="="){setViewerFit(false);setViewerZoom(z=>Math.min(8,z*1.2))}else if(event.key==="-"){setViewerFit(false);setViewerZoom(z=>Math.max(.1,z/1.2))} };
+    const key = (event: globalThis.KeyboardEvent) => { if (viewerMenuOpen || event.defaultPrevented || document.querySelector(".modal-backdrop,[role=dialog],[role=alertdialog]")) return; if (event.key === "Escape"||event.key==="Enter") setViewer(null); else if(!viewerFit&&event.key.startsWith("Arrow")&&(event.ctrlKey||event.key==="ArrowUp"||event.key==="ArrowDown")){event.preventDefault();const step=event.shiftKey?12:48;setViewerPan(p=>clampViewerPan({x:p.x+(event.key==="ArrowRight"?-step:event.key==="ArrowLeft"?step:0),y:p.y+(event.key==="ArrowDown"?-step:event.key==="ArrowUp"?step:0)},viewerZoom))}else if(event.key==="ArrowRight"&&!event.altKey)void moveViewer(1);else if(event.key==="ArrowLeft"&&!event.altKey)void moveViewer(-1);else if(event.code==="Space"){event.preventDefault();void moveViewer(1)}else if(event.key==="Backspace"){event.preventDefault();void moveViewer(-1)}else if(event.key==="+"||event.key==="="){setViewerFit(false);setViewerZoom(Math.min(viewerMaxZoom,viewerScale*1.2))}else if(event.key==="-"){setViewerFit(false);setViewerZoom(Math.max(viewerMinZoom,viewerScale/1.2))} };
     window.addEventListener("keydown",key); return () => window.removeEventListener("keydown",key);
-  }, [viewer,moveViewer,viewerFit,viewerZoom,viewerDimensions,viewerMenuOpen]);
-  useEffect(()=>{if(!viewer||!viewerCanvasRef.current)return;const el=viewerCanvasRef.current;const update=()=>setViewerCanvasSize({width:el.clientWidth,height:el.clientHeight});update();const observer=new ResizeObserver(update);observer.observe(el);return()=>observer.disconnect()},[viewer]);
-  const viewerFitPercent=viewerDimensions&&viewerCanvasSize.width&&viewerCanvasSize.height?Math.round(Math.min((viewerCanvasSize.width-120)/viewerDimensions.width,(viewerCanvasSize.height-24)/viewerDimensions.height)*100):0;
+  }, [viewer,moveViewer,viewerFit,viewerZoom,viewerDimensions,viewerMenuOpen,viewerScale,viewerMinZoom,viewerMaxZoom]);
+  useLayoutEffect(()=>{if(!viewerOpen||!viewerCanvasRef.current)return;const el=viewerCanvasRef.current;const update=()=>setViewerCanvasSize({width:el.clientWidth,height:el.clientHeight});update();const observer=new ResizeObserver(update);observer.observe(el);return()=>observer.disconnect()},[viewerOpen]);
   // The zoomed photo is centred in the viewer; panning is limited so it never leaves a gap it could fill.
   const clampViewerPan=(pan:{x:number;y:number},zoom:number)=>{const el=viewerCanvasRef.current,d=viewerDimensions;if(!el||!d)return pan;const mx=Math.max(0,(d.width*zoom-el.clientWidth)/2),my=Math.max(0,(d.height*zoom-el.clientHeight)/2);return{x:Math.max(-mx,Math.min(mx,pan.x)),y:Math.max(-my,Math.min(my,pan.y))};};
-  const wheelViewer=(e:ReactWheelEvent<HTMLDivElement>)=>{e.preventDefault();closeViewerMenu();const r=e.currentTarget.getBoundingClientRect();const cx=(e.clientX-r.left-r.width/2)/uiScale,cy=(e.clientY-r.top-r.height/2)/uiScale;const from=viewerFit?(Math.min(1,viewerFitPercent/100)||1):viewerZoom,pan=viewerFit?{x:0,y:0}:viewerPan;const to=Math.max(.05,Math.min(8,from*(e.deltaY<0?1.12:.89))),k=to/from;setViewerFit(false);setViewerZoom(to);setViewerPan(clampViewerPan({x:cx-(cx-pan.x)*k,y:cy-(cy-pan.y)*k},to));};
-  useEffect(()=>{if(!viewer)return;let active=true;setViewerPreviewSource(null);setViewerBroken(false);void invoke<string>("get_preview_source",{assetId:viewer.asset.id,epoch}).then(source=>{if(active)setViewerPreviewSource(source)}).catch(()=>{});for(const d of [-1,1]){const i=viewer.index+d;if(i>=0&&i<total)void invoke<Page>("get_assets",{filter:{...assetFilter,offset:i,limit:1}}).then(p=>{const a=p.items[0];if(a&&!a.isDirectory&&a.path){const im=new Image();im.src=thumbUrl(a,0,epoch)}})}return()=>{active=false}},[viewerReadId,viewer?.index,assetFilter,total,epoch]);
+  const wheelViewer=(e:ReactWheelEvent<HTMLDivElement>)=>{e.preventDefault();closeViewerMenu();const r=e.currentTarget.getBoundingClientRect();const cx=(e.clientX-r.left-r.width/2)/uiScale,cy=(e.clientY-r.top-r.height/2)/uiScale;const from=viewerScale,pan=viewerFit?{x:0,y:0}:viewerPan;const to=Math.max(viewerMinZoom,Math.min(viewerMaxZoom,from*(e.deltaY<0?1.12:.89))),k=to/from;setViewerFit(false);setViewerZoom(to);setViewerPan(clampViewerPan({x:cx-(cx-pan.x)*k,y:cy-(cy-pan.y)*k},to));};
+  useEffect(() => {
+    if (!viewer) return;
+    for (const offset of [-1, 1]) {
+      const index = viewer.index + offset;
+      if (index < 0 || index >= total) continue;
+      void invoke<Page>("get_assets", { filter: { ...assetFilter, offset: index, limit: 1 } }).then(page => {
+        const asset = page.items[0];
+        if (asset && !asset.isDirectory && asset.path) {
+          const image = new Image();
+          image.src = thumbUrl(asset, 0, epoch);
+        }
+      }).catch(() => {});
+    }
+  }, [viewerReadId, viewer?.index, assetFilter, total, epoch]);
 
   const crumbs = useMemo(() => view.kind === "folder" ? (view.folderPath ?? view.title).split(/[\\/]/).filter(Boolean) : ["Katalóg", view.title], [view]);
   const aiChipText=aiStatus.modelState==="error"?"Chyba AI modelu":aiStatus.state==="loading"?"AI sa načítava…":aiStatus.state==="indexing"?`AI indexuje ${aiStatus.indexed.toLocaleString("sk-SK")} / ${aiStatus.total.toLocaleString("sk-SK")}${aiStatus.etaS!=null?` · ~${Math.max(1,Math.round(aiStatus.etaS/3600))} h`:""}`:aiStatus.state==="ready"?"AI pripravené":aiStatus.state==="paused"?"AI pozastavené":aiStatus.state==="error"?"AI chyba":"AI vypnuté";
@@ -789,7 +833,30 @@ export default function App() {
           </>}{deletionSuggestions.has(viewer.asset.id)&&<>
           <span className="deletion-suggestion-badge" title="Návrh na vymazanie" aria-label="Návrh na vymazanie">✕</span>
           <button disabled={!!appInfo?.readonly} onClick={()=>void runDeletionAction("keep_suggested_assets",[viewer.asset.id])}>Odmietnuť návrh na vymazanie</button>
-        </>}{editors.map((editor,index)=><button key={editor.path} title={`${editor.path}${index===0?" (Ctrl+Alt+X)":""}`} disabled={viewer.asset.offline||viewer.asset.isDirectory} onClick={()=>openEditor(editor,[viewer.asset.id])}>Otvoriť v: {editor.name}</button>)}<button className="primary" onClick={()=>setSlideshow(v=>!v)} disabled={total<2}>{slideshow?"❚❚ Pozastaviť":"▶ Spustiť prezentáciu"}</button><label>Interval <select aria-label="Interval prezentácie" value={slideshowSeconds} onChange={e=>setSlideshowSeconds(Number(e.target.value))}>{[2,3,5,10,15,30].map(seconds=><option key={seconds} value={seconds}>{seconds} s</option>)}</select></label><button title="Prepnúť medzi prispôsobením oknu a skutočnou veľkosťou" onClick={()=>{setViewerFit(v=>!v);setViewerZoom(1);setViewerPan({x:0,y:0})}}>{viewerFit?"100 %":"Prispôsobiť"}</button><button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">{viewerFit?`${viewerFitPercent} %`:`${Math.round(viewerZoom*100)} %`}{viewerDimensions&&<> · {viewerDimensions.width} × {viewerDimensions.height}{formatFor(viewer.asset,formats)?.group==="raw"?" \u00b7 vložený náhľad":""}{viewerPreviewSource?` \u00b7 zdroj: ${viewerPreviewSource}`:""}</>}</span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onContextMenu={openViewerMenu} onPointerDown={e=>{if(e.button===0&&!viewerFit&&!(e.target as HTMLElement).closest(".viewer-arrow"))e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit&&e.currentTarget.hasPointerCapture(e.pointerId))setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{!viewer.asset.isDirectory&&!viewerBroken?<img className="viewer-image" style={viewerFit?{maxWidth:"100%",maxHeight:"100%",objectFit:"contain"}:{maxWidth:"none",maxHeight:"none",transformOrigin:"center",flex:"none",transform:`translate(${viewerPan.x}px,${viewerPan.y}px) scale(${viewerZoom})`}} src={thumbUrl(viewer.asset,0,epoch)} alt={viewer.asset.name} onLoad={e=>setViewerDimensions({width:e.currentTarget.naturalWidth,height:e.currentTarget.naturalHeight})} onError={()=>setViewerBroken(true)}/>:<div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}<button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div>
+        </>}{editors.map((editor,index)=><button key={editor.path} title={`${editor.path}${index===0?" (Ctrl+Alt+X)":""}`} disabled={viewer.asset.offline||viewer.asset.isDirectory} onClick={()=>openEditor(editor,[viewer.asset.id])}>Otvoriť v: {editor.name}</button>)}<button className="primary" onClick={()=>setSlideshow(v=>!v)} disabled={total<2}>{slideshow?"❚❚ Pozastaviť":"▶ Spustiť prezentáciu"}</button><label>Interval <select aria-label="Interval prezentácie" value={slideshowSeconds} onChange={e=>setSlideshowSeconds(Number(e.target.value))}>{[2,3,5,10,15,30].map(seconds=><option key={seconds} value={seconds}>{seconds} s</option>)}</select></label><button title="Prepnúť medzi prispôsobením oknu a skutočnou veľkosťou" onClick={() => {
+          setViewerFit(!viewerFit);
+          setViewerZoom(1 / viewerPixelRatio);
+          setViewerPan({ x: 0, y: 0 });
+        }}>{viewerFit ? "100 %" : "Prispôsobiť"}</button>
+        <label className="viewer-raw-toggle" title="Zapnuté: plné rozlíšenie RAW (pomalšie). Vypnuté: vložený náhľad (rýchle).">
+          <input type="checkbox" checked={rawDecode} onChange={event => setRawDecode(event.target.checked)}
+            onKeyDown={event => { if (event.code === "Space") event.stopPropagation(); }} /> Dekódovať RAW
+        </label><button title="Zamknúť priblíženie pri prechode na ďalšiu fotku" onClick={()=>setViewerLock(v=>!v)}>{viewerLock?"🔒":"🔓"}</button><span className="viewer-title">{viewer.asset.name}</span><span className="viewer-info">
+          {viewerDimensions && <>{viewerPercent} % · {viewerOriginal?.width} × {viewerOriginal?.height} · {viewerSourceLabel}</>}
+          {viewerFullLoading && <small className="viewer-full-loading">Načítavam plné rozlíšenie…</small>}
+        </span><span className="viewer-count">{viewer.index+1} / {total.toLocaleString("sk-SK")}</span></div><div ref={viewerCanvasRef} className="viewer-canvas" onContextMenu={openViewerMenu} onPointerDown={e=>{if(e.button===0&&!viewerFit&&!(e.target as HTMLElement).closest(".viewer-arrow"))e.currentTarget.setPointerCapture(e.pointerId)}} onWheel={wheelViewer} onPointerMove={e=>{if(e.buttons===1&&!viewerFit&&e.currentTarget.hasPointerCapture(e.pointerId))setViewerPan(p=>clampViewerPan({x:p.x+e.movementX/uiScale,y:p.y+e.movementY/uiScale},viewerZoom))}} onDoubleClick={e=>{if(!(e.target as HTMLElement).closest(".viewer-arrow"))setViewer(null)}}><button className="viewer-arrow" onClick={()=>void moveViewer(-1)}>‹</button>{viewerFileKey && (viewerFull || !preview || preview.dimensions) ? <img key={viewerFileKey} className="viewer-image"
+          style={viewerDimensions ? {
+            width: viewerDimensions.width * viewerScale, height: viewerDimensions.height * viewerScale,
+            maxWidth: "none", maxHeight: "none", objectFit: "contain", flex: "none",
+            transform: viewerFit ? undefined : "translate(" + viewerPan.x + "px," + viewerPan.y + "px)",
+          } : { maxWidth: "100%", maxHeight: "100%", objectFit: "contain" }}
+          src={viewerFull?.url ?? thumbUrl(viewer.asset, 0, epoch)} alt={viewer.asset.name}
+          onLoad={event => {
+            if (!viewerFull) setViewerPreview({ fileKey: viewerFileKey,
+              dimensions: { width: event.currentTarget.naturalWidth, height: event.currentTarget.naturalHeight } });
+          }}
+          onError={() => { if (!viewerFull) setViewerPreview({ fileKey: viewerFileKey, dimensions: null }); }}
+        /> : <div className="viewer-nonimage">{viewer.asset.ext.toUpperCase()}<small>Náhľad nie je k dispozícii</small></div>}<button className="viewer-arrow" onClick={()=>void moveViewer(1)}>›</button></div>
           {viewerMenuAnchor && <AssetContextMenu anchor={viewerMenuAnchor} onClose={closeViewerMenu} asset={viewer.asset}
             actionIds={() => [viewer.asset.id]} offline={!!(viewer.asset.offline || viewer.asset.missing)} isPhoto={isImage(viewer.asset, formats)}
             editors={editors} readOnly={!!appInfo?.readonly} aiReady={aiReady} aiReason={aiStatus.reason ?? "AI modul nie je nainštalovaný"}

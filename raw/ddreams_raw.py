@@ -2,6 +2,7 @@
 
 Protocol: one JSON object per line on stdin, one per line on stdout (UTF-8).
   request  {"id": 1, "path": "F:\\a.dng", "size": 480}
+           full-size modes: "mode": "image"|"rawFull"|"embedded"
   response {"id": 1, "ok": true, "jpeg": "<base64>", "source": "embedded"|"develop"|"pillow", "width": w, "height": h}
            {"id": 1, "ok": false, "error": "..."}
 Requests are served concurrently (LibRaw releases the GIL while decoding). Exits on stdin EOF.
@@ -30,6 +31,7 @@ else:
 MIN_EMBEDDED_PX = 800  # an embedded JPEG at least this large is good enough for a preview
 JPEG_QUALITY = 85
 WORKERS = 3
+FULL_JPEG_QUALITY = 92
 
 
 def decode_image(path: str, target: int):
@@ -86,6 +88,48 @@ def render(path: str, size: int, group: str = "raw") -> dict:
     return {"jpeg": base64.b64encode(out.getvalue()).decode("ascii"), "source": source, "width": image.width, "height": image.height}
 
 
+def decode_full_raw(path: str, embedded: bool):
+    with rawpy.imread(path) as raw:
+        sizes = raw.sizes
+        original = (sizes.height, sizes.width) if sizes.flip & 4 else (sizes.width, sizes.height)
+        if embedded:
+            try:
+                thumb = raw.extract_thumb()  # LibRaw selects the largest embedded preview.
+                if thumb.format == rawpy.ThumbFormat.JPEG:
+                    with Image.open(io.BytesIO(thumb.data)) as preview:
+                        orientation = preview.getexif().get(274)
+                        image = ImageOps.exif_transpose(preview).convert("RGB")
+                        if orientation is None:
+                            # Some embedded JPEGs omit EXIF; use the RAW orientation.
+                            rotation = {3: Image.Transpose.ROTATE_180, 5: Image.Transpose.ROTATE_90,
+                                        6: Image.Transpose.ROTATE_270}.get(sizes.flip)
+                            if rotation is not None:
+                                image = image.transpose(rotation)
+                        return image, "embedded", original
+            except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError, OSError):
+                pass
+        # Leaving user_flip unset lets LibRaw apply the camera orientation.
+        image = Image.fromarray(raw.postprocess(half_size=embedded, use_camera_wb=True,
+                                                output_bps=8, output_color=rawpy.ColorSpace.sRGB))
+        return (image, "rawReduced", original) if embedded else (image, "rawFull", image.size)
+
+
+def render_full(path: str, mode: str) -> dict:
+    if mode == "image":
+        with Image.open(path) as original_image:
+            image = ImageOps.exif_transpose(original_image).convert("RGB")
+        source, original = "pillow", image.size
+    elif mode in ("rawFull", "embedded"):
+        image, source, original = decode_full_raw(path, mode == "embedded")
+    else:
+        raise ValueError(f"Unknown full image mode: {mode}")
+    out = io.BytesIO()
+    image.save(out, "JPEG", quality=FULL_JPEG_QUALITY)
+    return {"jpeg": base64.b64encode(out.getvalue()).decode("ascii"), "source": source,
+            "width": image.width, "height": image.height,
+            "originalWidth": original[0], "originalHeight": original[1]}
+
+
 def main() -> None:
     stdin = io.TextIOWrapper(sys.stdin.buffer, encoding="utf-8")
     stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", newline="\n")
@@ -99,11 +143,15 @@ def main() -> None:
     def handle(request: dict) -> None:
         rid = request.get("id")
         try:
-            reply({"id": rid, "ok": True, **render(str(request["path"]), int(request.get("size") or 2048), request.get("group", "raw"))})
+            path = str(request["path"])
+            mode = request.get("mode")
+            result = render_full(path, mode) if mode else render(path, int(request.get("size") or 2048), request.get("group", "raw"))
+            reply({"id": rid, "ok": True, **result})
         except Exception as exc:  # one bad file must never kill the plugin
             reply({"id": rid, "ok": False, "error": f"{type(exc).__name__}: {exc}"})
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as pool, \
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as full_pool:
         for line in stdin:
             line = line.strip()
             if not line:
@@ -113,7 +161,7 @@ def main() -> None:
             except ValueError as exc:
                 reply({"id": None, "ok": False, "error": f"Neplatný JSON: {exc}"})
                 continue
-            pool.submit(handle, request)
+            (full_pool if request.get("mode") else pool).submit(handle, request)
 
 
 if __name__ == "__main__":

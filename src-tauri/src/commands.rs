@@ -1207,6 +1207,24 @@ pub fn get_preview_source(state: State<'_, ThumbnailState>, asset_id: i64, epoch
     state.0.render(asset_id, 0, epoch).map(|result| result.source).map_err(|e| format!("{e:?}"))
 }
 
+#[tauri::command]
+pub async fn prepare_full_image(
+    state: State<'_, ThumbnailState>, asset_id: i64, raw_decode: bool,
+) -> Result<Option<thumbs::FullImageInfo>, String> {
+    let thumbs = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || thumbs.prepare_full_image(asset_id, raw_decode))
+        .await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn read_full_image_chunk(
+    state: State<'_, ThumbnailState>, asset_id: i64, raw_decode: bool, key: String, offset: u64,
+) -> Result<tauri::ipc::Response, String> {
+    let thumbs = state.0.clone();
+    tauri::async_runtime::spawn_blocking(move || thumbs.read_full_image_chunk(asset_id, raw_decode, &key, offset))
+        .await.map_err(|e| e.to_string())?.map(tauri::ipc::Response::new)
+}
+
 #[tauri::command(async)]
 pub fn folder_exists(path:String)->bool{Path::new(path.trim()).is_dir()}
 

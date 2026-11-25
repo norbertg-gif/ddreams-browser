@@ -74,6 +74,20 @@ pub fn run() {
     let protocol_thumbs = thumbs.clone();
     let shutdown_exif = exif.clone();
     let shutdown_ai = ai_service.clone();
+    let mut context = tauri::generate_context!();
+    // Full images arrive as binary IPC chunks and are displayed as local object URLs.
+    let security = &mut context.config_mut().app.security;
+    for csp in [&mut security.csp, &mut security.dev_csp].into_iter().flatten() {
+        let mut directives: std::collections::HashMap<_, _> = csp.clone().into();
+        let fallback = directives.get("default-src").cloned();
+        if let Some(sources) = directives.get_mut("img-src") {
+            sources.push("blob:");
+        } else if let Some(mut sources) = fallback {
+            sources.push("blob:");
+            directives.insert("img-src".into(), sources);
+        }
+        *csp = directives.into();
+    }
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| { setup_ai.set_app(app.handle().clone()); Ok(()) })
@@ -248,6 +262,8 @@ pub fn run() {
             commands::get_folder_previews,
             commands::get_formats,
             commands::get_preview_source,
+            commands::prepare_full_image,
+            commands::read_full_image_chunk,
             commands::folder_exists,
             commands::delete_files,
             commands::get_delete_info,
@@ -281,7 +297,7 @@ pub fn run() {
             commands::set_thumbnail_epoch,
             commands::get_thumbnail_state
         ])
-        .build(tauri::generate_context!())
+        .build(context)
         .expect("error while building DDreams browser")
         .run(move |_app_handle, event| {
             if matches!(event, tauri::RunEvent::Exit) {
