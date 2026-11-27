@@ -12,6 +12,7 @@ mod formats;
 mod folder_rules;
 pub mod journal;
 mod incoming;
+mod iptc_write;
 mod listing;
 mod metadata_view;
 mod paths;
@@ -95,6 +96,7 @@ pub fn run() {
         .manage(DatabaseState(db))
         .manage(commands::BackgroundDbState(background_db))
         .manage(ExifState(exif))
+        .manage(Arc::new(iptc_write::IptcState::default()))
         .manage(ListingState(listing))
         .manage(FormatsState(formats))
         .manage(MetadataViewState(metadata_view))
@@ -238,6 +240,11 @@ pub fn run() {
             commands::copy_folder,
             commands::create_folder,
             commands::set_asset_values,
+            commands::set_asset_text,
+            commands::get_asset_iptc,
+            commands::plan_iptc_write,
+            commands::execute_iptc_write,
+            commands::cancel_iptc_write,
             commands::get_asset_labels,
             commands::set_asset_categories,
             commands::get_category_selection_counts,

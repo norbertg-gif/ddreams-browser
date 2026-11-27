@@ -448,6 +448,17 @@ input[type=checkbox]{accent-color:var(--accent)}
 .viewer-raw-toggle{display:inline-flex;align-items:center;gap:5px}
 .viewer-full-loading{display:block;color:var(--muted)}
 .face-toggle{display:inline-flex;align-items:center;gap:5px}
+.iptc-editor{padding:8px 10px;display:grid;gap:7px;border-bottom:1px solid var(--line)}
+.iptc-editor small{color:var(--muted)}
+.iptc-editor label{display:grid;gap:3px}
+.iptc-editor input,.iptc-editor textarea{width:100%;min-width:0;padding:4px 6px;background:var(--bg);border:1px solid var(--line);border-radius:4px;color:var(--text)}
+.iptc-editor textarea{resize:vertical}
+.iptc-keywords{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px}
+.iptc-keywords div{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px}
+.iptc-keywords div span{max-width:100%;overflow-wrap:anywhere;padding:1px 5px;border-radius:4px;background:var(--select)}
+.iptc-write-dialog{max-width:min(700px,90vw);max-height:85vh;overflow:auto}
+.iptc-write-warning{font-weight:600}
+.iptc-issues ul{max-height:180px;overflow:auto;overflow-wrap:anywhere}
 .face-overlay{position:absolute;inset:0;z-index:1;overflow:hidden;pointer-events:none;user-select:none}
 .face-overlay-box,.face-overlay-label{position:absolute}
 .face-overlay-box{border:2px solid #b9e6ff;box-shadow:0 0 2px #000,inset 0 0 2px #000}

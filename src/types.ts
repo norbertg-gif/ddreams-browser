@@ -23,6 +23,8 @@ export type AssetQuality = { assetId: number; sharp: number; hi: number; lo: num
 export type MetadataRow = { group: string; subgroup: string; name: string; value: string };
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
 export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };
+export type IptcTextField = "caption" | "author";
+export type CatalogIptc = { id: number; caption: string | null; author: string | null; keywords: string[][] };
 
 export type FileFormat = { ext: string; group: "image" | "raw" | "video" | "document" | "other"; name: string; hidden?: boolean };
 export type FormatTable = { version: number; formats: FileFormat[] };

@@ -23,7 +23,9 @@ import { FOLDER_RULES_EVENT, type FolderRuleMode } from "./folderRules";
 import FileOperationDialog from "./components/FileOperationDialog";
 import FileNameDialog from "./components/FileNameDialog";
 import { DockLayoutMenu, DockSections, DockSide, useDockDrag, useDockHosts, useDockLayout, useDockPresence } from "./components/Dock";
-import type { Asset, Folder, FormatTable, Page, View, ViewFilters, ValueCount } from "./types";
+import { patchGroup, showSection } from "./dockLayout";
+import IptcWriteDialog from "./components/IptcWriteDialog";
+import type { Asset, Folder, FormatTable, IptcTextField, Page, View, ViewFilters, ValueCount } from "./types";
 import { readStored, writeStored } from "./storage";
 import { buildAssetFilter, effectiveViewFilters, readViewSort, sortKeyForView, updateViewSort, type SavedViewSorts } from "./assetFilter";
 import { DEFAULT_THUMBNAIL_INFO, normalizeThumbnailInfo, type ThumbnailInfoConfig } from "./thumbnailInfo";
@@ -78,6 +80,23 @@ export default function App() {
   const [dockLayout, setDockLayout] = useDockLayout();
   const dockHosts = useDockHosts();
   const [dockPresence, setDockPresence] = useDockPresence();
+  const openKeywordAssignment = useCallback(() => {
+    const sectionId = "catalog.edit";
+    setDockLayout(current => {
+      const next = showSection(current, sectionId);
+      const group = [...next.left, ...next.right].find(group =>
+        group.panels.some(tab => next.sections[tab]?.includes(sectionId)));
+      const tab = group?.panels.find(tab => next.sections[tab]?.includes(sectionId));
+      const expanded = { ...next, collapsed: { ...next.collapsed, [sectionId]: false } };
+      return group && tab ? patchGroup(expanded, group.id, { active: tab, collapsed: false }) : expanded;
+    });
+    requestAnimationFrame(() => requestAnimationFrame(() => {
+      const section = dockHosts.section(sectionId);
+      const picker = section.querySelector<HTMLInputElement>(".keyword-autocomplete input");
+      (picker ?? section).scrollIntoView({ block: "nearest" });
+      picker?.focus({ preventScroll: true });
+    }));
+  }, [dockHosts, setDockLayout]);
   const { dragging: dockDragging, controls: dockControls } = useDockDrag();
   const [overlayMode, setOverlayMode] = useState<0|2>(()=>readStored<number>("ddreams.overlay",2)===0?0:2);
   const [hoverMode, setHoverMode] = useState<"off"|"hover"|"shift">(()=>readStored("ddreams.hover", "shift"));
@@ -165,6 +184,8 @@ export default function App() {
   const [folderRenameOp,setFolderRenameOp]=useState<{path:string;name:string}|null>(null);
   const [folderDeleteConfirm,setFolderDeleteConfirm]=useState<{path:string;info:{files:number;folders:number;catalogued:number;bytes:number;recycleAvailable:boolean}}|null>(null);
   const [operationProgress,setOperationProgress]=useState("");
+  const [iptcIds, setIptcIds] = useState<number[] | null>(null);
+  const [iptcToken, setIptcToken] = useState(0);
   const [viewer, setViewer] = useState<{ asset: Asset; index: number } | null>(null);
   const [comparison, setComparison] = useState<ComparedPhoto[] | null>(null);
   const closeComparison = useCallback(() => setComparison(null), []);
@@ -433,6 +454,7 @@ export default function App() {
   const setAssetValues = useCallback((ids: number[], changes: Record<string, unknown>) => {
     if (appInfo?.readonly) { setToast("Katalóg je iba na čítanie"); window.setTimeout(() => setToast(""), 2200); return; }
     if (!ids.length) return;
+    const textField: IptcTextField | null = "caption" in changes ? "caption" : "author" in changes ? "author" : null;
     const ratingEdited = "rating" in changes, labelEdited = "label" in changes;
     const taggedEdited = "tagged" in changes, pendingEdited = "editPending" in changes;
     const write = async () => {
@@ -440,12 +462,15 @@ export default function App() {
         const result = await invoke<{
           changeId: number | null;
           summary: string;
+          value?: string | null;
           remappedIds: { oldId: number; newId: number }[];
           assets: { id: number; rating: number | null; label: string | null; tagged: boolean; editPendingSince: number | null }[];
-        }>("set_asset_values", { assetIds: ids, changes });
+        }>(textField ? "set_asset_text" : "set_asset_values",
+          textField ? { assetIds: ids, field: textField, value: changes[textField] } : { assetIds: ids, changes });
         const patches = new Map<number, AssetValuePatch>(result.assets.map(asset => [asset.id, {
           id: asset.id, rating: asset.rating, label: asset.label, tagged: Number(asset.tagged),
           ...(pendingEdited ? { editPendingSince: asset.editPendingSince } : {}),
+          ...(textField ? { [textField]: result.value ?? null } : {}),
         }]));
         const remap = new Map(result.remappedIds.map(({ oldId, newId }) => [oldId, newId]));
         for (const [oldId, newId] of remap) {
@@ -494,7 +519,9 @@ export default function App() {
             (ratingEdited && (filter.kind === "rating" || !!filter.ratingMode || filter.sort === "rating")) ||
             (labelEdited && (filter.kind === "label" || !!filter.labelFilter || filter.sort === "label")) ||
             (taggedEdited && (filter.taggedOnly || (filter.kind === "special" && filter.value === "tagged"))) ||
-            (pendingEdited && filter.kind === "special" && filter.value === "edit_pending");
+            (pendingEdited && filter.kind === "special" && filter.value === "edit_pending") ||
+            (textField === "caption" && (filter.sort === "caption" || !!filter.query));
+          if (textField) setIptcToken(token => token + 1);
           grid.current?.applyValues(patches, reloadListing);
           setValueTokens(tokens => ({
             rating: tokens.rating + Number(ratingEdited || !!remap.size),
@@ -516,6 +543,11 @@ export default function App() {
     valueWrites.current = valueWrites.current.then(write);
     return valueWrites.current;
   }, [appInfo?.readonly, loadRecentChanges]);
+  const openIptcWrite = async (ids: number[]) => {
+    if (appInfo?.readonly || !ids.length) return;
+    await valueWrites.current;
+    setIptcIds(ids);
+  };
   const setAssetColors=useCallback(async(ids:number[],color:string,state:boolean|null)=>{if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");return;}try{const count=await invoke<number>("set_asset_colors",{assetIds:ids,color,state});if(count){setToast(`Farba ${color} opravená`);refreshAfterWrite();window.setTimeout(()=>setRefreshTick(v=>v+1),2400);window.setTimeout(()=>setToast(""),6000)}}catch(error){setToast(String(error));window.setTimeout(()=>setToast(""),3500)}},[appInfo,refreshAfterWrite]);
   const setAssetCategories=useCallback(async(ids:number[],categoryId:number,assign:boolean):Promise<boolean>=>{
     if(appInfo?.readonly){setToast("Katalóg je iba na čítanie");window.setTimeout(()=>setToast(""),2200);return false;}
@@ -850,7 +882,7 @@ export default function App() {
     <header className="topbar"><div className="top-left"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><nav className="top-crumbs">{crumbs.map((crumb,i)=><span key={`${crumb}-${i}`} className="crumb-item">{i>0&&<i>›</i>}<button onClick={()=>void openCrumb(i)}>{crumb}</button></span>)}{Object.values(filters).some(Boolean)&&<span className="active-filters">{filters.ratingMode&&`Hodnotenie ${filters.ratingMode} ${filters.ratingValue??""}`} {filters.labelFilter&&`Farebný štítok: ${labelText(filters.labelFilter)}`} {filters.taggedOnly&&"Označené"} {filters.fileGroup&&`Typ: ${filters.fileGroup==="all"?"všetky súbory":filters.fileGroup}`}<button onClick={()=>setFilters({})}>×</button></span>}</nav><span className="count-pill">{slovakItems(total)}</span></div><label className="search-box"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filtrovať v zobrazení…"/><kbd>Ctrl+F</kbd></label><div className="top-right"><DockLayoutMenu layout={dockLayout} setLayout={setDockLayout}/><div className="ai-anchor" ref={aiRef}><button className={`ai-chip ai-${aiStatus.state}`} title={!aiStatus.available?aiStatus.reason??"AI modul nie je nainštalovaný":aiStatus.lastError??"AI index a vyhľadávanie"} onClick={()=>setAiOpen(v=>!v)}>{aiChipText}</button>{aiOpen&&<div className="ai-popover"><b>AI katalóg</b><div><span>Zaindexované</span><strong>{aiStatus.indexed.toLocaleString("sk-SK")}</strong></div><div><span>Vo fronte</span><strong>{aiStatus.queued.toLocaleString("sk-SK")}</strong></div><div><span>Čaká na spracovanie</span><strong>{aiStatus.waiting.toLocaleString("sk-SK")}</strong></div><div><span>AI model</span><strong>{({unloaded:"nenačítaný",loading:"načítava sa",ready:"pripravený",error:"chyba"} as Record<string,string>)[aiStatus.modelState]??aiStatus.modelState}</strong></div>{aiStatus.modelState==="unloaded"&&<button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_load_model")}>Spracovať čakajúce fotografie <small>vyžaduje AI model</small></button>}<div><span>Offline</span><strong>{aiStatus.offline.toLocaleString("sk-SK")}</strong></div><div><span>Chyby</span><strong>{aiStatus.failed.toLocaleString("sk-SK")}</strong></div>{aiStatus.lastError&&<small>{aiStatus.lastError}</small>}<button disabled={!aiStatus.available||!aiEnabled||aiStatus.state==="loading"} onClick={()=>void updateAiStatus(aiStatus.state==="paused"?"ai_resume":"ai_pause")}>{aiStatus.state==="paused"?"Pokračovať":"Pozastaviť"}</button><button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_reindex")}>Aktualizovať index</button><button onClick={()=>void toggleAi()}>{aiEnabled?"Vypnúť AI":"Zapnúť AI"}</button></div>}</div><div className="history-anchor" ref={historyRef}><button className="catalog-label" title={catalogTooltip} onClick={()=>{setHistoryOpen(v=>!v);loadRecentChanges()}}><span className="status-light"/>{appInfo?.readonly ? "Katalóg iba na čítanie" : "Katalóg"}</button>{historyOpen&&<div className="change-history"><div className="change-history-head"><b>História zmien</b></div>{recentChanges.length?recentChanges.map(change=><div key={change.id}><time>{new Date(change.ts).toLocaleString("sk-SK")}</time><span>{change.summary}</span></div>):<small>Žiadne zmeny</small>}</div>}</div><button className="settings-button" title="Pomocník (F1)" onClick={()=>setHelpOpen(true)}>?</button><button className="settings-button" title="Nastavenia" onClick={()=>setSettingsOpen(true)}>⚙</button></div></header>
     <div className="workspace" inert={!!comparison}>
       <LeftPanel hosts={dockHosts} onNavigate={navigate} activeFolderId={view.kind === "folder" ? view.id ?? null : null} activeFolderIds={view.kind === "folder" ? view.ids : []} activeView={view} calendarRefreshToken={refreshTick + calendarCatalogueTick} refreshToken={treeRefreshTick} refreshPaths={treeRefreshPaths} onFileDrop={dropFiles} onCreateFolder={createFolder} onFolderRule={(path,mode)=>void changeFolderRule(path,mode)} onFolderAction={(action,path)=>void folderAction(action,path)} clipboardPath={folderClipboard?.mode==="move"?folderClipboard.path:null} clipboardAvailable={!!folderClipboard||!!fileClipboard} onToast={message=>{setToast(message);window.setTimeout(()=>setToast(""),3000)}}/>
-      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
+      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel iptcToken={iptcToken} onOpenKeywords={openKeywordAssignment} primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
         aiReady={aiReady} aiReason={!aiEnabled?"AI je vypnutá":aiStatus.reason??aiStatus.lastError??"AI sa pripravuje"}
         readOnly={!!appInfo?.readonly} indexRevision={aiStatus.state==="indexing"?0:aiStatus.indexed}
         refreshToken={refreshTick} onMove={path=>void dropFiles(selectedList,path,false)}
@@ -886,7 +918,7 @@ export default function App() {
           <button onClick={() => { setQuarantineReview(null); setReviewInGrid(false); }}>Teraz nie</button>
         </div>}
         {centerMode==="map"?<MapView epoch={epoch} selectedIds={selectedIds} onSelect={select} onNavigate={(ids,title)=>navigate({kind:"people",ids,title})} onGrid={()=>setCenterMode("grid")} onOpenNeighborhood={ids=>void openMapNeighborhood(ids)}/>:<>
-        <AssetGrid ref={grid} view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={requestQuarantineMove} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onCompare={openComparison} comparisonOpen={!!comparison} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
+        <AssetGrid ref={grid} view={view} quarantineDeleteDays={quarantineSettings?.deleteAfterDays} onQuarantine={requestQuarantineMove} deletionSuggestions={deletionSuggestions} onKeepSuggested={id=>void runDeletionAction("keep_suggested_assets",[id])} qualityToken={aiTick} query={queryDebounced} sort={sort} descending={descending} zoom={zoom} epoch={epoch} refreshToken={refreshTick} selectedIds={selectedIds} primaryId={primaryId} cutIds={cutIds} filters={queryFilters} overlayMode={overlayMode} hoverMode={hoverMode} includeChildren={includeChildren} formats={formats} thumbnailInfo={thumbnailInfo} onOpenThumbnailInfo={()=>setThumbnailInfoOpen(true)} onSetValues={setAssetValues} onFileOperation={beginFileOperation} onFindSimilar={asset=>void findSimilar(asset)} aiReady={aiReady} aiReason={aiStatus.reason??"AI modul nie je nainštalovaný"} readOnly={!!appInfo?.readonly} onSelect={select} onSelectRange={selectRange} onSelectAll={ids=>void selectAll(ids)} onCompare={openComparison} onWriteIptc={ids => void openIptcWrite(ids)} comparisonOpen={!!comparison} onOpen={(asset,index)=>{if(asset.isDirectory){const id=asset.folderId??asset.id;navigate({kind:"folder",id,ids:asset.folderId?[asset.folderId]:undefined,title:asset.path??asset.name,folderPath:asset.path??undefined});return;}setViewer({asset,index});setPrimaryId(asset.id);setPrimaryAsset(asset);setSelectedIds(new Set([asset.id]));}} onCounts={counts} onViewport={updateViewport}/>
         </>}
         {operationProgress&&<div className="grid-footer"><span>{operationProgress}</span></div>}
         {viewer && <div className="viewer-overlay" ref={viewerOverlayRef} tabIndex={-1}><div className="viewer-bar"><button onClick={()=>setViewer(null)}>‹ Zavrieť</button>
@@ -931,7 +963,7 @@ export default function App() {
             actionIds={() => [viewer.asset.id]} offline={!!(viewer.asset.offline || viewer.asset.missing)} isPhoto={isImage(viewer.asset, formats)}
             editors={editors} readOnly={!!appInfo?.readonly} aiReady={aiReady} aiReason={aiStatus.reason ?? "AI modul nie je nainštalovaný"}
             onSetValues={setAssetValues} onFileOperation={beginFileOperation} onQuarantine={requestQuarantineMove}
-            onFindSimilar={asset => { setViewer(null); void findSimilar(asset); }} />}
+            onWriteIptc={ids => void openIptcWrite(ids)} onFindSimilar={asset => { setViewer(null); void findSimilar(asset); }} />}
           <Filmstrip key={refreshTick} filter={assetFilter} index={viewer.index} total={total} epoch={epoch} onPick={(asset,index)=>{if(!asset.isDirectory && isImage(asset, formats)) showViewerAsset(asset, index);}}/><div className="viewer-footer">{viewer.asset.path}</div></div>}
       </section>
       <DockSide side="right" layout={dockLayout} setLayout={setDockLayout} hosts={dockHosts} hideNav={!!viewer} dragging={dockDragging} controls={dockControls} sectionPresence={dockPresence}/>
@@ -947,6 +979,14 @@ export default function App() {
       onOpen={openComparedPhoto}
       onSetValues={setAssetValues} onFileOperation={beginFileOperation} onQuarantine={requestQuarantineMove}
       onFindSimilar={asset => { closeComparison(); void findSimilar(asset); }} />}
+    {iptcIds && <IptcWriteDialog ids={iptcIds} progress={operationProgress} onClose={() => setIptcIds(null)}
+      onDone={result => {
+        setOperationProgress("");
+        setIptcToken(token => token + 1);
+        if (result.written) refreshAfterWrite();
+        setToast("Zapísané: " + result.written + ", bez zmeny: " + result.unchanged + ", chyby: " + result.errors.length);
+        window.setTimeout(() => setToast(""), 8000);
+      }} />}
     {thumbnailInfoOpen&&<ThumbnailInfoDialog value={thumbnailInfo} onSave={value=>{setThumbnailInfo(normalizeThumbnailInfo(value));setThumbnailInfoOpen(false);}} onClose={()=>setThumbnailInfoOpen(false)}/> }
     {fileOp&&<FileOperationDialog mode={fileOp.mode} initialPath={view.kind==="folder"?(view.folderPath??""):""} onChoose={path=>void chooseOperationTarget(path)} onClose={()=>setFileOp(null)} onCreate={createFolder}/>}
     {moveWarning&&<div className="modal-backdrop">

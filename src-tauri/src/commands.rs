@@ -449,20 +449,78 @@ pub fn set_asset_values(
     changes: serde_json::Map<String, Value>,
 ) -> Result<SetAssetValuesResult, String> {
     let _operation = changes.contains_key("editPending").then(|| file_manager.0.lock_operation()).transpose()?;
+    let (file_ids, candidates) = listed_asset_candidates(&listing.0, &asset_ids)?;
+    let result = state.0.set_asset_values(&file_ids, &candidates, &changes)?;
+    for id in asset_ids.iter().copied().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
+    for candidate in candidates { let _ = listing.0.invalidate_path(&candidate.folder_path); }
+    Ok(result)
+}
+
+fn listed_asset_candidates(listing: &ListingService, asset_ids: &[i64]) -> Result<(Vec<i64>, Vec<ListedAsset>), String> {
     let mut candidates = Vec::new();
     let mut file_ids = asset_ids.iter().copied().filter(|id| *id >= 0).collect::<Vec<_>>();
     for id in asset_ids.iter().copied().filter(|id| *id < 0) {
-        let asset = listing.0.asset(id).ok_or_else(|| format!("Listed asset {id} is no longer available"))?;
+        let asset = listing.asset(id).ok_or_else(|| format!("Listed asset {id} is no longer available"))?;
         if asset.is_directory || asset.ext.is_empty() { continue; }
         let path = asset.path.ok_or_else(|| format!("Path for listed asset {id} is unavailable"))?;
         let folder_path = Path::new(&path).parent().map(|parent| parent.to_string_lossy().to_string()).ok_or("Parent folder is unavailable")?;
         candidates.push(ListedAsset { temporary_id: id, name: asset.name, ext: asset.ext, size: asset.size, file_modified: asset.file_modified, path, folder_path });
         file_ids.push(id);
     }
-    let result = state.0.set_asset_values(&file_ids, &candidates, &changes)?;
-    for id in asset_ids.iter().copied().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
+    Ok((file_ids, candidates))
+}
+
+#[tauri::command(async)]
+pub fn set_asset_text(
+    state: State<'_, CatalogWriterState>, listing: State<'_, ListingState>,
+    asset_ids: Vec<i64>, field: crate::journal::AssetTextField, value: Option<String>,
+) -> Result<crate::journal::SetAssetTextResult, String> {
+    let (file_ids, candidates) = listed_asset_candidates(&listing.0, &asset_ids)?;
+    let result = state.0.set_asset_text(&file_ids, &candidates, field, value)?;
+    for id in file_ids.into_iter().filter(|id| *id >= 0) { let _ = listing.0.invalidate_asset_parent(id); }
     for candidate in candidates { let _ = listing.0.invalidate_path(&candidate.folder_path); }
     Ok(result)
+}
+
+#[tauri::command(async)]
+pub fn get_asset_iptc(
+    db: State<'_, DatabaseState>, listing: State<'_, ListingState>, formats: State<'_, FormatsState>, asset_ids: Vec<i64>,
+) -> Result<Vec<crate::iptc_write::CatalogPhoto>, String> {
+    crate::iptc_write::catalog_photos(&db.0, &listing.0, &formats.0, &asset_ids)
+}
+
+#[tauri::command]
+pub async fn plan_iptc_write(
+    db: State<'_, DatabaseState>, listing: State<'_, ListingState>, formats: State<'_, FormatsState>,
+    exif: State<'_, ExifState>, writer: State<'_, CatalogWriterState>, batch: State<'_, Arc<crate::iptc_write::IptcState>>, asset_ids: Vec<i64>,
+) -> Result<crate::iptc_write::PlanSummary, String> {
+    if !writer.0.is_writable() { return Err("Katalóg je iba na čítanie".into()); }
+    let (db, listing, formats, exif, batch) = (db.0.clone(), listing.0.clone(), formats.0.clone(), exif.0.clone(), batch.inner().clone());
+    let id = batch.begin_plan()?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let photos = crate::iptc_write::catalog_photos(&db, &listing, &formats, &asset_ids)?;
+        batch.store(crate::iptc_write::Plan::prepare(id, photos, &exif, &formats))
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn execute_iptc_write(
+    app: tauri::AppHandle, formats: State<'_, FormatsState>, exif: State<'_, ExifState>,
+    writer: State<'_, CatalogWriterState>, manager: State<'_, FileManagerState>, batch: State<'_, Arc<crate::iptc_write::IptcState>>, plan_id: u64,
+) -> Result<crate::iptc_write::WriteSummary, String> {
+    if !writer.0.is_writable() { return Err("Katalóg je iba na čítanie".into()); }
+    let (formats, exif, manager, batch) = (formats.0.clone(), exif.0.clone(), manager.0.clone(), batch.inner().clone());
+    tauri::async_runtime::spawn_blocking(move || {
+        let _operation = manager.lock_operation()?;
+        batch.execute(plan_id, &exif, &formats, |done, total| {
+            let _ = app.emit("file-operation-progress", FileProgress { operation: "Zapisujem IPTC".into(), done, total });
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub fn cancel_iptc_write(batch: State<'_, Arc<crate::iptc_write::IptcState>>, plan_id: u64) -> Result<(), String> {
+    batch.cancel(plan_id)
 }
 
 #[tauri::command(async)]
@@ -1125,7 +1183,7 @@ pub fn get_metadata(
     if let Some(asset)=listing.0.asset(asset_id) {
         let path=asset.path.clone().unwrap_or_default();
         let online=Path::new(&path).is_file();
-        let rows=if online { exif.0.metadata(Path::new(&path)).map(|json|live_rows(json,&view.0,None)).unwrap_or_default() } else { Vec::new() };
+        let rows=if online { crate::iptc_write::metadata_with_sidecar(&exif.0, Path::new(&path)).map(|json|live_rows(json,&view.0,None)).unwrap_or_default() } else { Vec::new() };
         return Ok(Some(MetadataResponse{asset,offline:!online,rows}));
     }
     let Some(data) = db::asset_metadata(&db.0, asset_id).map_err(|e| e.to_string())? else {
@@ -1134,7 +1192,7 @@ pub fn get_metadata(
     let path = data.asset.path.as_deref().unwrap_or("");
     let online = Path::new(path).is_file();
     if online {
-        if let Ok(value) = exif.0.metadata(Path::new(path)) {
+        if let Ok(value) = crate::iptc_write::metadata_with_sidecar(&exif.0, Path::new(path)) {
             let rows = live_rows(value, &view.0, Some(&data));
             if !rows.is_empty() {
                 return Ok(Some(MetadataResponse {

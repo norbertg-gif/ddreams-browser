@@ -467,7 +467,15 @@ fn copy_folder_contents(fs: &dyn FileSystemOps, source: &Path, target: &Path, co
     Ok(())
 }
 fn remove_tree(fs:&dyn FileSystemOps,path:&Path)->Result<(),String>{for item in fs.read_dir(path).map_err(|e|e.to_string())?{if fs.is_dir(&item){remove_tree(fs,&item)?}else{fs.remove_file(&item).map_err(|e|e.to_string())?}}fs.remove_dir(path).map_err(|e|e.to_string())}
-fn sidecar_pairs(source:&Path,target:&Path)->Result<Vec<Transfer>,String>{let mut pairs=vec![Transfer{from:source.to_path_buf(),to:target.to_path_buf()}];let Some(filename)=source.file_name().map(|x|x.to_string_lossy().to_string())else{return Err("Názov súboru sa nedá prečítať".into())};let mut candidates=Vec::new();if !source.extension().is_some_and(|x|x.eq_ignore_ascii_case("xmp")){candidates.push(source.with_extension("xmp"));candidates.push(source.with_file_name(format!("{filename}.xmp")));}let mut seen=HashSet::new();for candidate in candidates{if candidate.exists()&&seen.insert(key(&candidate)){let mapped=if candidate.file_name().is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case(&format!("{filename}.xmp"))){target.with_file_name(format!("{}.xmp",target.file_name().unwrap().to_string_lossy()))}else{target.with_extension("xmp")};pairs.push(Transfer{from:candidate,to:mapped});}}Ok(pairs)}
+pub(crate) fn sidecar_candidates(source: &Path) -> Vec<PathBuf> {
+    if source.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xmp")) { return Vec::new(); }
+    let Some(name) = source.file_name() else { return Vec::new(); };
+    let mut full_name = name.to_os_string();
+    full_name.push(".xmp");
+    vec![source.with_extension("xmp"), source.with_file_name(full_name)]
+}
+
+fn sidecar_pairs(source:&Path,target:&Path)->Result<Vec<Transfer>,String>{let mut pairs=vec![Transfer{from:source.to_path_buf(),to:target.to_path_buf()}];let Some(filename)=source.file_name().map(|x|x.to_string_lossy().to_string())else{return Err("Názov súboru sa nedá prečítať".into())};let candidates=sidecar_candidates(source);let mut seen=HashSet::new();for candidate in candidates{if candidate.exists()&&seen.insert(key(&candidate)){let mapped=if candidate.file_name().is_some_and(|n|n.to_string_lossy().eq_ignore_ascii_case(&format!("{filename}.xmp"))){target.with_file_name(format!("{}.xmp",target.file_name().unwrap().to_string_lossy()))}else{target.with_extension("xmp")};pairs.push(Transfer{from:candidate,to:mapped});}}Ok(pairs)}
 
 fn copy_transfers(fs:&dyn FileSystemOps,pairs:&[Transfer])->Result<Vec<Transfer>,String>{let mut done=Vec::<Transfer>::new();for pair in pairs{if let Err(error)=fs.copy_no_replace(&pair.from,&pair.to){let rollback=remove_created(fs,&done.iter().map(|x|x.to.clone()).collect::<Vec<_>>());return Err(combine_error(format!("{}: {error}",pair.from.display()),rollback));}done.push(pair.clone());}Ok(done)}
 fn move_transfers(fs:&dyn FileSystemOps,pairs:&[Transfer])->Result<Vec<Transfer>,String>{let mut done=Vec::<Transfer>::new();for pair in pairs{let result=if fs.same_volume(&pair.from,&pair.to){move_case_safe(fs,&pair.from,&pair.to)}else{copy_then_remove(fs,&pair.from,&pair.to)};if let Err(error)=result{let rollback=rollback_moves(fs,&done);return Err(combine_error(format!("{}: {error}",pair.from.display()),rollback));}done.push(pair.clone());}Ok(done)}

@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent, type ReactElement, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AssetQuality, CatalogAssetLinks, Metadata, MetadataRow, ValueCount, View } from "../types";
+import type { AssetQuality, CatalogAssetLinks, CatalogIptc, IptcTextField, Metadata, MetadataRow, ValueCount, View } from "../types";
 import { labelColor, labelText, type AssetValuePatch } from "./AssetGrid";
 import { readStored, writeStored } from "../storage";
 import { propertySection } from "../dockLayout";
@@ -13,8 +13,8 @@ import { fetchFaceThumbs, type AssetColorInfo, type AiSuggestion, type CategoryM
   type FaceInfo, type FacePerson, type FaceStatus, type KeywordMutation } from "./rightPanelData";
 import { FACE_OVERLAY_REFRESH } from "./FaceOverlay";
 
-type Props = { primaryReadId: number | null; selectedReadIds: number[]; labelCounts: ValueCount[]; primaryValues?: AssetValuePatch; valueTokens: CatalogValueTokens; incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
-function useRightPanelModel({ primaryReadId, selectedReadIds, labelCounts, primaryValues, valueTokens, incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
+type Props = { iptcToken: number; onOpenKeywords: () => void; primaryReadId: number | null; selectedReadIds: number[]; labelCounts: ValueCount[]; primaryValues?: AssetValuePatch; valueTokens: CatalogValueTokens; incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
+function useRightPanelModel({ iptcToken, onOpenKeywords, primaryReadId, selectedReadIds, labelCounts, primaryValues, valueTokens, incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
   const [loadedMetadata, setMetadata] = useState<Metadata | null>(null);
   const metadata = useMemo(() => {
     if (!loadedMetadata || !primaryValues || (loadedMetadata.asset.id !== primaryValues.id && loadedMetadata.asset.id !== primaryReadId)) return loadedMetadata;
@@ -94,7 +94,7 @@ function useRightPanelModel({ primaryReadId, selectedReadIds, labelCounts, prima
     setMetadata(null); if (primaryId == null) return;
     const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
-  }, [primaryReadId, refreshToken]);
+  }, [primaryReadId, refreshToken, iptcToken]);
   useEffect(()=>{let active=true;setAssetColors([]);if(!colorIds.length)return;const timer=window.setTimeout(()=>{void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[selectionReadKey,primaryReadId,refreshToken,colorToken]);
   useEffect(()=>{let active=true;setAssetQuality([]);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<AssetQuality[]>("get_asset_quality",{assetIds:[primaryId]}).then(rows=>{if(active)setAssetQuality(rows)}).catch(()=>{if(active)setAssetQuality([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken,colorToken]);
   useEffect(()=>{let active=true;setAssetLinks(null);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken]);
@@ -115,8 +115,8 @@ function useRightPanelModel({ primaryReadId, selectedReadIds, labelCounts, prima
     const extra = [...new Set(rows.map(row => row.group).filter(name => !fixed.includes(name)))].sort((a,b) => {
       if (a === "Všetky metadáta") return 1; if (b === "Všetky metadáta") return -1; return a.localeCompare(b);
     });
-    return [...fixed, ...extra].map(name => ({name, rows: rows.filter(row => row.group === name)})).filter(group => group.rows.length);
-  }, [metadata, rowOrder]);
+    return [...fixed, ...extra].map(name => ({name, rows: rows.filter(row => row.group === name)})).filter(group => group.rows.length || (group.name === "IPTC" && assignedAssetIds.length));
+  }, [metadata, rowOrder, assignedAssetIds.length]);
   const propertyGroups = useMemo(() => groups.map(group => propertySection(group.name)), [groups]);
   useRegisterSections(propertyGroups);
   const rowKey = (row: MetadataRow) => `${row.group}\u0000${row.subgroup}\u0000${row.name}`;
@@ -242,7 +242,9 @@ function useRightPanelModel({ primaryReadId, selectedReadIds, labelCounts, prima
       {metadata?.offline && <div className="offline-note">Súbor je offline. Zobrazené sú údaje z katalógu.</div>}
       {loading && <div className="subtle">Načítavam metadáta…</div>}
     </div></DockChrome>
-      {groups.map(group => <MetadataGroup key={group.name} group={group}/>)}
+      {groups.map(group => <MetadataGroup key={group.name} group={group}
+        editor={group.name === "IPTC" && <IptcEditor ids={assignedAssetIds} token={iptcToken} refreshToken={refreshToken}
+          readOnly={readOnly} onOpenKeywords={onOpenKeywords} onSave={(ids, field, value) => onSetValues(ids, { [field]: value })} />} />)}
       <FacesSection/>
       <DockChrome id="propertiesBottom"><div className="dock-copy-controls" {...propertyEvents}><div className="copy-controls">{selectedRows.length > 0 && <button title="Zrušiť všetky zaškrtnutia" onClick={() => setSelectedRows([])}>✕</button>}<span className="copy-label">Kopírovať{selectedRows.length ? ` (${selectedRows.length})` : ""}:</span><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje zaškrtnuté riadky ako „Názov: hodnota“ (Ctrl+C)" onClick={() => void copy("selected")}>S popisom</button><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje len hodnoty zaškrtnutých riadkov" onClick={() => void copy("values")}>Bez popisu</button><button disabled={!metadata} title="Ďalšie možnosti" onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu">{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}{Object.keys(rowOrder).length>0&&<button onClick={()=>{setRowOrder({});setCopyMenu(false)}}>Obnoviť pôvodné poradie riadkov</button>}</div>}
@@ -260,7 +262,78 @@ export default function RightPanel(props: Parameters<typeof useRightPanelModel>[
   return <RightSectionContext.Provider value={{ properties: sections }}>{content}</RightSectionContext.Provider>;
 }
 
-function MetadataGroup({ group }: { group: { name: string; rows: MetadataRow[] } }): ReactElement {
+function IptcEditor({ ids, token, refreshToken, readOnly, onOpenKeywords, onSave }: {
+  ids: number[]; token: number; refreshToken: number; readOnly: boolean; onOpenKeywords: () => void;
+  onSave: (ids: number[], field: IptcTextField, value: string | null) => void;
+}) {
+  const key = ids.join(",");
+  const [data, setData] = useState<{ key: string; photos: CatalogIptc[] }>();
+  useEffect(() => {
+    if (!key) return;
+    let active = true;
+    void invoke<CatalogIptc[]>("get_asset_iptc", { assetIds: key.split(",").map(Number) }).then(photos => {
+      if (active) setData({ key, photos });
+    }).catch(() => { if (active) setData(undefined); });
+    return () => { active = false; };
+  }, [key, token, refreshToken]);
+  const photos = data?.key === key ? data.photos : [];
+  if (!photos.length) return null;
+  const targets = photos.map(photo => photo.id);
+  const keywords = [...new Set(photos.flatMap(photo => photo.keywords.map(path => path.join(" › "))))];
+  return <div className="iptc-editor" key={key}>
+    <small>Hodnoty v katalógu</small>
+    {(["caption", "author"] as const).map(field => {
+      const initial = photos[0][field] ?? "";
+      const mixed = photos.some(photo => (photo[field] ?? "") !== initial);
+      return <IptcField key={field} field={field} value={mixed ? "" : initial} mixed={mixed} readOnly={readOnly}
+        onSave={value => onSave(targets, field, value)} />;
+    })}
+    <div className="iptc-keywords">
+      <span>Kľúčové slová</span><button type="button" title="Otvoriť priraďovanie kľúčových slov" onClick={onOpenKeywords}>…</button>
+      <div>{keywords.length ? keywords.map(keyword => <span key={keyword} title={keyword}>{keyword}</span>) : "—"}</div>
+    </div>
+  </div>;
+}
+
+function IptcField({ field, value, mixed, readOnly, onSave }: {
+  field: IptcTextField; value: string; mixed: boolean; readOnly: boolean; onSave: (value: string | null) => void;
+}) {
+  const [draft, setDraft] = useState<string | null>(null);
+  const edited = useRef<string | null>(null);
+  const save = () => {
+    const next = edited.current;
+    edited.current = null;
+    setDraft(null);
+    if (next == null || (!mixed && next === value)) return;
+    onSave(next.trim() ? next : null);
+  };
+  const caption = field === "caption";
+  const attrs = {
+    value: draft ?? value, readOnly, placeholder: mixed ? "(rôzne hodnoty)" : undefined,
+    maxLength: caption ? 2000 : 200,
+    onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      edited.current = event.currentTarget.value;
+      setDraft(event.currentTarget.value);
+    },
+    onBlur: save,
+    onKeyDown: (event: ReactKeyboardEvent<HTMLInputElement | HTMLTextAreaElement>) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        edited.current = null;
+        setDraft(null);
+        event.currentTarget.blur();
+      } else if (event.key === "Enter" && event.ctrlKey) {
+        event.preventDefault();
+        event.stopPropagation();
+        event.currentTarget.blur();
+      }
+    },
+  };
+  return <label>{caption ? "Popis" : "Autor"}{caption ? <textarea rows={3} {...attrs} /> : <input {...attrs} />}</label>;
+}
+
+function MetadataGroup({ group, editor }: { group: { name: string; rows: MetadataRow[] }; editor?: ReactNode }): ReactElement {
   const {
     bucketKey, catalogText, colorNames, dragRow, dropAfter, dropMark, isCollapsed, moveRow, propertyEvents,
     quality, qualityText, qualityTitle, rowKey, selectRow, selectedRows, setCopyMenu, setDropMark,
@@ -268,6 +341,8 @@ function MetadataGroup({ group }: { group: { name: string; rows: MetadataRow[] }
   return <DockSection id={propertySection(group.name)}><section className="property-group" {...propertyEvents}>
         <SectionHeading id={propertySection(group.name)} count={group.rows.length} metadata/>
         {!isCollapsed(propertySection(group.name)) && <div className="metadata-rows">
+          {editor}
+          {editor && !!group.rows.length && <div className="metadata-subgroup-title">Metadáta v súbore</div>}
           {[...new Set(group.rows.map(row=>row.subgroup))].map(subgroup=><div className="metadata-subgroup" key={subgroup}>
             {subgroup && subgroup !== group.name && <div className="metadata-subgroup-title">{subgroup}</div>}
             {group.rows.filter(row=>row.subgroup===subgroup).map(row => <div key={rowKey(row)} className={`meta-row checkable ${selectedRows.includes(rowKey(row)) ? "selected" : ""} ${dropMark?.key===rowKey(row)?(dropMark.after?"drop-after":"drop-before"):""}`} onClick={e => selectRow(row,e)} onContextMenu={e => { e.preventDefault(); setCopyMenu(true); }}

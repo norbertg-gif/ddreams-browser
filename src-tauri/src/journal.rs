@@ -47,6 +47,18 @@ pub struct SetAssetValuesResult {
     pub assets: Vec<AssetValueState>,
 }
 
+#[derive(Clone, Copy, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AssetTextField { Caption, Author }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetAssetTextResult {
+    #[serde(flatten)]
+    result: SetAssetValuesResult,
+    value: Option<String>,
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetAssetCategoriesResult {
@@ -407,6 +419,35 @@ impl CatalogWriter {
         let change_id = if changed { record_change(&tx, "set_asset_values", &summary)? } else { None };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(SetAssetValuesResult { change_id, summary, remapped_ids, assets: targets })
+    }
+
+    pub fn set_asset_text(&self, asset_ids: &[i64], listed: &[ListedAsset], field: AssetTextField, value: Option<String>) -> Result<SetAssetTextResult, String> {
+        self.require_write()?;
+        let (column, label, limit) = match field {
+            AssetTextField::Caption => ("caption", "Popis", 2000),
+            AssetTextField::Author => ("author", "Autor", 200),
+        };
+        let value = value.map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
+            .filter(|value| !value.trim().is_empty());
+        if let Some(value) = &value {
+            if value.chars().count() > limit { return Err(format!("{label} môže mať najviac {limit} znakov")); }
+            if value.contains('\0') || (column == "author" && value.contains('\n')) {
+                return Err(format!("{label} obsahuje nepovolený znak"));
+            }
+        }
+        let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
+        self.rules.guard(&tx, asset_ids, listed)?;
+        let (assets, remapped_ids, inserted) = resolve_write_assets(&tx, asset_ids, listed, value.is_some(), true,
+            |tx, id, path| self.track_incoming(tx, id, path))?;
+        let mut changed = inserted > 0;
+        for asset in &assets {
+            changed |= update_column(&tx, "assets", asset.id, column, value.as_deref())?;
+        }
+        let summary = format!("{label} · {} {}", assets.len(), slovak_count(assets.len(), "súbor", "súbory", "súborov"));
+        let change_id = if changed { record_change(&tx, "set_asset_text", &summary)? } else { None };
+        tx.commit().map_err(|e| e.to_string())?;
+        Ok(SetAssetTextResult { result: SetAssetValuesResult { change_id, summary, remapped_ids, assets }, value })
     }
 
     pub fn set_asset_categories(&self, asset_ids: &[i64], listed_assets: &[ListedAsset], category_id: i64, assign: bool) -> Result<SetAssetCategoriesResult, String> {
@@ -978,7 +1019,8 @@ fn keyword_exists(tx:&Transaction<'_>,id:i64)->Result<bool,String>{tx.query_row(
 fn ensure_unique_keyword_name(tx:&Transaction<'_>,parent:Option<i64>,name:&str,exclude:Option<i64>)->Result<(),String>{let mut stmt=tx.prepare("SELECT id,name FROM keywords WHERE parent_id IS ?1").map_err(|e|e.to_string())?;let rows=stmt.query_map([parent],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?))).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let normalized=name.trim().to_lowercase();if rows.iter().any(|(id,value)|Some(*id)!=exclude&&value.trim().to_lowercase()==normalized){return Err("Na tejto úrovni už existuje kľúčové slovo s týmto názvom".into());}Ok(())}
 fn keyword_subtree(tx:&Transaction<'_>,id:i64)->Result<Vec<i64>,String>{let mut stmt=tx.prepare("WITH RECURSIVE subtree(id) AS (SELECT id FROM keywords WHERE id=?1 UNION SELECT k.id FROM keywords k JOIN subtree s ON k.parent_id=s.id) SELECT id FROM subtree").map_err(|e|e.to_string())?;let ids=stmt.query_map([id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;if ids.is_empty(){return Err("Kľúčové slovo neexistuje".into());}Ok(ids)}
 fn keyword_ancestor_ids(tx:&Transaction<'_>,id:i64)->Result<Vec<i64>,String>{let mut current=tx.query_row("SELECT parent_id FROM keywords WHERE id=?1",[id],|r|r.get::<_,Option<i64>>(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;let mut result=Vec::new();let mut seen=std::collections::HashSet::new();while let Some(parent)=current{if !seen.insert(parent){break;}result.push(parent);current=tx.query_row("SELECT parent_id FROM keywords WHERE id=?1",[parent],|r|r.get::<_,Option<i64>>(0)).optional().map_err(|e|e.to_string())?.flatten();}Ok(result)}
-fn keyword_path(tx:&Transaction<'_>,id:i64)->Result<String,String>{let mut current=Some(id);let mut seen=std::collections::HashSet::new();let mut names=Vec::new();while let Some(key)=current{if !seen.insert(key){break;}let row:Option<(String,Option<i64>)>=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;let Some((name,parent))=row else{if key==id{return Err("Kľúčové slovo neexistuje".into());}break;};names.push(name);current=parent;}names.reverse();Ok(names.join(" › "))}
+fn keyword_path(tx:&Transaction<'_>,id:i64)->Result<String,String>{ Ok(keyword_components(tx, id)?.join(" › ")) }
+pub(crate) fn keyword_components(tx:&rusqlite::Connection,id:i64)->Result<Vec<String>,String>{let mut current=Some(id);let mut seen=std::collections::HashSet::new();let mut names=Vec::new();while let Some(key)=current{if !seen.insert(key){break;}let row:Option<(String,Option<i64>)>=tx.query_row("SELECT name,parent_id FROM keywords WHERE id=?1",[key],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;let Some((name,parent))=row else{if key==id{return Err("Kľúčové slovo neexistuje".into());}break;};names.push(name);current=parent;}names.reverse();Ok(names)}
 fn keyword_delete_info(connection:&rusqlite::Connection,id:i64)->Result<KeywordDeleteInfo,String>{let name:String=connection.query_row("SELECT name FROM keywords WHERE id=?1",[id],|r|r.get(0)).optional().map_err(|e|e.to_string())?.ok_or_else(||"Kľúčové slovo neexistuje".to_string())?;let mut stmt=connection.prepare("WITH RECURSIVE subtree(id) AS (SELECT id FROM keywords WHERE id=?1 UNION SELECT k.id FROM keywords k JOIN subtree s ON k.parent_id=s.id) SELECT id FROM subtree").map_err(|e|e.to_string())?;let ids=stmt.query_map([id],|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())?.collect::<rusqlite::Result<Vec<_>>>().map_err(|e|e.to_string())?;let marks=std::iter::repeat("?").take(ids.len()).collect::<Vec<_>>().join(",");let sql=format!("SELECT count(DISTINCT asset_id) FROM asset_keywords WHERE keyword_id IN ({marks})");let assigned=connection.query_row(&sql,rusqlite::params_from_iter(ids.iter()),|r|r.get::<_,i64>(0)).map_err(|e|e.to_string())? as usize;Ok(KeywordDeleteInfo{id,name,assigned_files:assigned,subkeywords:ids.len().saturating_sub(1)})}
 
 fn insert_asset(transaction: &Transaction<'_>, asset: &NewCatalogAsset) -> Result<(), String> {
@@ -1307,6 +1349,43 @@ mod tests {
 
     use crate::db::Db;
     use std::sync::{Arc,Mutex};
+
+    #[test]
+    fn set_asset_text_applies_catalogue_only_and_records_history() {
+        let db = write_fixture();
+        db.lock().unwrap().execute("DROP TABLE ddreams_change_items", []).unwrap();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let initial = writer.set_asset_text(&[1, 2], &[], AssetTextField::Caption, Some("Ľúka\r\nJeseň".into())).unwrap();
+        assert_eq!(initial.value.as_deref(), Some("Ľúka\nJeseň"));
+        assert!(initial.result.change_id.is_some());
+        let repeat = writer.set_asset_text(&[1, 2], &[], AssetTextField::Caption, initial.value).unwrap();
+        assert!(repeat.result.change_id.is_none());
+        let cleared = writer.set_asset_text(&[1], &[], AssetTextField::Caption, Some(" ".into())).unwrap();
+        assert!(cleared.value.is_none());
+        let conn = db.lock().unwrap();
+        let values = conn.query_row("SELECT (SELECT caption FROM assets WHERE id=1),(SELECT caption FROM assets WHERE id=2)", [],
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?))).unwrap();
+        assert_eq!(values, (None, "Ľúka\nJeseň".into()));
+        let action = conn.query_row("SELECT action FROM ddreams_changes WHERE id=?1",
+            [cleared.result.change_id], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(action, "set_asset_text");
+    }
+
+    #[test]
+    fn set_asset_text_remaps_listed_ids_and_validates_before_writing() {
+        let db = write_fixture();
+        let writer = CatalogWriter::new(db.clone(), true);
+        let candidate = ListedAsset { temporary_id: -10, name: "new.jpg".into(), ext: "jpg".into(),
+            size: None, file_modified: None, path: "F:\\Photos\\new.jpg".into(), folder_path: "F:\\Photos".into() };
+        let result = writer.set_asset_text(&[-10], std::slice::from_ref(&candidate), AssetTextField::Author, Some("Žanet".into())).unwrap();
+        let remap = &result.result.remapped_ids[0];
+        assert_eq!(remap.old_id, -10);
+        let value = db.lock().unwrap().query_row("SELECT author FROM assets WHERE id=?1", [remap.new_id], |r| r.get::<_, String>(0)).unwrap();
+        assert_eq!(value, "Žanet");
+        assert!(writer.set_asset_text(&[1], &[], AssetTextField::Author, Some("Ž".repeat(201))).is_err());
+        assert!(writer.set_asset_text(&[1], &[], AssetTextField::Caption, Some("X".repeat(2001))).is_err());
+        assert!(CatalogWriter::new(db, false).set_asset_text(&[1], &[], AssetTextField::Author, None).is_err());
+    }
 
     fn write_fixture() -> Db {
         let mut connection=Connection::open_in_memory().unwrap();

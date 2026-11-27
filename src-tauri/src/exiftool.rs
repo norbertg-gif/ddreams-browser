@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::{
-    io::{Read, Write},
+    io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, ChildStdin, Command, Stdio},
     sync::{
@@ -20,6 +20,7 @@ struct Process {
     child: Child,
     input: ChildStdin,
     chunks: Receiver<std::io::Result<Vec<u8>>>,
+    diagnostics: Receiver<Vec<u8>>,
     pending: Vec<u8>,
     next_execute: u64,
 }
@@ -31,11 +32,22 @@ impl Process {
             .args(["-stay_open", "True", "-@", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::piped());
         #[cfg(windows)]
         std::os::windows::process::CommandExt::creation_flags(&mut command, CREATE_NO_WINDOW);
         let mut child = command.spawn()?;
         let mut output = child.stdout.take().unwrap();
+        let mut stderr = BufReader::new(child.stderr.take().unwrap());
+        let (diagnostic_send, diagnostics) = mpsc::channel();
+        thread::Builder::new().name("exiftool-stderr".into()).spawn(move || {
+            loop {
+                let mut line = Vec::new();
+                match stderr.read_until(b'\n', &mut line) {
+                    Ok(n) if n > 0 => { if diagnostic_send.send(line).is_err() { break; } }
+                    _ => break,
+                }
+            }
+        })?;
         let (send, chunks) = mpsc::channel();
         thread::Builder::new()
             .name("exiftool-stdout".into())
@@ -60,27 +72,37 @@ impl Process {
             input: child.stdin.take().unwrap(),
             child,
             chunks,
+            diagnostics,
             pending: Vec::new(),
             next_execute: 1,
         })
     }
 
     fn request(&mut self, args: &[String]) -> std::io::Result<Vec<u8>> {
+        self.request_with_status(args, REQUEST_TIMEOUT).map(|(bytes, _, _)| bytes)
+    }
+
+    fn request_with_status(&mut self, args: &[String], timeout: Duration) -> std::io::Result<(Vec<u8>, String, i32)> {
         if self.child.try_wait()?.is_some() {
             return Err(io_error(std::io::ErrorKind::BrokenPipe, "ExifTool exited"));
         }
         let execute = self.next_execute;
         self.next_execute += 1;
         let marker = format!("{{ready{execute}}}").into_bytes();
+        let status_marker = format!("ddreams-exiftool-status-{execute}:");
+        if args.iter().any(|arg| arg.contains(['\r', '\n', '\0'])) {
+            return Err(io_error(std::io::ErrorKind::InvalidInput, "Neplatný znak v argumente ExifTool"));
+        }
         for arg in args {
             writeln!(self.input, "{arg}")?;
         }
+        writeln!(self.input, "-echo4\n{status_marker}\u{24}{{status}}")?;
         writeln!(self.input, "-execute{execute}")?;
         self.input.flush()?;
-        let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
-        loop {
+        let deadline = std::time::Instant::now() + timeout;
+        let frame = loop {
             if let Some(frame) = take_frame(&mut self.pending, &marker) {
-                return Ok(frame);
+                break frame;
             }
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
@@ -96,6 +118,17 @@ impl Process {
                     return Err(io_error(std::io::ErrorKind::UnexpectedEof, "ExifTool closed stdout"));
                 }
             }
+        };
+        let mut diagnostics = String::new();
+        loop {
+            let line = self.diagnostics.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .map_err(|_| io_error(std::io::ErrorKind::TimedOut, "ExifTool did not return its status"))?;
+            let line = String::from_utf8_lossy(&line);
+            if let Some(status) = line.trim_end().strip_prefix(&status_marker) {
+                let status = status.parse().map_err(|_| io_error(std::io::ErrorKind::InvalidData, "Invalid ExifTool status"))?;
+                return Ok((frame, diagnostics.trim().to_owned(), status));
+            }
+            if diagnostics.len() < 16 * 1024 { diagnostics.push_str(&line); }
         }
     }
 }
@@ -204,6 +237,42 @@ impl ExifTool {
         let data=self.with_process(|proc|proc.request(&args))?;
         let json:Value=serde_json::from_slice(&data).map_err(|e|io_error(std::io::ErrorKind::InvalidData,&e.to_string()))?;
         Ok(json.as_array().cloned().unwrap_or_default())
+    }
+
+    pub(crate) fn iptc_metadata(&self, path: &Path) -> std::io::Result<Value> {
+        let args = ["-charset", "filename=UTF8", "-j", "-G1:4", "-a", "-s",
+            "-FileType", "-IPTC:all", "-XMP-dc:all", "-XMP-lr:all"]
+            .into_iter().map(str::to_owned).chain([path.to_string_lossy().into_owned()]).collect::<Vec<_>>();
+        let (data, diagnostics, status) = self.with_process(|process| process.request_with_status(&args, REQUEST_TIMEOUT))?;
+        if status != 0 { return Err(io_error(std::io::ErrorKind::InvalidData, &diagnostics)); }
+        let json: Vec<Value> = serde_json::from_slice(&data)?;
+        json.into_iter().next().filter(Value::is_object)
+            .ok_or_else(|| io_error(std::io::ErrorKind::InvalidData, "ExifTool nevrátil metadáta"))
+    }
+
+    pub(crate) fn write(&self, path: &Path, tags: &[String]) -> std::io::Result<String> {
+        let mut args = vec!["-charset".into(), "filename=UTF8".into(), "-P".into()];
+        args.extend_from_slice(tags);
+        args.extend(["-overwrite_original".into(), path.to_string_lossy().into_owned()]);
+        let (bytes, diagnostics, status) = self.with_process(|process| process.request_with_status(&args, Duration::from_secs(300)))?;
+        let output = String::from_utf8_lossy(&bytes);
+        if status != 0 || !output.lines().any(|line| line.trim() == "1 image files updated") {
+            return Err(io_error(std::io::ErrorKind::Other, &format!("{diagnostics}\n{}", output.trim()).trim()));
+        }
+        Ok(diagnostics)
+    }
+
+    pub(crate) fn create_xmp(&self, tags: &[String]) -> std::io::Result<(Vec<u8>, String)> {
+        let mut args = vec!["-charset".into(), "filename=UTF8".into()];
+        args.extend_from_slice(tags);
+        // ExifTool expands % tokens in output paths. Send a fresh XMP packet to stdout.
+        args.extend(["-o".into(), "-.xmp".into()]);
+        let (bytes, diagnostics, status) = self.with_process(|process| process.request_with_status(&args, REQUEST_TIMEOUT))?;
+        if status != 0 || !bytes.starts_with(b"<?xpacket") || !bytes.ends_with(b"<?xpacket end='w'?>") {
+            let message = if diagnostics.is_empty() { "ExifTool nevytvoril XMP" } else { &diagnostics };
+            return Err(io_error(std::io::ErrorKind::InvalidData, message));
+        }
+        Ok((bytes, diagnostics))
     }
 
     pub fn largest_preview(&self, path: &Path) -> std::io::Result<Vec<u8>> {

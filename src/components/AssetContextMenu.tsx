@@ -29,6 +29,7 @@ type Props = {
   aiReason: string;
   onOpen?: () => void;
   onCompare?: () => void;
+  onWriteIptc?: (ids: number[]) => void;
   canCompare?: boolean;
   onOpenThumbnailInfo?: () => void;
   onSetValues: (ids: number[], changes: Record<string, unknown>) => void;
@@ -39,7 +40,7 @@ type Props = {
 
 export default function AssetContextMenu({
   anchor, onClose, asset, actionIds, offline, isPhoto, editors, readOnly, aiReady, aiReason,
-  onOpen, onCompare, canCompare, onOpenThumbnailInfo, onSetValues, onFileOperation, onQuarantine, onFindSimilar,
+  onOpen, onCompare, canCompare, onWriteIptc, onOpenThumbnailInfo, onSetValues, onFileOperation, onQuarantine, onFindSimilar,
 }: Props) {
   const menuRef = useRef<HTMLDivElement>(null);
   const [position, setPosition] = useState<{ left: number; top: number }>();
@@ -111,6 +112,8 @@ export default function AssetContextMenu({
         await navigator.clipboard.writeText(paths.join("\n"));
       }}>Kopírovať cestu</button>
       {onOpenThumbnailInfo && <button onClick={() => { onClose(); onOpenThumbnailInfo(); }}>Údaje pod náhľadmi…</button>}
+      {onWriteIptc && isPhoto && !asset.isDirectory && <button disabled={readOnly}
+        onClick={() => { onClose(); onWriteIptc(actionIds()); }}>Zapísať IPTC do súborov…</button>}
       <hr className="menu-separator" />
       <div className={readOnly ? "write-menu-group readonly" : "write-menu-group"}>
         <div className="write-menu-row"><span>Hodnotenie</span>

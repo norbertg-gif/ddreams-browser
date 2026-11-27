@@ -8,6 +8,7 @@
         { "label": "Popis", "keys": ["IPTC:Caption-Abstract", "XMP-dc:Description"] },
         { "label": "Autor popisu", "keys": ["IPTC:Writer-Editor"] },
         { "label": "Kľúčové slová", "keys": ["IPTC:Keywords", "XMP-dc:Subject"] },
+        { "label": "Hierarchia kľúčových slov", "keys": ["XMP-lr:HierarchicalSubject"] },
         { "label": "Kód predmetu IPTC", "keys": ["IPTC:SubjectReference"] }
       ] },
       { "name": "Kontakt", "fields": [
