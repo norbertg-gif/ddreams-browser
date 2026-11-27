@@ -32,6 +32,7 @@ export function buildAssetFilter(
     dateFrom: view.dateFrom ?? null, dateTo: view.dateTo ?? null,
     dateSource: view.dateSource ?? null, dateNoDate: view.dateNoDate ?? false,
     query, sort, descending, ratingMode: filters.ratingMode ?? null, ratingValue: filters.ratingValue ?? null,
-    labelFilter: filters.labelFilter ?? null, taggedOnly: filters.taggedOnly ?? false, fileGroup: filters.fileGroup ?? null,
+    labelFilter: filters.labelFilter ?? null, taggedOnly: filters.taggedOnly ?? false,
+    categoryFilter: filters.categoryFilter ?? null, keywordFilter: filters.keywordFilter ?? null, fileGroup: filters.fileGroup ?? null,
   };
 }
