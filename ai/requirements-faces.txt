@@ -1,0 +1,5 @@
+# ONNX Runtime for face detection/recognition, installed separately into modules\ai\pylibs:
+#   C:\DDreams\modules\python\Scripts\python.exe -m pip install --target C:\DDreams\modules\ai\pylibs -r ai\requirements-faces.txt
+# Must stay on 1.24.x: newer builds need CUDA 13, while torch in requirements.txt is cu126.
+# ddreams_ai.py imports torch first so its CUDA/cuDNN libraries are loaded for onnxruntime.
+onnxruntime-gpu==1.24.1
