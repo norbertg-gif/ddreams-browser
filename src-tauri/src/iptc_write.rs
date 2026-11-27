@@ -1,11 +1,12 @@
 use crate::{db::Db, exiftool::ExifTool, file_ops::{sidecar_candidates, FileSystemOps, NativeFileSystem},
-    formats::FormatTable, journal::keyword_components, listing::ListingService};
+    formats::FormatTable, journal::{keyword_components, AssetTextField}, listing::ListingService};
 use rusqlite::{Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
     fs,
+    hash::{DefaultHasher, Hash, Hasher},
     io::Write,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, atomic::{AtomicBool, AtomicU64, Ordering}},
@@ -29,6 +30,8 @@ pub struct CatalogPhoto {
     caption: Option<String>,
     author: Option<String>,
     keywords: Vec<Vec<String>>,
+    #[serde(skip)]
+    keyword_ids: Vec<i64>,
 }
 
 pub fn catalog_photos(db: &Db, listing: &ListingService, formats: &FormatTable, ids: &[i64]) -> Result<Vec<CatalogPhoto>, String> {
@@ -39,7 +42,8 @@ pub fn catalog_photos(db: &Db, listing: &ListingService, formats: &FormatTable, 
     let mut by_id = conn.prepare(&format!("{base} AND id=?1")).map_err(|e| e.to_string())?;
     let mut by_path = conn.prepare(&format!("{base} AND path=?1 COLLATE NOCASE ORDER BY id LIMIT 1")).map_err(|e| e.to_string())?;
     let map = |r: &rusqlite::Row<'_>| Ok(CatalogPhoto {
-        id: r.get(0)?, path: r.get(1)?, ext: r.get(2)?, caption: r.get(3)?, author: r.get(4)?, keywords: Vec::new(),
+        id: r.get(0)?, path: r.get(1)?, ext: r.get(2)?, caption: r.get(3)?, author: r.get(4)?,
+        keywords: Vec::new(), keyword_ids: Vec::new(),
     });
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -54,21 +58,25 @@ pub fn catalog_photos(db: &Db, listing: &ListingService, formats: &FormatTable, 
             }
             catalogued.or_else(|| Some(CatalogPhoto {
                 id, path: asset.path.clone(), ext: asset.ext.clone(),
-                caption: asset.caption.clone(), author: asset.author.clone(), keywords: Vec::new(),
+                caption: asset.caption.clone(), author: asset.author.clone(), keywords: Vec::new(), keyword_ids: Vec::new(),
             }))
         } else { None };
         let Some(mut photo) = photo.filter(|photo| is_photo(formats, &photo.ext)) else { continue };
-        if photo.id > 0 { photo.keywords = catalog_keywords(&conn, photo.id)?; }
+        if photo.id > 0 {
+            (photo.keyword_ids, photo.keywords) = catalog_keywords(&conn, photo.id)?;
+        }
         photo.id = id;
         result.push(photo);
     }
     Ok(result)
 }
 
-fn catalog_keywords(conn: &Connection, id: i64) -> Result<Vec<Vec<String>>, String> {
+fn catalog_keywords(conn: &Connection, id: i64) -> Result<(Vec<i64>, Vec<Vec<String>>), String> {
     let mut stmt = conn.prepare("SELECT keyword_id FROM asset_keywords WHERE asset_id=?1 ORDER BY keyword_id").map_err(|e| e.to_string())?;
     let ids = stmt.query_map([id], |r| r.get::<_, i64>(0)).map_err(|e| e.to_string())?;
-    ids.map(|id| keyword_components(conn, id.map_err(|e| e.to_string())?)).collect()
+    let ids = ids.collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?;
+    let paths = ids.iter().map(|&id| keyword_components(conn, id)).collect::<Result<_, _>>()?;
+    Ok((ids, paths))
 }
 
 fn is_photo(formats: &FormatTable, ext: &str) -> bool { matches!(formats.group(ext), Some("image" | "raw")) }
@@ -85,7 +93,7 @@ fn embedded_file_type(ext: &str) -> Option<&'static str> {
 
 fn ext(path: &Path) -> &str { path.extension().and_then(|value| value.to_str()).unwrap_or("") }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 struct Stamp { size: u64, modified: SystemTime, canonical: PathBuf }
 
 fn stamp(path: &Path) -> Result<Option<Stamp>, String> {
@@ -154,17 +162,24 @@ fn tag_values<'a>(metadata: &'a Value, tag: &'a str) -> impl Iterator<Item = &'a
         .filter(move |(key, _)| matches_tag(key, tag)).flat_map(|(_, value)| values(value))
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum EditKind { Set, Append, Remove }
+
 #[derive(Debug, PartialEq, Eq)]
-struct Edit { tag: &'static str, value: String, append: bool }
+struct Edit { tag: &'static str, value: String, kind: EditKind }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Merge { edits: Vec<Edit>, warnings: Vec<String> }
 
-fn merge(photo: &CatalogPhoto, metadata: &Value, embedded: bool) -> Merge {
-    let mut result = Merge::default();
+fn safe_iptc(metadata: &Value) -> bool {
     // Relabelling a legacy IPTC block as UTF-8 can corrupt unrelated tags.
     let existing_iptc = metadata.as_object().is_some_and(|tags| tags.keys().any(|key| key.split(':').any(|part| part == "IPTC")));
-    let safe_iptc = !existing_iptc || tag_values(metadata, "IPTC:CodedCharacterSet").any(|value| value.eq_ignore_ascii_case("UTF8"));
+    !existing_iptc || tag_values(metadata, "IPTC:CodedCharacterSet").any(|value| value.eq_ignore_ascii_case("UTF8"))
+}
+
+fn merge(photo: &CatalogPhoto, metadata: &Value, embedded: bool) -> Merge {
+    let mut result = Merge::default();
+    let safe_iptc = safe_iptc(metadata);
     let mut legacy_warning = false;
     let mut add = |tag: &'static str, value: &str, append: bool, limit: usize| {
         if value.contains('\0') || (append && value.contains(['\r', '\n'])) {
@@ -174,7 +189,8 @@ fn merge(photo: &CatalogPhoto, metadata: &Value, embedded: bool) -> Merge {
         } else if value.len() > limit {
             result.warnings.push(format!("{tag} presahuje {limit} bajtov, hodnota sa zapíše iba do XMP"));
         } else {
-            result.edits.push(Edit { tag, value: value.replace("\r\n", "\n").replace('\r', "\n"), append });
+            let kind = if append { EditKind::Append } else { EditKind::Set };
+            result.edits.push(Edit { tag, value: value.replace("\r\n", "\n").replace('\r', "\n"), kind });
         }
     };
     for (tags, value, limit) in [(DESCRIPTION, photo.caption.as_deref(), 2000), (CREATOR, photo.author.as_deref(), 32)] {
@@ -203,13 +219,152 @@ fn merge(photo: &CatalogPhoto, metadata: &Value, embedded: bool) -> Merge {
     result
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ManualEdit {
+    Text {
+        field: AssetTextField,
+        #[serde(deserialize_with = "explicit_text_value")]
+        value: Option<String>,
+    },
+    RemoveKeyword { keyword: String },
+    AddKeywords,
+}
+
+fn explicit_text_value<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<String>, D::Error> {
+    Option::deserialize(value)
+}
+
+fn keyword_key(value: &str) -> String { value.trim().to_lowercase() }
+
+fn file_keywords(metadata: &Value) -> Vec<String> {
+    let mut seen = HashSet::new();
+    KEYWORDS.iter().flat_map(|tag| tag_values(metadata, tag))
+        .filter(|value| seen.insert(keyword_key(value))).map(str::to_owned).collect()
+}
+
+fn exact_tag(key: &str, tag: &str) -> bool {
+    let name = tag.split_once(':').unwrap().1;
+    key.rsplit(':').next() == Some(name) && matches_tag(key, tag)
+}
+
+fn text_value(metadata: &Value, tags: [&str; 2], multiple: bool) -> Option<String> {
+    let preferred: Vec<_> = metadata.as_object().into_iter().flatten()
+        .filter(|(key, _)| exact_tag(key, tags[0])).flat_map(|(_, value)| values(value)).collect();
+    let values = if !preferred.is_empty() { preferred } else {
+        let alternatives = tag_values(metadata, tags[0]).collect::<Vec<_>>();
+        if alternatives.is_empty() { tag_values(metadata, tags[1]).collect() } else { alternatives }
+    };
+    if multiple && !values.is_empty() { Some(values.join("; ")) }
+    else { values.first().map(|value| (*value).to_owned()) }
+}
+
+fn manual_merge(photo: &CatalogPhoto, metadata: &Value, embedded: bool, action: &ManualEdit) -> Result<Merge, String> {
+    if matches!(action, ManualEdit::AddKeywords) {
+        let present: HashSet<_> = file_keywords(metadata).iter().map(|value| keyword_key(value)).collect();
+        let mut additions = photo.clone();
+        additions.caption = None;
+        additions.author = None;
+        additions.keywords.retain(|path| path.last().is_some_and(|leaf| !present.contains(&keyword_key(leaf))));
+        return Ok(merge(&additions, metadata, embedded));
+    }
+    let mut result = Merge::default();
+    let safe_iptc = safe_iptc(metadata);
+    let mut warn_legacy = false;
+    let mut add = |tag: &'static str, value: &str, kind, limit| {
+        if tag.starts_with("IPTC:") && !safe_iptc {
+            warn_legacy = true;
+        } else if value.len() > limit {
+            result.warnings.push(format!("{tag} presahuje {limit} bajtov, hodnota sa zapíše iba do XMP"));
+        } else {
+            result.edits.push(Edit { tag, value: value.to_owned(), kind });
+        }
+    };
+    match action {
+        ManualEdit::Text { field, value } => {
+            let (tags, limit) = match field { AssetTextField::Caption => (DESCRIPTION, 2000), AssetTextField::Author => (CREATOR, 32) };
+            let value = value.as_deref().unwrap_or_default();
+            for (tag, limit) in [(tags[0], usize::MAX), (tags[1], limit)].into_iter().take(if embedded { 2 } else { 1 }) {
+                let current: Vec<_> = tag_values(metadata, tag).collect();
+                let already_set = current == [value] && metadata.as_object().is_some_and(|tags|
+                    tags.keys().filter(|key| matches_tag(key, tag)).all(|key| exact_tag(key, tag)));
+                let absent = !metadata.as_object().is_some_and(|tags| tags.keys().any(|key| matches_tag(key, tag)));
+                if (value.is_empty() && !absent) || (!value.is_empty() && !already_set) {
+                    add(tag, value, EditKind::Set, limit);
+                }
+            }
+        }
+        ManualEdit::RemoveKeyword { keyword } => {
+            let key = keyword_key(keyword);
+            for tag in KEYWORDS.into_iter().chain([HIERARCHY]) {
+                if tag == KEYWORDS[1] && !embedded { continue; }
+                let mut seen = HashSet::new();
+                for value in tag_values(metadata, tag) {
+                    let leaf = if tag == HIERARCHY { value.rsplit('|').next().unwrap_or(value) } else { value };
+                    if keyword_key(leaf) == key && seen.insert(value) {
+                        if value.contains('\0') { return Err("Kľúčové slovo obsahuje nepovolený znak".into()); }
+                        add(tag, value, EditKind::Remove, usize::MAX);
+                    }
+                }
+            }
+        }
+        ManualEdit::AddKeywords => unreachable!(),
+    }
+    if warn_legacy { result.warnings.push("Existujúce kódovanie IPTC nie je UTF-8. Upraviť možno iba XMP.".into()); }
+    Ok(result)
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Issue { path: String, message: String }
 
 impl Issue {
     fn new(path: &Path, message: String) -> Self { Self { path: path.to_string_lossy().into_owned(), message } }
+
+    fn for_photo(photo: &CatalogPhoto, message: String) -> Self {
+        Self { path: photo.path.clone().unwrap_or_else(|| format!("ID {}", photo.id)), message }
+    }
 }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EditorPhoto {
+    #[serde(flatten)]
+    catalog: CatalogPhoto,
+    file: Option<EditorFile>,
+    reason: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EditorFile {
+    caption: Option<String>,
+    author: Option<String>,
+    keywords: Vec<String>,
+    revision: String,
+}
+
+pub fn editor_photos(photos: Vec<CatalogPhoto>, exif: &ExifTool, formats: &FormatTable) -> Vec<EditorPhoto> {
+    photos.into_iter().map(|catalog| {
+        let file = (|| {
+            let source = catalog.path.as_deref().ok_or("Fotka nemá cestu")?;
+            let job = Job::read(catalog.clone(), PathBuf::from(source), exif, formats, true)?;
+            Ok::<_, String>(EditorFile {
+                caption: text_value(&job.before, DESCRIPTION, false),
+                author: text_value(&job.before, CREATOR, true),
+                keywords: file_keywords(&job.before),
+                revision: job.revision(),
+            })
+        })();
+        match file {
+            Ok(file) => EditorPhoto { catalog, file: Some(file), reason: None },
+            Err(reason) => EditorPhoto { catalog, file: None, reason: Some(reason) },
+        }
+    }).collect()
+}
+
+#[derive(Deserialize)]
+pub struct EditorTarget { pub id: i64, revision: String }
 
 #[derive(Default, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -236,6 +391,57 @@ pub struct WriteSummary {
     warnings: Vec<Issue>,
 }
 
+impl WriteSummary {
+    pub fn catalog_error(&mut self, photo: &CatalogPhoto, message: &str) {
+        self.errors.push(Issue::for_photo(photo, format!("Katalóg: {message}")));
+    }
+}
+
+impl CatalogPhoto {
+    pub fn matching_keyword_ids(&self, keyword: &str) -> impl Iterator<Item = i64> + '_ {
+        let key = keyword_key(keyword);
+        self.keyword_ids.iter().copied().zip(&self.keywords).filter_map(move |(id, path)|
+            path.last().is_some_and(|leaf| keyword_key(leaf) == key).then_some(id))
+    }
+}
+
+pub fn edit_photos(
+    photos: Vec<CatalogPhoto>, targets: Vec<EditorTarget>, action: &ManualEdit,
+    exif: &ExifTool, formats: &FormatTable, mut guard: impl FnMut(i64) -> Result<(), String>,
+    progress: impl Fn(usize, usize),
+) -> (WriteSummary, Vec<CatalogPhoto>) {
+    let mut summary = WriteSummary::default();
+    let mut succeeded = Vec::new();
+    let mut photos: HashMap<_, _> = photos.into_iter().map(|photo| (photo.id, photo)).collect();
+    let total = targets.len();
+    progress(0, total);
+    for (index, target) in targets.into_iter().enumerate() {
+        if let Some(photo) = photos.remove(&target.id) {
+            let apply = || {
+                let source = photo.path.as_deref().ok_or("Fotka nemá cestu")?;
+                let mut job = Job::read(photo.clone(), PathBuf::from(source), exif, formats, true)?;
+                if job.revision() != target.revision { return Err("Súbor alebo metadáta sa zmenili od načítania".into()); }
+                job.merge = manual_merge(&photo, &job.before, job.embedded.is_some(), action)?;
+                let diagnostic = job.write(exif, formats)?;
+                Ok::<_, String>((job, diagnostic))
+            };
+            match guard(photo.id).and_then(|_| apply()) {
+                Ok((job, diagnostic)) => {
+                    if job.merge.edits.is_empty() { summary.unchanged += 1; } else { summary.written += 1; }
+                    summary.warnings.extend(job.merge.warnings.into_iter().chain((!diagnostic.is_empty()).then_some(diagnostic))
+                        .map(|warning| Issue::new(&job.target, warning)));
+                    succeeded.push(photo);
+                }
+                Err(message) => summary.errors.push(Issue::for_photo(&photo, message)),
+            }
+        } else {
+            summary.errors.push(Issue { path: format!("ID {}", target.id), message: "Fotka už nie je dostupná".into() });
+        }
+        progress(index + 1, total);
+    }
+    (summary, succeeded)
+}
+
 struct Job {
     photo: CatalogPhoto,
     source: PathBuf,
@@ -245,11 +451,12 @@ struct Job {
     embedded: Option<&'static str>,
     before: Value,
     merge: Merge,
+    manual: bool,
 }
 
-fn read_target(exif: &ExifTool, target: &Path, target_stamp: Option<&Stamp>, embedded: Option<&str>) -> Result<Value, String> {
+fn read_target(exif: &ExifTool, target: &Path, target_stamp: Option<&Stamp>, embedded: Option<&str>, manual: bool) -> Result<Value, String> {
     if target_stamp.is_none() { return Ok(Value::Null); }
-    let metadata = exif.iptc_metadata(target).map_err(|e| e.to_string())?;
+    let metadata = if manual { exif.iptc_editor_metadata(target) } else { exif.iptc_metadata(target) }.map_err(|e| e.to_string())?;
     let expected = embedded.unwrap_or("XMP");
     if !tag_values(&metadata, "File:FileType").any(|file_type| file_type == expected) {
         return Err(format!("ExifTool nerozpoznal očakávaný typ {expected}"));
@@ -259,6 +466,12 @@ fn read_target(exif: &ExifTool, target: &Path, target_stamp: Option<&Stamp>, emb
 
 impl Job {
     fn prepare(photo: CatalogPhoto, source: PathBuf, exif: &ExifTool, formats: &FormatTable) -> Result<Self, String> {
+        let mut job = Self::read(photo, source, exif, formats, false)?;
+        job.merge = merge(&job.photo, &job.before, job.embedded.is_some());
+        Ok(job)
+    }
+
+    fn read(photo: CatalogPhoto, source: PathBuf, exif: &ExifTool, formats: &FormatTable, manual: bool) -> Result<Self, String> {
         if !source.is_absolute() || !ext(&source).eq_ignore_ascii_case(&photo.ext) {
             return Err("Cesta alebo prípona fotografie sa nezhoduje s katalógom".into());
         }
@@ -269,9 +482,18 @@ impl Job {
         if embedded.is_none() && target_stamp.as_ref().is_some_and(|target| target.canonical == source_stamp.canonical) {
             return Err("XMP sidecar odkazuje na originál".into());
         }
-        let before = read_target(exif, &target, target_stamp.as_ref(), embedded)?;
-        let merge = merge(&photo, &before, embedded.is_some());
-        Ok(Self { photo, source, source_stamp, target, target_stamp, embedded, before, merge })
+        let before = read_target(exif, &target, target_stamp.as_ref(), embedded, manual)?;
+        Ok(Self { photo, source, source_stamp, target, target_stamp, embedded, before, merge: Merge::default(), manual })
+    }
+
+    fn revision(&self) -> String {
+        let mut hash = DefaultHasher::new();
+        self.source.hash(&mut hash);
+        self.source_stamp.hash(&mut hash);
+        self.target.hash(&mut hash);
+        self.target_stamp.hash(&mut hash);
+        self.before.to_string().hash(&mut hash);
+        format!("{:016x}", hash.finish())
     }
 
     fn check_target(&self, formats: &FormatTable) -> Result<(), String> {
@@ -288,24 +510,27 @@ impl Job {
 
     fn write(&self, exif: &ExifTool, formats: &FormatTable) -> Result<String, String> {
         self.check_target(formats)?;
-        let live = read_target(exif, &self.target, self.target_stamp.as_ref(), self.embedded)?;
-        if live != self.before || merge(&self.photo, &live, self.embedded.is_some()) != self.merge {
+        let live = read_target(exif, &self.target, self.target_stamp.as_ref(), self.embedded, self.manual)?;
+        if live != self.before {
             return Err("Metadáta sa od kontroly zmenili".into());
         }
+        if self.merge.edits.is_empty() { return Ok(String::new()); }
         let mut args = Vec::new();
         let mut temp_files = Vec::new();
         if self.merge.edits.iter().any(|edit| edit.tag.starts_with("IPTC:")) {
             args.extend(["-charset".into(), "iptc=UTF8".into(), "-IPTC:CodedCharacterSet=UTF8".into()]);
         }
         for edit in &self.merge.edits {
-            if edit.append {
+            if edit.kind == EditKind::Append {
                 args.extend([format!("-{}-={}", edit.tag, edit.value), format!("-{}+={}", edit.tag, edit.value)]);
-            } else if edit.value.contains('\n') {
+            } else if edit.value.contains(['\r', '\n']) {
                 let temp = TempFile::new(&std::env::temp_dir(), edit.value.as_bytes()).map_err(|e| e.to_string())?;
-                args.push(format!("-{}<={}", edit.tag, temp.0.display()));
+                let operator = if edit.kind == EditKind::Remove { "-<=" } else { "<=" };
+                args.push(format!("-{}{operator}{}", edit.tag, temp.0.display()));
                 temp_files.push(temp);
             } else {
-                args.push(format!("-{}={}", edit.tag, edit.value));
+                let operator = if edit.kind == EditKind::Remove { "-=" } else { "=" };
+                args.push(format!("-{}{operator}{}", edit.tag, edit.value));
             }
         }
         self.check_target(formats)?;
@@ -323,14 +548,29 @@ impl Job {
         if let Some(before) = &self.target_stamp {
             restore_mtime(&self.target, before.modified, &after_stamp)?;
         }
-        let after = read_target(exif, &self.target, Some(&after_stamp), self.embedded)?;
+        let after = read_target(exif, &self.target, Some(&after_stamp), self.embedded, self.manual)?;
         for edit in &self.merge.edits {
-            if !tag_values(&after, edit.tag).any(|value| value.replace("\r\n", "\n").replace('\r', "\n") == edit.value) {
-                return Err(format!("Kontrola po zápise nenašla {}{}", edit.tag, if warning.is_empty() { String::new() } else { format!(" · {warning}") }));
+            let mut values = tag_values(&after, edit.tag).map(|value| value.replace("\r\n", "\n").replace('\r', "\n"));
+            let verified = match edit.kind {
+                EditKind::Remove => tag_values(&after, edit.tag).all(|value| value != edit.value),
+                EditKind::Set if self.manual && edit.value.is_empty() => {
+                    !after.as_object().is_some_and(|tags| tags.keys().any(|key| matches_tag(key, edit.tag)))
+                }
+                EditKind::Set if self.manual => values.next().as_deref() == Some(&edit.value) && values.next().is_none(),
+                _ => values.any(|value| value == edit.value),
+            };
+            if !verified {
+                let error = if self.manual { format!("Kontrola hodnoty {} po zápise zlyhala", edit.tag) }
+                    else { format!("Kontrola po zápise nenašla {}", edit.tag) };
+                return Err(if warning.is_empty() { error } else { format!("{error} · {warning}") });
             }
         }
         for tag in DESCRIPTION.into_iter().chain(CREATOR).chain(KEYWORDS).chain([HIERARCHY]) {
-            if tag_values(&self.before, tag).any(|value| !tag_values(&after, tag).any(|present| present == value)) {
+            if tag_values(&self.before, tag).any(|value| {
+                let replaced = self.manual && self.merge.edits.iter().any(|edit| edit.tag == tag &&
+                    (edit.kind == EditKind::Set || (edit.kind == EditKind::Remove && edit.value == value)));
+                !replaced && !tag_values(&after, tag).any(|present| present == value)
+            }) {
                 return Err(format!("Kontrola po zápise nenašla pôvodnú hodnotu {tag}"));
             }
         }
@@ -535,7 +775,7 @@ mod tests {
     fn photo(path: &Path) -> CatalogPhoto {
         CatalogPhoto { id: 1, path: Some(path.to_string_lossy().into_owned()), ext: ext(path).into(),
             caption: Some("Prvý riadok\nŽlté kľúče".into()), author: Some("Ľuboš".into()),
-            keywords: vec![vec!["Vianoce".into(), "Deti".into()], vec!["deti".into()]] }
+            keywords: vec![vec!["Vianoce".into(), "Deti".into()], vec!["deti".into()]], keyword_ids: vec![1, 2] }
     }
 
     #[test]
@@ -580,6 +820,56 @@ mod tests {
     }
 
     #[cfg(windows)]
+    fn edit_temporary_photo(photo: CatalogPhoto, action: ManualEdit, exif: &ExifTool, formats: &FormatTable) -> WriteSummary {
+        let loaded = editor_photos(vec![photo.clone()], exif, formats).pop().unwrap();
+        let targets = vec![EditorTarget { id: photo.id, revision: loaded.file.unwrap().revision }];
+        let (result, applied) = edit_photos(vec![photo], targets, &action, exif, formats, |_| Ok(()), |_, _| {});
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(applied.len(), 1);
+        result
+    }
+
+    #[test]
+    fn manual_edits_replace_delete_and_remove_only_the_requested_tags() {
+        assert!(serde_json::from_value::<ManualEdit>(json!({"kind":"text", "field":"caption"})).is_err());
+        assert!(serde_json::from_value::<ManualEdit>(json!({"kind":"text", "field":"caption", "value":null})).is_ok());
+        let photo = photo(Path::new("a.jpg"));
+        let metadata = json!({
+            "XMP-dc:Description": "pôvodný",
+            "XMP-dc:Description-fr": "traduction",
+            "IPTC:Caption-Abstract": "starší",
+            "IPTC:CodedCharacterSet": "UTF8",
+            "XMP-dc:Subject": ["DETI", "iné"],
+            "IPTC:Keywords": ["Deti", "iné"],
+            "XMP-lr:HierarchicalSubject": ["Vianoce|deti", "Deti|iné", "Deti"],
+        });
+        assert_eq!(text_value(&metadata, DESCRIPTION, false).as_deref(), Some("pôvodný"));
+        for value in [Some("nový".to_string()), None] {
+            let action = ManualEdit::Text { field: AssetTextField::Caption, value: value.clone() };
+            let result = manual_merge(&photo, &metadata, true, &action).unwrap();
+            assert_eq!(result.edits, DESCRIPTION.map(|tag| Edit {
+                tag, value: value.clone().unwrap_or_default(), kind: EditKind::Set,
+            }));
+        }
+        let remove = ManualEdit::RemoveKeyword { keyword: "dEti".into() };
+        let edit = manual_merge(&photo, &metadata, true, &remove).unwrap();
+        assert_eq!(edit.edits.iter().map(|edit| (edit.tag, edit.value.as_str(), edit.kind)).collect::<Vec<_>>(), [
+            (KEYWORDS[0], "DETI", EditKind::Remove), (KEYWORDS[1], "Deti", EditKind::Remove),
+            (HIERARCHY, "Vianoce|deti", EditKind::Remove), (HIERARCHY, "Deti", EditKind::Remove),
+        ]);
+        assert_eq!(photo.matching_keyword_ids("DETI").collect::<Vec<_>>(), [1, 2]);
+        let legacy = manual_merge(&photo, &json!({"IPTC:Keywords": "Deti", "XMP-dc:Subject": "deti"}), true, &remove).unwrap();
+        assert_eq!(legacy.edits.len(), 1);
+        assert_eq!(legacy.edits[0].tag, KEYWORDS[0]);
+        assert_eq!(legacy.warnings.len(), 1);
+        let long_author = ManualEdit::Text { field: AssetTextField::Author, value: Some("Ž".repeat(20)) };
+        let long = manual_merge(&photo, &Value::Null, true, &long_author).unwrap();
+        assert_eq!(long.edits.len(), 1);
+        assert_eq!(long.edits[0].tag, CREATOR[0]);
+        assert_eq!(long.warnings.len(), 1);
+    }
+
+    #[cfg(windows)]
     #[test]
     fn bundled_exiftool_writes_only_missing_metadata_on_temporary_files() {
         let executable = Path::new(env!("CARGO_MANIFEST_DIR")).join("../tools/exiftool/exiftool.exe");
@@ -588,7 +878,8 @@ mod tests {
         let dir = TempDir::new();
         let jpeg = dir.file("snímka.jpg");
         image::RgbImage::new(16, 16).save(&jpeg).unwrap();
-        exif.write(&jpeg, &["-XMP-dc:Description=Pôvodný popis".into(), "-XMP-dc:Subject=Staré".into()]).unwrap();
+        exif.write(&jpeg, &["-charset".into(), "iptc=UTF8".into(), "-IPTC:CodedCharacterSet=UTF8".into(),
+            "-IPTC:Caption-Abstract=Starší popis".into(), "-XMP-dc:Description=Pôvodný popis".into(), "-XMP-dc:Subject=Staré".into()]).unwrap();
         let tiff = dir.file("snímka.tiff");
         let dng_seed = dir.file("dng-seed.tiff");
         let dng = dir.file("snímka.dng");
@@ -630,6 +921,51 @@ mod tests {
         let before = fs::read(&old_xmp).unwrap();
         assert_eq!(second.execute(&exif, &formats, &AtomicBool::new(false), |_, _| {}).written, 0);
         assert_eq!(fs::read(&old_xmp).unwrap(), before);
+
+        let describe = ManualEdit::Text { field: AssetTextField::Caption, value: Some("Nový popis\nDruhý riadok".into()) };
+        assert_eq!(edit_temporary_photo(photo(&jpeg), describe, &exif, &formats).written, 1);
+        let after = exif.iptc_editor_metadata(&jpeg).unwrap();
+        for tag in DESCRIPTION { assert_eq!(tag_values(&after, tag).next(), Some("Nový popis\nDruhý riadok")); }
+        let creator = ManualEdit::Text { field: AssetTextField::Author, value: Some("Sára".into()) };
+        assert_eq!(edit_temporary_photo(photo(&old_raw), creator, &exif, &formats).written, 1);
+        let side = exif.metadata(&old_xmp).unwrap();
+        assert_eq!(tag_values(&side, CREATOR[0]).next(), Some("Sára"));
+        assert!(side.get("XMP-crs:Exposure2012").is_some());
+        let clear = ManualEdit::Text { field: AssetTextField::Caption, value: None };
+        assert_eq!(edit_temporary_photo(photo(&jpeg), clear, &exif, &formats).written, 1);
+        let after = exif.iptc_editor_metadata(&jpeg).unwrap();
+        for tag in DESCRIPTION { assert!(tag_values(&after, tag).next().is_none()); }
+        let remove = ManualEdit::RemoveKeyword { keyword: "DETI".into() };
+        assert_eq!(edit_temporary_photo(photo(&jpeg), remove, &exif, &formats).written, 1);
+        let after = exif.iptc_editor_metadata(&jpeg).unwrap();
+        assert_eq!(file_keywords(&after), ["Staré"]);
+        assert!(tag_values(&after, HIERARCHY).next().is_none());
+        let mut keyword_photo = photo(&jpeg);
+        keyword_photo.keywords = vec![vec!["007".into()]];
+        assert_eq!(edit_temporary_photo(keyword_photo, ManualEdit::AddKeywords, &exif, &formats).written, 1);
+        let after = exif.iptc_editor_metadata(&jpeg).unwrap();
+        assert!(file_keywords(&after).contains(&"007".into()));
+        assert!(tag_values(&after, DESCRIPTION[0]).next().is_none());
+        for path in [&jpeg, &old_xmp] { assert_eq!(fs::metadata(path).unwrap().modified().unwrap(), mtime); }
+        for raw in [&old_raw, &new_raw] { assert_eq!(fs::read(raw).unwrap(), b"fake RAW"); }
+
+        let manual_raw = dir.file("ručný %d.ARW");
+        let manual_sidecar = manual_raw.with_extension("xmp");
+        fs::write(&manual_raw, b"fake RAW").unwrap();
+        let manual_stamp = stamp(&manual_raw).unwrap();
+        let manual_photo = photo(&manual_raw);
+        let old_revision = editor_photos(vec![manual_photo.clone()], &exif, &formats)
+            .pop().unwrap().file.unwrap().revision;
+        let describe = ManualEdit::Text { field: AssetTextField::Caption, value: Some("Ručne".into()) };
+        assert_eq!(edit_temporary_photo(manual_photo.clone(), describe, &exif, &formats).written, 1);
+        let before = fs::read(&manual_sidecar).unwrap();
+        let clear = ManualEdit::Text { field: AssetTextField::Caption, value: None };
+        let targets = vec![EditorTarget { id: manual_photo.id, revision: old_revision }];
+        let (stale_edit, applied) = edit_photos(vec![manual_photo], targets, &clear, &exif, &formats, |_| Ok(()), |_, _| {});
+        assert_eq!((stale_edit.written, stale_edit.errors.len(), applied.len()), (0, 1, 0));
+        assert_eq!(fs::read(&manual_sidecar).unwrap(), before);
+        assert_eq!(stamp(&manual_raw).unwrap(), manual_stamp);
+        assert_eq!(fs::read(&manual_raw).unwrap(), b"fake RAW");
 
         let fresh = dir.file("pretek.ARW");
         fs::write(&fresh, b"fake RAW").unwrap();

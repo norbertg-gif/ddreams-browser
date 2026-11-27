@@ -24,8 +24,8 @@ import FileOperationDialog from "./components/FileOperationDialog";
 import FileNameDialog from "./components/FileNameDialog";
 import { DockLayoutMenu, DockSections, DockSide, useDockDrag, useDockHosts, useDockLayout, useDockPresence } from "./components/Dock";
 import { patchGroup, showSection } from "./dockLayout";
-import IptcWriteDialog from "./components/IptcWriteDialog";
-import type { Asset, Folder, FormatTable, IptcTextField, Page, View, ViewFilters, ValueCount } from "./types";
+import IptcWriteDialog, { IptcIssues } from "./components/IptcWriteDialog";
+import type { Asset, Folder, FormatTable, IptcEdit, IptcSummary, IptcTarget, IptcTextField, Page, View, ViewFilters, ValueCount } from "./types";
 import { readStored, writeStored } from "./storage";
 import { buildAssetFilter, effectiveViewFilters, readViewSort, sortKeyForView, updateViewSort, type SavedViewSorts } from "./assetFilter";
 import { DEFAULT_THUMBNAIL_INFO, normalizeThumbnailInfo, type ThumbnailInfoConfig } from "./thumbnailInfo";
@@ -48,6 +48,14 @@ type AiSeriesResponse = { groups:{ids:number[];best:number}[]; analyzed:number; 
 
 function slovakItems(count:number){return `${count.toLocaleString("sk-SK")} ${count===1?"položka":count>=2&&count<=4?"položky":"položiek"}`;}
 function dateText(value: string | null | undefined) { return value ? value.replace("T", " ").slice(0, 19) : "—"; }
+
+type AssetEditValues = {
+  changeId: number | null;
+  summary: string;
+  value?: string | null;
+  remappedIds: { oldId: number; newId: number }[];
+  assets: { id: number; rating: number | null; label: string | null; tagged: boolean; editPendingSince: number | null }[];
+};
 
 export default function App() {
   const seriesMenu = useTransientDetails();
@@ -186,6 +194,7 @@ export default function App() {
   const [operationProgress,setOperationProgress]=useState("");
   const [iptcIds, setIptcIds] = useState<number[] | null>(null);
   const [iptcToken, setIptcToken] = useState(0);
+  const [iptcEditIssues, setIptcEditIssues] = useState<IptcSummary | null>(null);
   const [viewer, setViewer] = useState<{ asset: Asset; index: number } | null>(null);
   const [comparison, setComparison] = useState<ComparedPhoto[] | null>(null);
   const closeComparison = useCallback(() => setComparison(null), []);
@@ -451,87 +460,82 @@ export default function App() {
       window.setTimeout(() => setToast(""), 4000);
     }
   };
-  const setAssetValues = useCallback((ids: number[], changes: Record<string, unknown>) => {
-    if (appInfo?.readonly) { setToast("Katalóg je iba na čítanie"); window.setTimeout(() => setToast(""), 2200); return; }
-    if (!ids.length) return;
+  const applyAssetValues = useCallback((result: AssetEditValues, changes: Record<string, unknown>) => {
     const textField: IptcTextField | null = "caption" in changes ? "caption" : "author" in changes ? "author" : null;
     const ratingEdited = "rating" in changes, labelEdited = "label" in changes;
     const taggedEdited = "tagged" in changes, pendingEdited = "editPending" in changes;
+    const patches = new Map<number, AssetValuePatch>(result.assets.map(asset => [asset.id, {
+      id: asset.id, rating: asset.rating, label: asset.label, tagged: Number(asset.tagged),
+      ...(pendingEdited ? { editPendingSince: asset.editPendingSince } : {}),
+      ...(textField ? { [textField]: result.value ?? null } : {}),
+    }]));
+    const remap = new Map(result.remappedIds.map(({ oldId, newId }) => [oldId, newId]));
+    for (const [oldId, newId] of remap) {
+      const patch = patches.get(newId);
+      if (patch) patches.set(oldId, patch);
+    }
+    if (remap.size) {
+      for (const [oldId, newId] of remap) valueAliases.current.set(newId, oldId);
+      setSelectedIds(previous => [...previous].some(id => remap.has(id))
+        ? new Set([...previous].map(id => remap.get(id) ?? id)) : previous);
+      setPrimaryId(id => id == null ? id : remap.get(id) ?? id);
+    }
+    const patchAsset = (asset: Asset) => {
+      const patch = patches.get(asset.id);
+      return patch ? { ...asset, ...patch } : asset;
+    };
+    if (currentViewer.current) {
+      for (const [id, patch] of patches) {
+        viewerValuePatches.current.set(id, { ...viewerValuePatches.current.get(id), ...patch });
+      }
+    }
+    setPrimaryAsset(previous => previous && patchAsset(previous));
+    setViewer(previous => {
+      if (!previous) return previous;
+      const asset = patchAsset(previous.asset);
+      return asset === previous.asset ? previous : { ...previous, asset };
+    });
+    setComparison(current => current?.map(photo => {
+      const asset = patchAsset(photo.asset);
+      return asset === photo.asset ? photo : { ...photo, asset };
+    }) ?? null);
+    const context = valueContext.current;
+    const patch = context.primaryId == null ? undefined : patches.get(context.primaryId);
+    if (patch) {
+      setPrimaryValueEdit(previous => ({
+        patch: {
+          ...(previous?.refreshTick === context.refreshTick && previous.patch.id === patch.id ? previous.patch : {}),
+          ...patch,
+        },
+        refreshTick: context.refreshTick,
+      }));
+    }
+    if (result.changeId != null) {
+      const filter = currentAssetFilter.current;
+      const reloadListing =
+        (ratingEdited && (filter.kind === "rating" || !!filter.ratingMode || filter.sort === "rating")) ||
+        (labelEdited && (filter.kind === "label" || !!filter.labelFilter || filter.sort === "label")) ||
+        (taggedEdited && (filter.taggedOnly || (filter.kind === "special" && filter.value === "tagged"))) ||
+        (pendingEdited && filter.kind === "special" && filter.value === "edit_pending") ||
+        (textField === "caption" && (filter.sort === "caption" || !!filter.query));
+      grid.current?.applyValues(patches, reloadListing);
+      setValueTokens(tokens => ({
+        rating: tokens.rating + Number(ratingEdited || !!remap.size),
+        label: tokens.label + Number(labelEdited || !!remap.size),
+        special: tokens.special + Number(taggedEdited || pendingEdited || !!remap.size),
+      }));
+      if (context.historyOpen) loadRecentChanges();
+    } else {
+      grid.current?.applyValues(patches, false);
+    }
+  }, [loadRecentChanges]);
+  const setAssetValues = useCallback((ids: number[], changes: Record<string, unknown>) => {
+    if (appInfo?.readonly) { setToast("Katalóg je iba na čítanie"); window.setTimeout(() => setToast(""), 2200); return; }
+    if (!ids.length) return;
     const write = async () => {
       try {
-        const result = await invoke<{
-          changeId: number | null;
-          summary: string;
-          value?: string | null;
-          remappedIds: { oldId: number; newId: number }[];
-          assets: { id: number; rating: number | null; label: string | null; tagged: boolean; editPendingSince: number | null }[];
-        }>(textField ? "set_asset_text" : "set_asset_values",
-          textField ? { assetIds: ids, field: textField, value: changes[textField] } : { assetIds: ids, changes });
-        const patches = new Map<number, AssetValuePatch>(result.assets.map(asset => [asset.id, {
-          id: asset.id, rating: asset.rating, label: asset.label, tagged: Number(asset.tagged),
-          ...(pendingEdited ? { editPendingSince: asset.editPendingSince } : {}),
-          ...(textField ? { [textField]: result.value ?? null } : {}),
-        }]));
-        const remap = new Map(result.remappedIds.map(({ oldId, newId }) => [oldId, newId]));
-        for (const [oldId, newId] of remap) {
-          const patch = patches.get(newId);
-          if (patch) patches.set(oldId, patch);
-        }
-        if (remap.size) {
-          for (const [oldId, newId] of remap) valueAliases.current.set(newId, oldId);
-          setSelectedIds(previous => [...previous].some(id => remap.has(id))
-            ? new Set([...previous].map(id => remap.get(id) ?? id)) : previous);
-          setPrimaryId(id => id == null ? id : remap.get(id) ?? id);
-        }
-        const patchAsset = (asset: Asset) => {
-          const patch = patches.get(asset.id);
-          return patch ? { ...asset, ...patch } : asset;
-        };
-        if (currentViewer.current) {
-          for (const [id, patch] of patches) {
-            viewerValuePatches.current.set(id, { ...viewerValuePatches.current.get(id), ...patch });
-          }
-        }
-        setPrimaryAsset(previous => previous && patchAsset(previous));
-        setViewer(previous => {
-          if (!previous) return previous;
-          const asset = patchAsset(previous.asset);
-          return asset === previous.asset ? previous : { ...previous, asset };
-        });
-        setComparison(current => current?.map(photo => {
-          const asset = patchAsset(photo.asset);
-          return asset === photo.asset ? photo : { ...photo, asset };
-        }) ?? null);
-        const context = valueContext.current;
-        const patch = context.primaryId == null ? undefined : patches.get(context.primaryId);
-        if (patch) {
-          setPrimaryValueEdit(previous => ({
-            patch: {
-              ...(previous?.refreshTick === context.refreshTick && previous.patch.id === patch.id ? previous.patch : {}),
-              ...patch,
-            },
-            refreshTick: context.refreshTick,
-          }));
-        }
-        if (result.changeId != null) {
-          const filter = currentAssetFilter.current;
-          const reloadListing =
-            (ratingEdited && (filter.kind === "rating" || !!filter.ratingMode || filter.sort === "rating")) ||
-            (labelEdited && (filter.kind === "label" || !!filter.labelFilter || filter.sort === "label")) ||
-            (taggedEdited && (filter.taggedOnly || (filter.kind === "special" && filter.value === "tagged"))) ||
-            (pendingEdited && filter.kind === "special" && filter.value === "edit_pending") ||
-            (textField === "caption" && (filter.sort === "caption" || !!filter.query));
-          if (textField) setIptcToken(token => token + 1);
-          grid.current?.applyValues(patches, reloadListing);
-          setValueTokens(tokens => ({
-            rating: tokens.rating + Number(ratingEdited || !!remap.size),
-            label: tokens.label + Number(labelEdited || !!remap.size),
-            special: tokens.special + Number(taggedEdited || pendingEdited || !!remap.size),
-          }));
-          if (context.historyOpen) loadRecentChanges();
-        } else {
-          grid.current?.applyValues(patches, false);
-        }
+        const result = await invoke<AssetEditValues>("set_asset_values", { assetIds: ids, changes });
+        applyAssetValues(result, changes);
         setToast(result.summary);
         window.setTimeout(() => setToast(""), 6000);
       } catch (error) {
@@ -542,7 +546,28 @@ export default function App() {
     };
     valueWrites.current = valueWrites.current.then(write);
     return valueWrites.current;
-  }, [appInfo?.readonly, loadRecentChanges]);
+  }, [appInfo?.readonly, applyAssetValues]);
+  const editIptc = useCallback((targets: IptcTarget[], action: IptcEdit) => {
+    const write = async () => {
+      try {
+        const result = await invoke<IptcSummary & { text: AssetEditValues | null; catalogKeywordsChanged: boolean }>(
+          "edit_asset_iptc", { targets, action });
+        if (action.kind === "text" && result.text) applyAssetValues(result.text, { [action.field]: action.value });
+        if (result.catalogKeywordsChanged) refreshAfterWrite();
+        if (result.errors.length || result.warnings.length) setIptcEditIssues(result);
+        setToast("Upravené súbory: " + result.written + ", bez zmeny: " + result.unchanged + ", chyby: " + result.errors.length);
+        window.setTimeout(() => setToast(""), 6000);
+      } catch (error) {
+        setToast(String(error));
+        window.setTimeout(() => setToast(""), 6000);
+      } finally {
+        if (targets.length > 5) setOperationProgress("");
+        setIptcToken(token => token + 1);
+      }
+    };
+    valueWrites.current = valueWrites.current.then(write);
+    return valueWrites.current;
+  }, [applyAssetValues, refreshAfterWrite]);
   const openIptcWrite = async (ids: number[]) => {
     if (appInfo?.readonly || !ids.length) return;
     await valueWrites.current;
@@ -882,7 +907,7 @@ export default function App() {
     <header className="topbar"><div className="top-left"><div className="brand-mark">D</div><div className="brand-title">DDreams <b>browser</b></div><nav className="top-crumbs">{crumbs.map((crumb,i)=><span key={`${crumb}-${i}`} className="crumb-item">{i>0&&<i>›</i>}<button onClick={()=>void openCrumb(i)}>{crumb}</button></span>)}{Object.values(filters).some(Boolean)&&<span className="active-filters">{filters.ratingMode&&`Hodnotenie ${filters.ratingMode} ${filters.ratingValue??""}`} {filters.labelFilter&&`Farebný štítok: ${labelText(filters.labelFilter)}`} {filters.taggedOnly&&"Označené"} {filters.fileGroup&&`Typ: ${filters.fileGroup==="all"?"všetky súbory":filters.fileGroup}`}<button onClick={()=>setFilters({})}>×</button></span>}</nav><span className="count-pill">{slovakItems(total)}</span></div><label className="search-box"><span>⌕</span><input value={query} onChange={e=>setQuery(e.target.value)} placeholder="Filtrovať v zobrazení…"/><kbd>Ctrl+F</kbd></label><div className="top-right"><DockLayoutMenu layout={dockLayout} setLayout={setDockLayout}/><div className="ai-anchor" ref={aiRef}><button className={`ai-chip ai-${aiStatus.state}`} title={!aiStatus.available?aiStatus.reason??"AI modul nie je nainštalovaný":aiStatus.lastError??"AI index a vyhľadávanie"} onClick={()=>setAiOpen(v=>!v)}>{aiChipText}</button>{aiOpen&&<div className="ai-popover"><b>AI katalóg</b><div><span>Zaindexované</span><strong>{aiStatus.indexed.toLocaleString("sk-SK")}</strong></div><div><span>Vo fronte</span><strong>{aiStatus.queued.toLocaleString("sk-SK")}</strong></div><div><span>Čaká na spracovanie</span><strong>{aiStatus.waiting.toLocaleString("sk-SK")}</strong></div><div><span>AI model</span><strong>{({unloaded:"nenačítaný",loading:"načítava sa",ready:"pripravený",error:"chyba"} as Record<string,string>)[aiStatus.modelState]??aiStatus.modelState}</strong></div>{aiStatus.modelState==="unloaded"&&<button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_load_model")}>Spracovať čakajúce fotografie <small>vyžaduje AI model</small></button>}<div><span>Offline</span><strong>{aiStatus.offline.toLocaleString("sk-SK")}</strong></div><div><span>Chyby</span><strong>{aiStatus.failed.toLocaleString("sk-SK")}</strong></div>{aiStatus.lastError&&<small>{aiStatus.lastError}</small>}<button disabled={!aiStatus.available||!aiEnabled||aiStatus.state==="loading"} onClick={()=>void updateAiStatus(aiStatus.state==="paused"?"ai_resume":"ai_pause")}>{aiStatus.state==="paused"?"Pokračovať":"Pozastaviť"}</button><button disabled={!aiStatus.available||!aiEnabled} onClick={()=>void updateAiStatus("ai_reindex")}>Aktualizovať index</button><button onClick={()=>void toggleAi()}>{aiEnabled?"Vypnúť AI":"Zapnúť AI"}</button></div>}</div><div className="history-anchor" ref={historyRef}><button className="catalog-label" title={catalogTooltip} onClick={()=>{setHistoryOpen(v=>!v);loadRecentChanges()}}><span className="status-light"/>{appInfo?.readonly ? "Katalóg iba na čítanie" : "Katalóg"}</button>{historyOpen&&<div className="change-history"><div className="change-history-head"><b>História zmien</b></div>{recentChanges.length?recentChanges.map(change=><div key={change.id}><time>{new Date(change.ts).toLocaleString("sk-SK")}</time><span>{change.summary}</span></div>):<small>Žiadne zmeny</small>}</div>}</div><button className="settings-button" title="Pomocník (F1)" onClick={()=>setHelpOpen(true)}>?</button><button className="settings-button" title="Nastavenia" onClick={()=>setSettingsOpen(true)}>⚙</button></div></header>
     <div className="workspace" inert={!!comparison}>
       <LeftPanel hosts={dockHosts} onNavigate={navigate} activeFolderId={view.kind === "folder" ? view.id ?? null : null} activeFolderIds={view.kind === "folder" ? view.ids : []} activeView={view} calendarRefreshToken={refreshTick + calendarCatalogueTick} refreshToken={treeRefreshTick} refreshPaths={treeRefreshPaths} onFileDrop={dropFiles} onCreateFolder={createFolder} onFolderRule={(path,mode)=>void changeFolderRule(path,mode)} onFolderAction={(action,path)=>void folderAction(action,path)} clipboardPath={folderClipboard?.mode==="move"?folderClipboard.path:null} clipboardAvailable={!!folderClipboard||!!fileClipboard} onToast={message=>{setToast(message);window.setTimeout(()=>setToast(""),3000)}}/>
-      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel iptcToken={iptcToken} onOpenKeywords={openKeywordAssignment} primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
+      <DockSections hosts={dockHosts} setLayout={setDockLayout} controls={dockControls} collapsed={dockLayout.collapsed} setPresence={setDockPresence}><RightPanel iptcToken={iptcToken} onEditIptc={editIptc} onOpenKeywords={openKeywordAssignment} primaryReadId={primaryReadId} selectedReadIds={selectedReadIds} labelCounts={availableLabels} valueTokens={valueTokens} primaryValues={primaryValueEdit?.refreshTick === refreshTick && primaryValueEdit.patch.id === primaryId ? primaryValueEdit.patch : undefined} incomingTools={<IncomingTools folder={incomingFolder} ids={selectedList}
         aiReady={aiReady} aiReason={!aiEnabled?"AI je vypnutá":aiStatus.reason??aiStatus.lastError??"AI sa pripravuje"}
         readOnly={!!appInfo?.readonly} indexRevision={aiStatus.state==="indexing"?0:aiStatus.indexed}
         refreshToken={refreshTick} onMove={path=>void dropFiles(selectedList,path,false)}
@@ -987,6 +1012,16 @@ export default function App() {
         setToast("Zapísané: " + result.written + ", bez zmeny: " + result.unchanged + ", chyby: " + result.errors.length);
         window.setTimeout(() => setToast(""), 8000);
       }} />}
+    {iptcEditIssues && <div className="modal-backdrop">
+      <section className="confirm-dialog iptc-write-dialog" role="dialog" aria-modal="true" aria-label="Výsledok úpravy IPTC"
+        onKeyDown={event => { if (event.key === "Escape") { event.stopPropagation(); setIptcEditIssues(null); } }}>
+        <b>Výsledok úpravy IPTC</b>
+        <p>Upravené súbory: {iptcEditIssues.written} · bez zmeny: {iptcEditIssues.unchanged}</p>
+        <IptcIssues title="Chyby" items={iptcEditIssues.errors} defaultOpen />
+        <IptcIssues title="Upozornenia" items={iptcEditIssues.warnings} defaultOpen />
+        <div className="confirm-actions"><button autoFocus onClick={() => setIptcEditIssues(null)}>Zavrieť</button></div>
+      </section>
+    </div>}
     {thumbnailInfoOpen&&<ThumbnailInfoDialog value={thumbnailInfo} onSave={value=>{setThumbnailInfo(normalizeThumbnailInfo(value));setThumbnailInfoOpen(false);}} onClose={()=>setThumbnailInfoOpen(false)}/> }
     {fileOp&&<FileOperationDialog mode={fileOp.mode} initialPath={view.kind==="folder"?(view.folderPath??""):""} onChoose={path=>void chooseOperationTarget(path)} onClose={()=>setFileOp(null)} onCreate={createFolder}/>}
     {moveWarning&&<div className="modal-backdrop">

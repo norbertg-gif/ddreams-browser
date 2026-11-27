@@ -240,9 +240,20 @@ impl ExifTool {
     }
 
     pub(crate) fn iptc_metadata(&self, path: &Path) -> std::io::Result<Value> {
-        let args = ["-charset", "filename=UTF8", "-j", "-G1:4", "-a", "-s",
+        self.read_iptc_metadata(path, false)
+    }
+
+    pub(crate) fn iptc_editor_metadata(&self, path: &Path) -> std::io::Result<Value> {
+        self.read_iptc_metadata(path, true)
+    }
+
+    fn read_iptc_metadata(&self, path: &Path, text_values: bool) -> std::io::Result<Value> {
+        let mut args = ["-charset", "filename=UTF8", "-j", "-G1:4", "-a", "-s",
             "-FileType", "-IPTC:all", "-XMP-dc:all", "-XMP-lr:all"]
-            .into_iter().map(str::to_owned).chain([path.to_string_lossy().into_owned()]).collect::<Vec<_>>();
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        // Keep numeric-looking text (for example keyword "007") as a string.
+        if text_values { args.extend(["-api".into(), "StructFormat=JSONQ".into()]); }
+        args.push(path.to_string_lossy().into_owned());
         let (data, diagnostics, status) = self.with_process(|process| process.request_with_status(&args, REQUEST_TIMEOUT))?;
         if status != 0 { return Err(io_error(std::io::ErrorKind::InvalidData, &diagnostics)); }
         let json: Vec<Value> = serde_json::from_slice(&data)?;

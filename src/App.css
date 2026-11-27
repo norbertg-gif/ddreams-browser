@@ -453,9 +453,13 @@ input[type=checkbox]{accent-color:var(--accent)}
 .iptc-editor label{display:grid;gap:3px}
 .iptc-editor input,.iptc-editor textarea{width:100%;min-width:0;padding:4px 6px;background:var(--bg);border:1px solid var(--line);border-radius:4px;color:var(--text)}
 .iptc-editor textarea{resize:vertical}
+.iptc-editor .iptc-unwritten-value{color:var(--muted);font-style:italic}
+.iptc-catalog-hint{white-space:pre-wrap;overflow-wrap:anywhere}
 .iptc-keywords{display:grid;grid-template-columns:1fr auto;align-items:center;gap:4px}
-.iptc-keywords div{grid-column:1/-1;display:flex;flex-wrap:wrap;gap:4px}
-.iptc-keywords div span{max-width:100%;overflow-wrap:anywhere;padding:1px 5px;border-radius:4px;background:var(--select)}
+.iptc-keywords div{grid-column:1/-1;display:flex;align-items:center;flex-wrap:wrap;gap:4px}
+.iptc-keywords div span{max-width:100%;overflow-wrap:anywhere;padding:1px 5px;border:1px solid transparent;border-radius:4px;background:var(--select)}
+.iptc-keywords div span.iptc-unwritten-chip{background:transparent;border-color:var(--line)}
+.iptc-keywords div span button{padding:0 3px;margin-left:3px}
 .iptc-write-dialog{max-width:min(700px,90vw);max-height:85vh;overflow:auto}
 .iptc-write-warning{font-weight:600}
 .iptc-issues ul{max-height:180px;overflow:auto;overflow-wrap:anywhere}

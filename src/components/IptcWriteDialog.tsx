@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import type { IptcIssue, IptcSummary } from "../types";
 
-type Issue = { path: string; message: string };
 type Plan = {
   id: number;
   files: number;
@@ -11,12 +11,11 @@ type Plan = {
   description: number;
   creator: number;
   keywords: number;
-  errors: Issue[];
-  warnings: Issue[];
+  errors: IptcIssue[];
+  warnings: IptcIssue[];
 };
-type Result = { written: number; unchanged: number; cancelled: number; errors: Issue[]; warnings: Issue[] };
 
-function Issues({ title, items, defaultOpen = false }: { title: string; items: Issue[]; defaultOpen?: boolean }) {
+export function IptcIssues({ title, items, defaultOpen = false }: { title: string; items: IptcIssue[]; defaultOpen?: boolean }) {
   if (!items.length) return null;
   return <details className="iptc-issues" open={defaultOpen || undefined}>
     <summary>{title} ({items.length})</summary>
@@ -28,10 +27,10 @@ export default function IptcWriteDialog({ ids, progress, onClose, onDone }: {
   ids: number[];
   progress: string;
   onClose: () => void;
-  onDone: (result: Result) => void;
+  onDone: (result: IptcSummary) => void;
 }) {
   const [plan, setPlan] = useState<Plan>();
-  const [result, setResult] = useState<Result>();
+  const [result, setResult] = useState<IptcSummary>();
   const [error, setError] = useState("");
   const [running, setRunning] = useState(false);
   const cancelRequested = useRef(false);
@@ -57,7 +56,7 @@ export default function IptcWriteDialog({ ids, progress, onClose, onDone }: {
     busy.current = true;
     setRunning(true);
     try {
-      const value = await invoke<Result>("execute_iptc_write", { planId: plan.id });
+      const value = await invoke<IptcSummary>("execute_iptc_write", { planId: plan.id });
       setResult(value);
       onDone(value);
     } catch (reason) {
@@ -90,15 +89,15 @@ export default function IptcWriteDialog({ ids, progress, onClose, onDone }: {
         {!!plan.sidecar && <p>Nový sidecar: <code>&lt;názov&gt;.xmp</code>. Použije sa aj existujúci <code>&lt;názov&gt;.&lt;prípona&gt;.xmp</code>.</p>}
         <p>Doplní sa popis: {plan.description} · autor: {plan.creator} · nové kľúčové slová: {plan.keywords}</p>
         <p className="iptc-write-warning">Zapisuje sa priamo do súborov, bez zálohy. Existujúce hodnoty v súboroch sa neprepíšu, len doplnia.</p>
-        <Issues title="Chyby pri kontrole" items={plan.errors} defaultOpen />
-        <Issues title="Upozornenia" items={plan.warnings} />
+        <IptcIssues title="Chyby pri kontrole" items={plan.errors} defaultOpen />
+        <IptcIssues title="Upozornenia" items={plan.warnings} />
       </>}
       {running && <p role="status">{cancelling ? "Zastavím po dokončení aktuálneho súboru…" : progress || "Zapisujem IPTC…"}</p>}
       {result && <>
         <p role="status">Zapísané: {result.written}, bez zmeny: {result.unchanged}, chyby: {result.errors.length}</p>
         {!!result.cancelled && <p>Zrušené pred zápisom: {result.cancelled}</p>}
-        <Issues title="Chyby" items={result.errors} defaultOpen />
-        <Issues title="Upozornenia" items={result.warnings} />
+        <IptcIssues title="Chyby" items={result.errors} defaultOpen />
+        <IptcIssues title="Upozornenia" items={result.warnings} />
       </>}
       {error && <p role="alert">{error}</p>}
       <div className="confirm-actions">

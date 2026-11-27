@@ -51,6 +51,28 @@ pub struct SetAssetValuesResult {
 #[serde(rename_all = "camelCase")]
 pub enum AssetTextField { Caption, Author }
 
+impl AssetTextField {
+    fn settings(self) -> (&'static str, &'static str, usize) {
+        match self {
+            Self::Caption => ("caption", "Popis", 2000),
+            Self::Author => ("author", "Autor", 200),
+        }
+    }
+
+    pub(crate) fn normalize(self, value: Option<String>) -> Result<Option<String>, String> {
+        let (column, label, limit) = self.settings();
+        let value = value.map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
+            .filter(|value| !value.trim().is_empty());
+        if let Some(value) = &value {
+            if value.chars().count() > limit { return Err(format!("{label} môže mať najviac {limit} znakov")); }
+            if value.contains('\0') || (column == "author" && value.contains('\n')) {
+                return Err(format!("{label} obsahuje nepovolený znak"));
+            }
+        }
+        Ok(value)
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetAssetTextResult {
@@ -423,18 +445,8 @@ impl CatalogWriter {
 
     pub fn set_asset_text(&self, asset_ids: &[i64], listed: &[ListedAsset], field: AssetTextField, value: Option<String>) -> Result<SetAssetTextResult, String> {
         self.require_write()?;
-        let (column, label, limit) = match field {
-            AssetTextField::Caption => ("caption", "Popis", 2000),
-            AssetTextField::Author => ("author", "Autor", 200),
-        };
-        let value = value.map(|value| value.replace("\r\n", "\n").replace('\r', "\n"))
-            .filter(|value| !value.trim().is_empty());
-        if let Some(value) = &value {
-            if value.chars().count() > limit { return Err(format!("{label} môže mať najviac {limit} znakov")); }
-            if value.contains('\0') || (column == "author" && value.contains('\n')) {
-                return Err(format!("{label} obsahuje nepovolený znak"));
-            }
-        }
+        let (column, label, _) = field.settings();
+        let value = field.normalize(value)?;
         let mut connection = self.db.lock().map_err(|_| "catalog lock poisoned")?;
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e| e.to_string())?;
         self.rules.guard(&tx, asset_ids, listed)?;
@@ -448,6 +460,12 @@ impl CatalogWriter {
         let change_id = if changed { record_change(&tx, "set_asset_text", &summary)? } else { None };
         tx.commit().map_err(|e| e.to_string())?;
         Ok(SetAssetTextResult { result: SetAssetValuesResult { change_id, summary, remapped_ids, assets }, value })
+    }
+
+    pub(crate) fn check_iptc_edit(&self, id: i64, listed: &[ListedAsset]) -> Result<(), String> {
+        self.require_write()?;
+        let conn = self.db.lock().map_err(|_| "catalog lock poisoned")?;
+        self.rules.guard(&conn, &[id], listed)
     }
 
     pub fn set_asset_categories(&self, asset_ids: &[i64], listed_assets: &[ListedAsset], category_id: i64, assign: bool) -> Result<SetAssetCategoriesResult, String> {

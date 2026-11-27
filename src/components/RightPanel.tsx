@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type DragEvent as ReactDragEvent,
   type KeyboardEvent as ReactKeyboardEvent, type ReactElement, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import type { AssetQuality, CatalogAssetLinks, CatalogIptc, IptcTextField, Metadata, MetadataRow, ValueCount, View } from "../types";
+import type { AssetQuality, CatalogAssetLinks, IptcEdit, IptcPhoto, IptcTarget, IptcTextField, Metadata, MetadataRow, ValueCount, View } from "../types";
 import { labelColor, labelText, type AssetValuePatch } from "./AssetGrid";
 import { readStored, writeStored } from "../storage";
 import { propertySection } from "../dockLayout";
@@ -13,8 +13,8 @@ import { fetchFaceThumbs, type AssetColorInfo, type AiSuggestion, type CategoryM
   type FaceInfo, type FacePerson, type FaceStatus, type KeywordMutation } from "./rightPanelData";
 import { FACE_OVERLAY_REFRESH } from "./FaceOverlay";
 
-type Props = { iptcToken: number; onOpenKeywords: () => void; primaryReadId: number | null; selectedReadIds: number[]; labelCounts: ValueCount[]; primaryValues?: AssetValuePatch; valueTokens: CatalogValueTokens; incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
-function useRightPanelModel({ iptcToken, onOpenKeywords, primaryReadId, selectedReadIds, labelCounts, primaryValues, valueTokens, incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
+type Props = { iptcToken: number; onEditIptc: (targets: IptcTarget[], action: IptcEdit) => Promise<void>; onOpenKeywords: () => void; primaryReadId: number | null; selectedReadIds: number[]; labelCounts: ValueCount[]; primaryValues?: AssetValuePatch; valueTokens: CatalogValueTokens; incomingTools?: ReactNode; thumbEpoch?: number; catalogReady?: boolean; activeColors?: string; activeQuality?: string; primaryId: number | null; selectedIds: number[]; includeChildren: boolean; onIncludeChildrenChange: (value: boolean) => void; onNavigate: (view: View) => void; onSetValues:(ids:number[],changes:Record<string,unknown>)=>void; onSetColors:(ids:number[],color:string,state:boolean|null)=>void; onSetCategory:(ids:number[],categoryId:number,assign:boolean)=>void|Promise<boolean>; onCategoryChanged:(result:CategoryMutation,deleted:boolean)=>void; onRefresh:()=>void; onClusterNotice:(message:string)=>void; onCategoryError:(error:unknown)=>void; onSetKeyword:(ids:number[],keywordId:number,assign:boolean)=>Promise<boolean>; onCreateAssignKeyword:(ids:number[],parentId:number|null,name:string)=>void; onKeywordChanged:(result:KeywordMutation,deleted:boolean)=>void; readOnly:boolean; refreshToken: number; catalogRefreshToken?: number; colorToken?: number;aiAvailable:boolean;aiReady:boolean;aiReason:string };
+function useRightPanelModel({ iptcToken, onEditIptc, onOpenKeywords, primaryReadId, selectedReadIds, labelCounts, primaryValues, valueTokens, incomingTools, thumbEpoch = 0, catalogReady = true, activeColors = "", activeQuality = "", primaryId, selectedIds, includeChildren, onIncludeChildrenChange, onNavigate, onSetValues, onSetColors, onSetCategory, onCategoryChanged, onRefresh, onClusterNotice, onSetKeyword, onCreateAssignKeyword, onKeywordChanged, onCategoryError, readOnly, refreshToken, catalogRefreshToken = 0, colorToken = 0,aiAvailable,aiReady,aiReason }: Props) {
   const [loadedMetadata, setMetadata] = useState<Metadata | null>(null);
   const metadata = useMemo(() => {
     if (!loadedMetadata || !primaryValues || (loadedMetadata.asset.id !== primaryValues.id && loadedMetadata.asset.id !== primaryReadId)) return loadedMetadata;
@@ -110,7 +110,8 @@ function useRightPanelModel({ iptcToken, onOpenKeywords, primaryReadId, selected
   const dragRow=useRef<MetadataRow|null>(null);
   const [dropMark,setDropMark]=useState<{key:string;after:boolean}|null>(null);
   const groups = useMemo(() => {
-    const rows = orderRows(metadata?.rows ?? []);
+    const rows = orderRows((metadata?.rows ?? []).filter(row => row.group !== "IPTC" ||
+      !["Popis", "Autor", "Kľúčové slová", "Hierarchia kľúčových slov"].includes(row.name)));
     const fixed = ["IPTC", "EXIF", "Katalóg"];
     const extra = [...new Set(rows.map(row => row.group).filter(name => !fixed.includes(name)))].sort((a,b) => {
       if (a === "Všetky metadáta") return 1; if (b === "Všetky metadáta") return -1; return a.localeCompare(b);
@@ -244,7 +245,7 @@ function useRightPanelModel({ iptcToken, onOpenKeywords, primaryReadId, selected
     </div></DockChrome>
       {groups.map(group => <MetadataGroup key={group.name} group={group}
         editor={group.name === "IPTC" && <IptcEditor ids={assignedAssetIds} token={iptcToken} refreshToken={refreshToken}
-          readOnly={readOnly} onOpenKeywords={onOpenKeywords} onSave={(ids, field, value) => onSetValues(ids, { [field]: value })} />} />)}
+          readOnly={readOnly} onOpenKeywords={onOpenKeywords} onEdit={onEditIptc} />} />)}
       <FacesSection/>
       <DockChrome id="propertiesBottom"><div className="dock-copy-controls" {...propertyEvents}><div className="copy-controls">{selectedRows.length > 0 && <button title="Zrušiť všetky zaškrtnutia" onClick={() => setSelectedRows([])}>✕</button>}<span className="copy-label">Kopírovať{selectedRows.length ? ` (${selectedRows.length})` : ""}:</span><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje zaškrtnuté riadky ako „Názov: hodnota“ (Ctrl+C)" onClick={() => void copy("selected")}>S popisom</button><button disabled={!metadata || selectedRows.length === 0} title="Skopíruje len hodnoty zaškrtnutých riadkov" onClick={() => void copy("values")}>Bez popisu</button><button disabled={!metadata} title="Ďalšie možnosti" onClick={() => setCopyMenu(v => !v)}>▾</button>
         {copyMenu && <div className="copy-menu">{groups.map(group=><button key={group.name} onClick={() => void copy("section", group.name)}>Kopírovať celú sekciu {group.name}</button>)}{Object.keys(rowOrder).length>0&&<button onClick={()=>{setRowOrder({});setCopyMenu(false)}}>Obnoviť pôvodné poradie riadkov</button>}</div>}
@@ -262,41 +263,108 @@ export default function RightPanel(props: Parameters<typeof useRightPanelModel>[
   return <RightSectionContext.Provider value={{ properties: sections }}>{content}</RightSectionContext.Provider>;
 }
 
-function IptcEditor({ ids, token, refreshToken, readOnly, onOpenKeywords, onSave }: {
+const IPTC_AUTO_LOAD_LIMIT = 50;
+const UNWRITTEN_IPTC ="Hodnota je len v katalógu. Zapíš ju úpravou poľa alebo cez Zapísať IPTC do súborov…";
+
+function IptcEditor({ ids, token, refreshToken, readOnly, onOpenKeywords, onEdit }: {
   ids: number[]; token: number; refreshToken: number; readOnly: boolean; onOpenKeywords: () => void;
-  onSave: (ids: number[], field: IptcTextField, value: string | null) => void;
+  onEdit: (targets: IptcTarget[], action: IptcEdit) => Promise<void>;
 }) {
   const key = ids.join(",");
-  const [data, setData] = useState<{ key: string; photos: CatalogIptc[] }>();
+  const revision = token + ":" + refreshToken;
+  const [data, setData] = useState<{ key: string; revision: string; photos: IptcPhoto[]; error?: string }>();
+  const [writing, setWriting] = useState(false);
+  const busy = useRef(false);
+  // Reading many files ties up the shared ExifTool process, so large selections load on request.
+  const [loadKey, setLoadKey] = useState<string | null>(null);
+  const deferred = ids.length > IPTC_AUTO_LOAD_LIMIT && loadKey !== key;
   useEffect(() => {
-    if (!key) return;
+    if (!key || deferred) return;
     let active = true;
-    void invoke<CatalogIptc[]>("get_asset_iptc", { assetIds: key.split(",").map(Number) }).then(photos => {
-      if (active) setData({ key, photos });
-    }).catch(() => { if (active) setData(undefined); });
-    return () => { active = false; };
-  }, [key, token, refreshToken]);
-  const photos = data?.key === key ? data.photos : [];
-  if (!photos.length) return null;
-  const targets = photos.map(photo => photo.id);
-  const keywords = [...new Set(photos.flatMap(photo => photo.keywords.map(path => path.join(" › "))))];
-  return <div className="iptc-editor" key={key}>
-    <small>Hodnoty v katalógu</small>
+    const timer = window.setTimeout(() => {
+      void invoke<IptcPhoto[]>("get_asset_iptc", { assetIds: key.split(",").map(Number) }).then(photos => {
+        if (active) setData({ key, revision, photos });
+      }).catch(error => { if (active) setData({ key, revision, photos: [], error: String(error) }); });
+    }, 120);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [key, revision, deferred]);
+  if (!key) return null;
+  if (deferred) return <div className="iptc-editor">
+    <button type="button" onClick={() => setLoadKey(key)}
+      title="Pri veľkom výbere sa IPTC zo súborov nenačítava automaticky, aby nebrzdilo prácu.">
+      Načítať IPTC zo súborov ({ids.length})
+    </button>
+  </div>;
+  const current = data?.key === key ? data : undefined;
+  const photos = current?.photos ?? [];
+  const loading = current?.revision !== revision;
+  const unavailable = photos.find(photo => !photo.file);
+  const reason = readOnly ? "Katalóg je iba na čítanie"
+    : writing ? "Upravujem IPTC…" : loading ? "Načítavam IPTC…"
+    : unavailable && (unavailable.reason || "Súbor alebo jeho metadáta nie sú dostupné");
+  if (!photos.length) return <div className="iptc-editor">
+    {loading && <small role="status">Načítavam IPTC…</small>}
+    {current?.error && <small role="alert">{current.error}</small>}
+  </div>;
+  const submit = async (action: IptcEdit) => {
+    if (busy.current || reason) return;
+    const targets = photos.flatMap(photo => photo.file ? [{ id: photo.id, revision: photo.file.revision }] : []);
+    if (targets.length !== photos.length) return;
+    busy.current = true;
+    setWriting(true);
+    try { await onEdit(targets, action); }
+    finally { busy.current = false; setWriting(false); }
+  };
+  const fileKeywords = new Map<string, string>();
+  const unwritten = new Map<string, { name: string; paths: Set<string> }>();
+  const keywordKey = (word: string) => word.trim().toLowerCase();
+  for (const photo of photos) {
+    if (!photo.file) continue;
+    const current = new Set(photo.file.keywords.map(keywordKey));
+    for (const word of photo.file.keywords) if (!fileKeywords.has(keywordKey(word))) fileKeywords.set(keywordKey(word), word);
+    for (const path of photo.keywords) {
+      const name = path[path.length - 1];
+      if (!name || current.has(keywordKey(name))) continue;
+      const leaf = keywordKey(name);
+      const chip = unwritten.get(leaf) ?? { name, paths: new Set<string>() };
+      chip.paths.add(path.join(" › "));
+      unwritten.set(leaf, chip);
+    }
+  }
+  return <div className="iptc-editor">
     {(["caption", "author"] as const).map(field => {
-      const initial = photos[0][field] ?? "";
-      const mixed = photos.some(photo => (photo[field] ?? "") !== initial);
-      return <IptcField key={field} field={field} value={mixed ? "" : initial} mixed={mixed} readOnly={readOnly}
-        onSave={value => onSave(targets, field, value)} />;
+      const fileValue = photos[0].file?.[field] ?? null;
+      const catalogValue = photos[0][field];
+      const shown = fileValue ?? catalogValue ?? "";
+      const mixed = photos.some(photo => (photo.file?.[field] ?? null) !== fileValue ||
+        (photo.file?.[field] ?? photo[field] ?? "") !== shown);
+      const catalogOnly = !mixed && !!shown && fileValue == null && photos.every(photo => photo.file);
+      const differs = photos.some(photo => photo.file?.[field] != null && photo[field] != null && photo.file[field] !== photo[field]);
+      const catalogHint = differs ? (photos.some(photo => photo[field] !== catalogValue)
+        ? "(rôzne hodnoty)" : catalogValue ?? "—") : null;
+      return <IptcField key={key + ":" + revision + ":" + field} field={field} value={mixed ? "" : shown}
+        mixed={mixed} catalogOnly={catalogOnly} catalogHint={catalogHint} readOnlyReason={reason}
+        onSave={value => void submit({ kind: "text", field, value })} />;
     })}
-    <div className="iptc-keywords">
+    <div className="iptc-keywords" title={reason ?? undefined}>
       <span>Kľúčové slová</span><button type="button" title="Otvoriť priraďovanie kľúčových slov" onClick={onOpenKeywords}>…</button>
-      <div>{keywords.length ? keywords.map(keyword => <span key={keyword} title={keyword}>{keyword}</span>) : "—"}</div>
+      <div>
+        {[...fileKeywords].map(([key, keyword]) => <span key={key}>{keyword}<button type="button" disabled={!!reason}
+          aria-label={"Odobrať kľúčové slovo " + keyword} onClick={() => void submit({ kind: "removeKeyword", keyword })}>×</button></span>)}
+        {[...unwritten].map(([key, chip]) => <span key={"catalog:" + key} className="iptc-unwritten-chip"
+          title={[...chip.paths, UNWRITTEN_IPTC].join("\n")}>{chip.name} <small>nezapísané</small></span>)}
+        {!fileKeywords.size && !unwritten.size && "—"}
+        {!!unwritten.size && <button type="button" disabled={!!reason} onClick={() => void submit({ kind: "addKeywords" })}>
+          Zapísať do súboru
+        </button>}
+      </div>
     </div>
   </div>;
 }
 
-function IptcField({ field, value, mixed, readOnly, onSave }: {
-  field: IptcTextField; value: string; mixed: boolean; readOnly: boolean; onSave: (value: string | null) => void;
+function IptcField({ field, value, mixed, catalogOnly, catalogHint, readOnlyReason, onSave }: {
+  field: IptcTextField; value: string; mixed: boolean; catalogOnly: boolean; catalogHint: string | null;
+  readOnlyReason?: string | null; onSave: (value: string | null) => void;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
   const edited = useRef<string | null>(null);
@@ -304,12 +372,14 @@ function IptcField({ field, value, mixed, readOnly, onSave }: {
     const next = edited.current;
     edited.current = null;
     setDraft(null);
-    if (next == null || (!mixed && next === value)) return;
+    if (readOnlyReason || next == null || (!mixed && !catalogOnly && catalogHint == null && next === value)) return;
     onSave(next.trim() ? next : null);
   };
   const caption = field === "caption";
   const attrs = {
-    value: draft ?? value, readOnly, placeholder: mixed ? "(rôzne hodnoty)" : undefined,
+    value: draft ?? value, readOnly: !!readOnlyReason, placeholder: mixed ? "(rôzne hodnoty)" : undefined,
+    title: readOnlyReason ?? (catalogOnly ? UNWRITTEN_IPTC : undefined),
+    className: catalogOnly && draft == null ? "iptc-unwritten-value" : undefined,
     maxLength: caption ? 2000 : 200,
     onChange: (event: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => {
       edited.current = event.currentTarget.value;
@@ -330,7 +400,11 @@ function IptcField({ field, value, mixed, readOnly, onSave }: {
       }
     },
   };
-  return <label>{caption ? "Popis" : "Autor"}{caption ? <textarea rows={3} {...attrs} /> : <input {...attrs} />}</label>;
+  return <label>
+    <span>{caption ? "Popis" : "Autor"} {catalogOnly && <small title={UNWRITTEN_IPTC}>nezapísané</small>}</span>
+    {caption ? <textarea rows={3} {...attrs} /> : <input {...attrs} />}
+    {catalogHint != null && <small className="iptc-catalog-hint">v katalógu: {catalogHint}</small>}
+  </label>;
 }
 
 function MetadataGroup({ group, editor }: { group: { name: string; rows: MetadataRow[] }; editor?: ReactNode }): ReactElement {

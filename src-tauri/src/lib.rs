@@ -242,6 +242,7 @@ pub fn run() {
             commands::set_asset_values,
             commands::set_asset_text,
             commands::get_asset_iptc,
+            commands::edit_asset_iptc,
             commands::plan_iptc_write,
             commands::execute_iptc_write,
             commands::cancel_iptc_write,

@@ -24,7 +24,19 @@ export type MetadataRow = { group: string; subgroup: string; name: string; value
 export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
 export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };
 export type IptcTextField = "caption" | "author";
-export type CatalogIptc = { id: number; caption: string | null; author: string | null; keywords: string[][] };
+export type IptcPhoto = {
+  id: number;
+  caption: string | null;
+  author: string | null;
+  keywords: string[][];
+  file: { caption: string | null; author: string | null; keywords: string[]; revision: string } | null;
+  reason: string | null;
+};
+export type IptcTarget = { id: number; revision: string };
+export type IptcEdit = { kind: "text"; field: IptcTextField; value: string | null }
+  | { kind: "removeKeyword"; keyword: string } | { kind: "addKeywords" };
+export type IptcIssue = { path: string; message: string };
+export type IptcSummary = { written: number; unchanged: number; cancelled: number; errors: IptcIssue[]; warnings: IptcIssue[] };
 
 export type FileFormat = { ext: string; group: "image" | "raw" | "video" | "document" | "other"; name: string; hidden?: boolean };
 export type FormatTable = { version: number; formats: FileFormat[] };
