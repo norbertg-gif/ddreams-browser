@@ -46,11 +46,17 @@ npx tauri build --no-bundle                     # ~7 min, vytvorí src-tauri\tar
 powershell -ExecutionPolicy Bypass -File tools\setup-python.ps1    # venv C:\DDreams\modules\python z ai\requirements.txt
 C:\DDreams\modules\python\Scripts\python.exe -m pip install --target C:\DDreams\modules\ai\pylibs -r ai\requirements-faces.txt
 C:\DDreams\modules\python\Scripts\python.exe tools\prepare_models.py --modules C:\DDreams\modules
-powershell -ExecutionPolicy Bypass -File tools\publish.ps1 -Catalog <cesta k catalog.sqlite>
+powershell -ExecutionPolicy Bypass -File tools\publish.ps1
 ```
 
 `publish.ps1` skopíruje aplikáciu, AI server, RAW plugin a ExifTool do `C:\DDreams`
-(`-InstallRoot` mení cieľ). Katalóg skopíruje iba pri prvej inštalácii, existujúci nikdy neprepíše.
+(`-InstallRoot` mení cieľ). Pri prvej inštalácii vytvorí prázdny katalóg (`tools\create_catalog.py`:
+bez priečinkov a kľúčových slov, len vzorové kategórie Ľudia › Rodina a Miesta). S `-Catalog <cesta>`
+namiesto toho skopíruje existujúci katalóg, napríklad z importu ACDSee. Existujúci katalóg nikdy neprepíše.
+
+Fotky sa do katalógu pridávajú priebežne: stačí otvoriť priečinok a fotke priradiť hodnotenie,
+kategóriu alebo kľúčové slovo. Celý priečinok zaradíš ako „zahrnutý“ v Nastaveniach alebo pravým klikom
+v strome priečinkov: jeho nové fotky sa potom pridajú do katalógu pri každom otvorení.
 Ďalšie nasadenia: zavrieť `C:\DDreams\ddreams-browser.exe`, postaviť a znova spustiť `publish.ps1`.
 
 Štruktúra inštalácie:
@@ -84,6 +90,8 @@ Importer používa iba štandardnú knižnicu Pythonu a číta **kópiu** datab�
 python tools\import_acdsee\import_acdsee.py --source <kópia databázy ACDSee> --out .local\catalog.sqlite
 python ai\import_acdsee_faces.py --help         # import tvárí a mien z tej istej kópie
 ```
+
+Takto vytvorený katalóg sa pri prvej inštalácii odovzdá cez `publish.ps1 -Catalog <cesta>`.
 
 ## Vývoj
 

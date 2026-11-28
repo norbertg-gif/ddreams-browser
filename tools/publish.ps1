@@ -26,10 +26,12 @@ $SourceExifTool = Join-Path $ExifToolSource 'exiftool.exe'
 if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) { throw "ExifTool source not found: $SourceExifTool" }
 $catalogExists = Test-Path -LiteralPath $InstallCatalog -PathType Leaf
 if ($catalogExists -and $Catalog) { throw "Refusing to overwrite existing DDreams catalog: $InstallCatalog" }
-if (-not $catalogExists) {
-    if (-not $Catalog) { throw 'First install requires -Catalog <path>.' }
-    if (-not (Test-Path -LiteralPath $Catalog -PathType Leaf)) { throw "Catalog source not found: $Catalog" }
+if (-not $catalogExists -and $Catalog -and -not (Test-Path -LiteralPath $Catalog -PathType Leaf)) {
+    throw "Catalog source not found: $Catalog"
 }
+# The Python environment is created by tools\setup-python.ps1.
+$InstallPython = Join-Path $ModulesDir 'python\Scripts\python.exe'
+if (-not (Test-Path -LiteralPath $InstallPython -PathType Leaf)) { throw "Python environment not found: $InstallPython. Run tools\setup-python.ps1 first." }
 
 $runningInstall = Get-Process -Name 'ddreams-browser' -ErrorAction SilentlyContinue | Where-Object {
     try { $_.Path -and ([IO.Path]::GetFullPath($_.Path) -ieq [IO.Path]::GetFullPath($InstallExe)) } catch { $false }
@@ -44,8 +46,14 @@ Copy-Item -LiteralPath $ReleaseExe -Destination $InstallExe -Force
 Write-Output "Copied app: $InstallExe"
 
 if (-not (Test-Path -LiteralPath $InstallCatalog -PathType Leaf)) {
-    Copy-Item -LiteralPath $Catalog -Destination $InstallCatalog
-    Write-Output "Installed catalog: $InstallCatalog"
+    if ($Catalog) {
+        Copy-Item -LiteralPath $Catalog -Destination $InstallCatalog
+        Write-Output "Installed catalog: $InstallCatalog"
+    } else {
+        # No catalog given on the first install: start with an empty one.
+        & $InstallPython -I (Join-Path $RepoRoot 'tools\create_catalog.py') --out $InstallCatalog
+        if ($LASTEXITCODE -ne 0) { throw "Creating an empty catalog failed: $InstallCatalog" }
+    }
 } else {
     Write-Output "Preserved existing catalog: $InstallCatalog"
 }
@@ -64,12 +72,9 @@ New-Item -ItemType Directory -Path $InstallRawDir -Force | Out-Null
 Copy-Item -LiteralPath $SourceRawScript -Destination (Join-Path $InstallRawDir 'ddreams_raw.py') -Force
 Write-Output "Copied RAW plugin: $(Join-Path $InstallRawDir 'ddreams_raw.py')"
 $AiConfig = Join-Path $InstallAiDir 'ai.json'
-# The Python environment is created by tools\setup-python.ps1. An ai.json that still points
-# outside the installation at the old shared environment is switched over.
-$InstallPython = Join-Path $ModulesDir 'python\Scripts\python.exe'
+# An ai.json that still points outside the installation at the old shared environment is switched over.
 # Relative to modules\ai, so the whole installation folder can be moved.
 $RelativePython = '..\python\Scripts\python.exe'
-if (-not (Test-Path -LiteralPath $InstallPython -PathType Leaf)) { throw "Python environment not found: $InstallPython. Run tools\setup-python.ps1 first." }
 if (-not (Test-Path -LiteralPath $AiConfig -PathType Leaf) -or (Get-Content -LiteralPath $AiConfig -Raw | ConvertFrom-Json).python -ne $RelativePython) {
     [IO.File]::WriteAllText($AiConfig, (@{ python = $RelativePython } | ConvertTo-Json -Compress), [Text.UTF8Encoding]::new($false))
     Write-Output "Wrote AI config: $AiConfig"

@@ -11,10 +11,7 @@ import { expandedNodes, folderTreeKey, toggleSetItem, usePersistentSet } from ".
 import { useSpringOpen } from "../hooks/useSpringOpen";
 
 type Shortcut = { name: string; path: string };
-const DEFAULT_SHORTCUTS: Shortcut[] = [
-  { name: "Fotky", path: String.raw`F:\My_docs\My Pictures\Fotky` },
-  { name: "Panasonic", path: String.raw`F:\My_docs\My Pictures\Fotky\Panasonic` },
-];
+const DEFAULT_SHORTCUTS: Shortcut[] = [];
 type Props = { hosts: { folders: HTMLElement; calendar: HTMLElement }; onNavigate: (view: View) => void; activeFolderId: number | null; activeFolderIds?: number[]; activeView?: View; refreshToken?:number; calendarRefreshToken:number; refreshPaths?:string[]; onFileDrop?:(ids:number[],path:string,copy:boolean)=>void; onCreateFolder?:(path:string)=>void ; onFolderRule?: FolderRuleAction; onToast?:(message:string)=>void; onFolderAction?:(action:"reveal"|"copyPath"|"rename"|"delete"|"cut"|"copy"|"paste",path:string)=>void; clipboardPath?:string|null; clipboardAvailable?:boolean };
 
 export default function LeftPanel({ hosts, onNavigate, activeFolderId, activeFolderIds = [], activeView, refreshToken=0, calendarRefreshToken, refreshPaths=[], onFileDrop, onCreateFolder, onFolderRule, onToast, onFolderAction, clipboardPath=null, clipboardAvailable=false }: Props) {

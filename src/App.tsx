@@ -3,6 +3,7 @@ import Filmstrip from "./components/Filmstrip";
 import { launchEditor, useEditors, type Editor } from "./editors";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { pictureDir } from "@tauri-apps/api/path";
 import { createPortal } from "react-dom";
 import AssetGrid, { formatBytes, formatFor, isImage, labelText, thumbUrl, type AssetGridHandle, type AssetValuePatch, type GridAsset } from "./components/AssetGrid";
 import AssetContextMenu, { useAssetContextMenu } from "./components/AssetContextMenu";
@@ -32,7 +33,12 @@ import { DEFAULT_THUMBNAIL_INFO, normalizeThumbnailInfo, type ThumbnailInfoConfi
 import "./App.css";
 import "./manage.css";
 
-const DEFAULT_PATH = String.raw`F:\My_docs\My Pictures\Fotky`;
+// The last opened folder, or the Windows Pictures folder on the very first start.
+async function initialFolderPath(): Promise<string> {
+  const stored = readStored<string | null>("ddreams.lastFolder", null);
+  if (typeof stored === "string" && stored) return stored;
+  return pictureDir().catch(() => "C:\\");
+}
 type AppInfo = { root: string; catalog: string; backups: string; cache: string; exiftool: string; formats: string; metadataView: string; settings: string; portable: boolean; readonly: boolean };
 type RecentChange = { id:number; ts:string; summary:string };
 type CategoryMutation = { changeId:number|null; summary:string; categoryId:number|null; parentId:number|null; rootId:number|null; ancestorIds:number[]; deletedCategoryIds:number[]; deletedRootIds:number[] };
@@ -277,7 +283,7 @@ export default function App() {
   }, [viewerOpen]);
 
   useEffect(() => { const timer = window.setTimeout(() => setQueryDebounced(query), 180); return () => window.clearTimeout(timer); }, [query]);
-  useEffect(() => { setZoom(readStored("ddreams.zoom",168)); const path=readStored("ddreams.lastFolder",DEFAULT_PATH); void invoke<Folder | null>("find_folder_path", { path }).then(folder => { const v=folder?{kind:"folder" as const,id:folder.id,ids:folder.folderIds,title:folder.path??folder.name,folderPath:folder.path??undefined}:{kind:"folder" as const,id:-1,title:DEFAULT_PATH,folderPath:DEFAULT_PATH};viewResolved.current=performance.now();void invoke("startup_mark",{label:"initial folder resolved"}).catch(()=>{});setView(v);setHistory([v]);setHistoryIndex(0); }).catch(() => { viewResolved.current=performance.now(); const v={kind:"folder" as const,id:-1,title:DEFAULT_PATH,folderPath:DEFAULT_PATH};setView(v);setHistory([v]);setHistoryIndex(0); }); }, []);
+  useEffect(() => { setZoom(readStored("ddreams.zoom",168)); void initialFolderPath().then(path => invoke<Folder | null>("find_folder_path", { path }).then(folder => { const v=folder?{kind:"folder" as const,id:folder.id,ids:folder.folderIds,title:folder.path??folder.name,folderPath:folder.path??undefined}:{kind:"folder" as const,id:-1,title:path,folderPath:path};viewResolved.current=performance.now();void invoke("startup_mark",{label:"initial folder resolved"}).catch(()=>{});setView(v);setHistory([v]);setHistoryIndex(0); }).catch(() => { viewResolved.current=performance.now(); const v={kind:"folder" as const,id:-1,title:path,folderPath:path};setView(v);setHistory([v]);setHistoryIndex(0); })); }, []);
   useEffect(()=>{void invoke<FormatTable>("get_formats").then(setFormats).catch(error=>console.error("Format table failed to load",error));},[]);
   useEffect(() => {
     let active = true;
