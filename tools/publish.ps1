@@ -66,6 +66,18 @@ if (-not (Test-Path -LiteralPath $SourceAiScript -PathType Leaf)) { throw "AI se
 $InstallAiScript = Join-Path $InstallAiDir 'ddreams_ai.py'
 Copy-Item -LiteralPath $SourceAiScript -Destination $InstallAiScript -Force
 Write-Output "Copied AI server: $InstallAiScript"
+$SourceAiCoreDir = Join-Path $RepoRoot 'ai\ddreams_core'
+$InstallAiCoreDir = Join-Path $InstallAiDir 'ddreams_core'
+$AiCorePairs = @(
+    foreach ($file in (Get-ChildItem -LiteralPath $SourceAiCoreDir -File -Recurse)) {
+        $relativePath = $file.FullName.Substring($SourceAiCoreDir.Length + 1)
+        if ($relativePath -split '[\\/]' -contains '__pycache__') { continue }
+        $destination = Join-Path $InstallAiCoreDir $relativePath
+        New-Item -ItemType Directory -Path (Split-Path -Parent $destination) -Force | Out-Null
+        Copy-Item -LiteralPath $file.FullName -Destination $destination -Force
+        ,@($file.FullName, $destination)
+    }
+)
 Copy-Item -LiteralPath (Join-Path $RepoRoot 'ai\faces_schema.py') -Destination (Join-Path $InstallAiDir 'faces_schema.py') -Force
 Write-Output "Copied faces schema: $(Join-Path $InstallAiDir 'faces_schema.py')"
 # RAW preview plugin (LibRaw via rawpy); uses the Python runtime from modules\ai\ai.json.
@@ -105,12 +117,12 @@ if ($copyExifTool) {
 }
 
 # A copy once left a file full of zero bytes; verify what was published.
-foreach ($pair in @(
+foreach ($pair in (@(
     @($ReleaseExe, $InstallExe),
     @($SourceAiScript, $InstallAiScript),
     @((Join-Path $RepoRoot 'ai\faces_schema.py'), (Join-Path $InstallAiDir 'faces_schema.py')),
     @($SourceRawScript, (Join-Path $InstallRawDir 'ddreams_raw.py'))
-)) {
+) + $AiCorePairs)) {
     if ((Get-FileHash -LiteralPath $pair[0]).Hash -ne (Get-FileHash -LiteralPath $pair[1]).Hash) { throw "Published file differs from its source: $($pair[1])" }
 }
 Write-Output "Portable installation ready: $InstallRoot"
