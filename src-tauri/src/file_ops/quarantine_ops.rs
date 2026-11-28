@@ -23,10 +23,7 @@ impl FileManager {
         {
             let path = row.map_err(|e| e.to_string())?;
             if !inside(Path::new(&path), Path::new(new)) {
-                return Err(
-                    "V karanténe sú fotky. Pred zmenou priečinka ich vráťte alebo odstráňte."
-                        .into(),
-                );
+                return Err("V karanténe sú fotky. Pred zmenou priečinka ich vráťte alebo odstráňte.".into());
             }
         }
         Ok(())
@@ -139,9 +136,15 @@ impl FileManager {
             return Err("Nastavenia importu alebo karantény sa zmenili. Skontrolujte zoznam po ďalšom štarte.".into());
         }
         validate_roots(settings.incoming(), settings.quarantine())?;
-        if !selection.moves { review.moves.clear(); }
-        if !selection.deletes { review.deletes.clear(); }
-        if !selection.stale_edits { review.stale_edits.clear(); }
+        if !selection.moves {
+            review.moves.clear();
+        }
+        if !selection.deletes {
+            review.deletes.clear();
+        }
+        if !selection.stale_edits {
+            review.stale_edits.clear();
+        }
         let total = review.moves.len() + review.deletes.len() + review.stale_edits.len();
         let mut reserved = if review.moves.is_empty() && review.stale_edits.is_empty() {
             Ok(HashSet::new())
@@ -199,9 +202,7 @@ impl FileManager {
                 }
             })();
             if let Err(error) = result {
-                outcome
-                    .failures
-                    .push(format!("{}: {error}", snapshot.path.display()));
+                outcome.failures.push(format!("{}: {error}", snapshot.path.display()));
             }
         }
         progress(total, total);
@@ -241,12 +242,7 @@ impl FileManager {
                         |r| r.get(0),
                     )
                     .map_err(|e| e.to_string())?;
-                if !suggested
-                    || !inside(
-                        &checked_path(&source.path)?,
-                        &checked_path(settings.incoming())?,
-                    )
-                {
+                if !suggested || !inside(&checked_path(&source.path)?, &checked_path(settings.incoming())?) {
                     return Err("Fotka už nie je návrhom v importovacom priečinku".into());
                 }
             }
@@ -269,10 +265,7 @@ impl FileManager {
             let (mut source, origin) = self.quarantined_source(id)?;
             self.snapshot(id, &source.path, settings.quarantine())?;
             let target = origin.parent().ok_or("Chýba pôvodný priečinok")?;
-            if inside(
-                &checked_path(&origin)?,
-                &checked_path(settings.quarantine())?,
-            ) {
+            if inside(&checked_path(&origin)?, &checked_path(settings.quarantine())?) {
                 return Err("Pôvodná cesta patrí do karantény".into());
             }
             source.name = origin
@@ -284,11 +277,7 @@ impl FileManager {
         }))
     }
 
-    pub(crate) fn quarantine_delete_info(
-        &self,
-        ids: &[i64],
-        settings: &Settings,
-    ) -> Result<DeleteInfo, String> {
+    pub(crate) fn quarantine_delete_info(&self, ids: &[i64], settings: &Settings) -> Result<DeleteInfo, String> {
         self.writable()?;
         validate_roots(settings.incoming(), settings.quarantine())?;
         let mut pending = self.quarantine_delete.lock().map_err(|e| e.to_string())?;
@@ -317,10 +306,8 @@ impl FileManager {
     ) -> Result<Outcome, String> {
         self.writable()?;
         validate_roots(settings.incoming(), settings.quarantine())?;
-        let pending =
-            std::mem::take(&mut *self.quarantine_delete.lock().map_err(|e| e.to_string())?);
-        let snapshots: std::collections::HashMap<_, _> =
-            pending.into_iter().map(|file| (file.id, file)).collect();
+        let pending = std::mem::take(&mut *self.quarantine_delete.lock().map_err(|e| e.to_string())?);
+        let snapshots: std::collections::HashMap<_, _> = pending.into_iter().map(|file| (file.id, file)).collect();
         if snapshots.is_empty()
             || snapshots.len() != ids.iter().collect::<HashSet<_>>().len()
             || ids.iter().any(|id| !snapshots.contains_key(id))
@@ -344,11 +331,7 @@ impl FileManager {
     ) -> Outcome {
         let mut result = Outcome::default();
         let mut seen = HashSet::new();
-        let ids = ids
-            .iter()
-            .copied()
-            .filter(|id| seen.insert(*id))
-            .collect::<Vec<_>>();
+        let ids = ids.iter().copied().filter(|id| seen.insert(*id)).collect::<Vec<_>>();
         for (index, &id) in ids.iter().enumerate() {
             progress(index, ids.len());
             if let Err(error) = action(id, &mut result) {
@@ -379,21 +362,24 @@ impl FileManager {
 
     fn quarantined_source(&self, id: i64) -> Result<(Source, PathBuf), String> {
         let source = self.quarantine_source(id)?;
-        let origin = self
-            .quarantine_origin(source.id)?
-            .ok_or("Položka nie je v karanténe")?;
+        let origin = self.quarantine_origin(source.id)?.ok_or("Položka nie je v karanténe")?;
         Ok((source, origin))
     }
 
     fn review_snapshot(&self, stage: Stage, id: i64, path: &Path, settings: &Settings) -> Result<Snapshot, String> {
         let snapshot = self.snapshot(id, path, stage.root(settings))?;
         if stage == Stage::StaleEdit {
-            let since: Option<i64> = self.db.lock().map_err(|e| e.to_string())?
+            let since: Option<i64> = self
+                .db
+                .lock()
+                .map_err(|e| e.to_string())?
                 .query_row("SELECT edit_pending_since FROM assets WHERE id=?1", [id], |r| r.get(0))
                 .map_err(|e| e.to_string())?;
-            if since.is_none_or(|since| snapshot.files.iter().any(|(file, _, modified, _)| {
-                file == path && crate::quarantine::modified_after_mark(*modified, since)
-            })) {
+            if since.is_none_or(|since| {
+                snapshot.files.iter().any(|(file, _, modified, _)| {
+                    file == path && crate::quarantine::modified_after_mark(*modified, since)
+                })
+            }) {
                 return Err("Fotka už bola upravená".into());
             }
         }
@@ -407,10 +393,7 @@ impl FileManager {
             .map(|pair| {
                 let resolved = checked_path(&pair.from)?;
                 if resolved == scope || !resolved.starts_with(&scope) {
-                    return Err(format!(
-                        "Súbor je mimo povoleného priečinka: {}",
-                        pair.from.display()
-                    ));
+                    return Err(format!("Súbor je mimo povoleného priečinka: {}", pair.from.display()));
                 }
                 let info = self
                     .fs
@@ -453,27 +436,18 @@ impl FileManager {
         reserved: Option<&mut HashSet<String>>,
         outcome: &mut Outcome,
     ) -> Result<(), String> {
-        let source_folder = source
-            .path
-            .parent()
-            .ok_or("Chýba priečinok súboru")?
-            .to_owned();
+        let source_folder = source.path.parent().ok_or("Chýba priečinok súboru")?.to_owned();
         self.snapshot(source.id, &source.path, &source_folder)?;
         checked_path(folder)?;
         fs::create_dir_all(folder).map_err(|e| format!("{}: {e}", folder.display()))?;
         checked_path(folder)?;
-        let mut plan = self
-            .plan(&[source], folder, None)?
-            .pop()
-            .ok_or("Chýba plán presunu")?;
+        let mut plan = self.plan(&[source], folder, None)?.pop().ok_or("Chýba plán presunu")?;
         let entering = reserved.is_some();
         // Two photos with different extensions can share a stem-based XMP.
         // Assign distinct stems in quarantine so their expiry can be independent.
         let overlaps_sidecar = |path: &Path| {
             entering
-                && !path
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
+                && !path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("xmp"))
                 && (reserved
                     .as_ref()
                     .is_some_and(|stems| stems.contains(&file_stem_key(path)))
@@ -485,10 +459,7 @@ impl FileManager {
         };
         plan.conflict |= overlaps_sidecar(&plan.target);
         if plan.conflict && policy != ConflictPolicy::KeepBoth {
-            return Err(format!(
-                "Kolízia názvu, preskočené: {}",
-                plan.target.display()
-            ));
+            return Err(format!("Kolízia názvu, preskočené: {}", plan.target.display()));
         }
         let plan = self.number_conflict_with(plan, folder, overlaps_sidecar)?;
         let transfer = FileCatalogMove {
@@ -528,10 +499,7 @@ impl FileManager {
             .writer
             .record_quarantine_move(&summary, &transfer, &origin, entering)
         {
-            return Err(combine_error(
-                error,
-                rollback_moves(self.fs.as_ref(), &applied),
-            ));
+            return Err(combine_error(error, rollback_moves(self.fs.as_ref(), &applied)));
         }
         if let Some(stems) = reserved {
             stems.insert(file_stem_key(&plan.target));
@@ -546,17 +514,10 @@ impl FileManager {
         Ok(())
     }
 
-    fn delete_quarantine_file(
-        &self,
-        source: &Source,
-        drives: &[String],
-        outcome: &mut Outcome,
-    ) -> Result<(), String> {
+    fn delete_quarantine_file(&self, source: &Source, drives: &[String], outcome: &mut Outcome) -> Result<(), String> {
         let recycle = self.fs.has_recycle_bin(&source.path);
         if !recycle && !drives.contains(&volume_key(&source.path).to_uppercase()) {
-            return Err(
-                "Na disku nie je dostupný Kôš. Trvalé zmazanie vyžaduje potvrdenie.".into(),
-            );
+            return Err("Na disku nie je dostupný Kôš. Trvalé zmazanie vyžaduje potvrdenie.".into());
         }
         let folder = source.path.parent().ok_or("Chýba priečinok súboru")?;
         let snapshot = self.snapshot(source.id, &source.path, folder)?;
@@ -580,17 +541,12 @@ impl FileManager {
         } else {
             "Potvrdené trvalé zmazanie z karantény"
         };
-        self.writer.record_file_intent(
-            "confirm_quarantine_delete",
-            &format!("{confirmation}: {names}"),
-        )?;
+        self.writer
+            .record_file_intent("confirm_quarantine_delete", &format!("{confirmation}: {names}"))?;
         let mut failures = Vec::new();
         if recycle {
             if let Err(error) = self.fs.recycle_delete(&files) {
-                return Err(combine_error(
-                    error,
-                    self.restore_recycled_files(&files, true),
-                ));
+                return Err(combine_error(error, self.restore_recycled_files(&files, true)));
             }
         } else {
             self.fs
@@ -611,15 +567,9 @@ impl FileManager {
                 "Z karantény zmazané natrvalo"
             }
         );
-        if let Err(error) = self
-            .writer
-            .record_named_file_delete(&[source.id], action, &summary)
-        {
+        if let Err(error) = self.writer.record_named_file_delete(&[source.id], action, &summary) {
             if recycle {
-                return Err(combine_error(
-                    error,
-                    self.restore_recycled_files(&files, false),
-                ));
+                return Err(combine_error(error, self.restore_recycled_files(&files, false)));
             }
             outcome.deleted += 1;
             self.quarantine_invalidate(folder, outcome);
@@ -636,10 +586,7 @@ impl FileManager {
         self.quarantine_invalidate(folder, outcome);
         outcome.deleted += 1;
         if !failures.is_empty() {
-            return Err(format!(
-                "Nepodarilo sa zmazať XMP: {}",
-                failures.join(" · ")
-            ));
+            return Err(format!("Nepodarilo sa zmazať XMP: {}", failures.join(" · ")));
         }
         Ok(())
     }
@@ -648,7 +595,12 @@ impl FileManager {
         let errors = files
             .iter()
             .filter(|path| !skip_existing || !self.fs.exists(path))
-            .filter_map(|path| self.fs.restore_recycled(path).err().map(|error| format!("{}: {error}", path.display())))
+            .filter_map(|path| {
+                self.fs
+                    .restore_recycled(path)
+                    .err()
+                    .map(|error| format!("{}: {error}", path.display()))
+            })
             .collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(())
@@ -687,8 +639,5 @@ fn photo_format(formats: &FormatTable, path: &Path) -> bool {
 }
 
 fn file_stem_key(path: &Path) -> String {
-    path.file_stem()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_lowercase()
+    path.file_stem().unwrap_or_default().to_string_lossy().to_lowercase()
 }
