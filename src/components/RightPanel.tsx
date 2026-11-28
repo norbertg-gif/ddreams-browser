@@ -28,7 +28,7 @@ function useRightPanelModel({ iptcToken, onEditIptc, onOpenKeywords, primaryRead
     return { ...loadedMetadata, asset: { ...loadedMetadata.asset, ...primaryValues }, rows };
   }, [loadedMetadata, primaryValues, primaryReadId]);
   const [assetLinks,setAssetLinks]=useState<CatalogAssetLinks|null>(null);
-  const [loading, setLoading] = useState(false);
+  const [, setLoading] = useState(false);
   const { isCollapsed } = useSectionCollapse();
   const [selectedRows, setSelectedRows] = useState<string[]>(() => { const v = readStored<string[]>("ddreams.metadataChecked", []); return Array.isArray(v) ? v : []; });
   useEffect(() => writeStored("ddreams.metadataChecked", selectedRows), [selectedRows]);
@@ -91,13 +91,15 @@ function useRightPanelModel({ iptcToken, onEditIptc, onOpenKeywords, primaryRead
 
   useEffect(() => {
     const requestId = ++metadataRequest.current;
-    setMetadata(null); if (primaryId == null) return;
-    const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 260);
+    // The previous file's properties stay on screen until the new ones arrive, so the panel
+    // swaps its content instead of collapsing and rebuilding on every photo.
+    if (primaryId == null) { setMetadata(null); return; }
+    const timer = window.setTimeout(() => { setLoading(true); void invoke<Metadata | null>("get_metadata", { assetId: primaryId }).then(value=>{if(metadataRequest.current===requestId)setMetadata(value)}).catch(e=>{if(metadataRequest.current===requestId)setCopyMessage(String(e))}).finally(()=>{if(metadataRequest.current===requestId)setLoading(false)}); }, 150);
     return () => { window.clearTimeout(timer); metadataRequest.current++; };
   }, [primaryReadId, refreshToken, iptcToken]);
-  useEffect(()=>{let active=true;setAssetColors([]);if(!colorIds.length)return;const timer=window.setTimeout(()=>{void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[selectionReadKey,primaryReadId,refreshToken,colorToken]);
-  useEffect(()=>{let active=true;setAssetQuality([]);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<AssetQuality[]>("get_asset_quality",{assetIds:[primaryId]}).then(rows=>{if(active)setAssetQuality(rows)}).catch(()=>{if(active)setAssetQuality([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken,colorToken]);
-  useEffect(()=>{let active=true;setAssetLinks(null);if(primaryId==null)return;const timer=window.setTimeout(()=>{void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken]);
+  useEffect(()=>{let active=true;if(!colorIds.length){setAssetColors([]);return;}const timer=window.setTimeout(()=>{void invoke<AssetColorInfo[]>("get_asset_colors",{assetIds:colorIds}).then(v=>{if(active)setAssetColors(v)}).catch(()=>{if(active)setAssetColors([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[selectionReadKey,primaryReadId,refreshToken,colorToken]);
+  useEffect(()=>{let active=true;if(primaryId==null){setAssetQuality([]);return;}const timer=window.setTimeout(()=>{void invoke<AssetQuality[]>("get_asset_quality",{assetIds:[primaryId]}).then(rows=>{if(active)setAssetQuality(rows)}).catch(()=>{if(active)setAssetQuality([])})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken,colorToken]);
+  useEffect(()=>{let active=true;if(primaryId==null){setAssetLinks(null);return;}const timer=window.setTimeout(()=>{void invoke<CatalogAssetLinks|null>("get_catalog_asset_links",{assetId:primaryId}).then(v=>{if(active)setAssetLinks(v)}).catch(()=>{if(active)setAssetLinks(null)})},120);return()=>{active=false;window.clearTimeout(timer)}},[primaryReadId,refreshToken]);
   useEffect(()=>{if(aiAvailable&&aiReady)void reloadFacePersons();else{++facePersonsRequest.current;if(facePersonsTimer.current!==undefined){window.clearTimeout(facePersonsTimer.current);facePersonsTimer.current=undefined}setFacePersons([]);setFaceStatus({available:false,scanned:0,pending:0,faces:0,named:0,unknown:0,persons:0})}return()=>{++facePersonsRequest.current;if(facePersonsTimer.current!==undefined){window.clearTimeout(facePersonsTimer.current);facePersonsTimer.current=undefined}}},[aiAvailable,catalogRefreshToken,aiReady]);
   const previousColorToken=useRef(colorToken);
   useEffect(()=>{if(previousColorToken.current===colorToken)return;previousColorToken.current=colorToken;if(!aiAvailable||!aiReady||facePersonsTimer.current!==undefined)return;const delay=Math.max(0,20000-(Date.now()-facePersonsLastLoad.current));facePersonsTimer.current=window.setTimeout(()=>{facePersonsTimer.current=undefined;void reloadFacePersons()},delay)},[colorToken,aiAvailable,aiReady]);
@@ -148,6 +150,7 @@ function useRightPanelModel({ iptcToken, onEditIptc, onOpenKeywords, primaryRead
     }
   };
   const copy = async (mode: "selected" | "values" | "section", group?: string) => {
+    if (metadata && metadata.asset.id !== primaryId) return; // still showing the previous file
     const ids = selectedIds.length > 1 ? selectedIds : primaryId == null ? [] : [primaryId];
     if (!ids.length) return;
     const keys = mode === "section" ? null : selectedRows;
@@ -241,7 +244,6 @@ function useRightPanelModel({ iptcToken, onEditIptc, onOpenKeywords, primaryRead
       <div className="selected-summary">{metadata?.asset.name ?? (primaryId == null ? "Nie je vybraný súbor" : "Načítavam vlastnosti…")}{selectedIds.length > 1 && <small>{selectedIds.length} vybraných súborov</small>}</div>
       {stats.length>0&&<div className="stat-cards">{stats.map(([name,value])=><div key={name}><small>{name}</small><b title={value}>{value?.split(" (")[0]}</b></div>)}</div>}
       {metadata?.offline && <div className="offline-note">Súbor je offline. Zobrazené sú údaje z katalógu.</div>}
-      {loading && <div className="subtle">Načítavam metadáta…</div>}
     </div></DockChrome>
       {groups.map(group => <MetadataGroup key={group.name} group={group}
         editor={group.name === "IPTC" && <IptcEditor ids={assignedAssetIds} token={iptcToken} refreshToken={refreshToken}
@@ -295,9 +297,10 @@ function IptcEditor({ ids, token, refreshToken, readOnly, onOpenKeywords, onEdit
       Načítať IPTC zo súborov ({ids.length})
     </button>
   </div>;
-  const current = data?.key === key ? data : undefined;
+  // While the new selection loads, the previous values stay visible but read-only.
+  const current = data;
   const photos = current?.photos ?? [];
-  const loading = current?.revision !== revision;
+  const loading = current?.key !== key || current.revision !== revision;
   const unavailable = photos.find(photo => !photo.file);
   const reason = readOnly ? "Katalóg je iba na čítanie"
     : writing ? "Upravujem IPTC…" : loading ? "Načítavam IPTC…"
