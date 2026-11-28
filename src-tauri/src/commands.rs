@@ -1308,7 +1308,9 @@ pub fn get_thumbnail_metadata(
         let Some(path)=path.filter(|_|!is_directory) else { candidates.push(Candidate{id,path:PathBuf::new(),key:String::new(),entry:CacheEntry::default(),missing:Vec::new()});continue; };
         let path=PathBuf::from(path);
         if !path.is_file(){candidates.push(Candidate{id,path,key:String::new(),entry:CacheEntry::default(),missing:Vec::new()});continue;}
-        let (key,_,_)=display_metadata::file_key(&path).map_err(|e|e.to_string())?;
+        let Ok((key,_,_))=display_metadata::file_key(&path) else {
+            candidates.push(Candidate{id,path,key:String::new(),entry:CacheEntry::default(),missing:Vec::new()});continue;
+        };
         let entry=cache.0.get(&key);
         let missing=display_metadata::missing_fields(&entry,&requested,date.as_deref());
         candidates.push(Candidate{id,path,key,entry,missing});
@@ -1318,8 +1320,9 @@ pub fn get_thumbnail_metadata(
         let targets=candidates.iter().enumerate().filter(|(_,c)|!c.missing.is_empty()&&!c.key.is_empty()).map(|(i,_)|i).collect::<Vec<_>>();
         let paths=targets.iter().map(|i|candidates[*i].path.clone()).collect::<Vec<_>>();
         let tags=display_metadata::tags_for(&query_fields);
-        let records=exif.0.metadata_batch(&paths,&tags).map_err(|e|e.to_string())?;
+        let records=crate::native_exif::metadata_batch(&exif.0,&paths,&tags);
         for (idx,record) in targets.into_iter().zip(records.into_iter()){
+            let Some(record)=record else {continue;};
             let candidate=&mut candidates[idx];
             if let Some(object)=record.as_object(){let values=display_metadata::parse_values(object,&query_fields);display_metadata::merge_values(&mut candidate.entry.values,values);}
             display_metadata::mark_loaded(&mut candidate.entry,&query_fields);

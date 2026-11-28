@@ -55,23 +55,75 @@ impl ExifIndex {
         let mut todo=Vec::new();let mut done=0;let mut stale=Vec::new();for a in assets.iter(){if same(a,old.get(&a.id).cloned()){done+=1}else {if old.contains_key(&a.id){stale.push(a.id)}if Path::new(&a.path).is_file(){todo.push(a.clone())}}}
         {let tx=conn.transaction().map_err(|e|e.to_string())?;for id in stale{tx.execute("DELETE FROM exif_index WHERE asset_id=?",[id]).map_err(|e|e.to_string())?;}tx.commit().map_err(|e|e.to_string())?;}
         *self.progress.lock().unwrap()=Progress{done,total:assets.len(),running:!todo.is_empty(),error:None};
-        for batch in todo.chunks(200){let values=read_batch(&self.tool,batch)?;let tx=conn.transaction().map_err(|e|e.to_string())?;let mut count=0;
+        for batch in todo.chunks(200){let (values, error)=read_batch(&self.tool,batch);let tx=conn.transaction().map_err(|e|e.to_string())?;let mut count=0;
             // Every file of the batch gets a row, even without EXIF, so it is not re-read on every pass.
-            for a in batch{let v=values.get(&a.path.to_lowercase().replace('/',"\\")).filter(|v|v.get("Error").is_none()).unwrap_or(&Value::Null);{let make=string(v,"Make");let model=string(v,"Model");let lens=[string(v,"LensModel"),string(v,"LensID"),string(v,"Lens")].into_iter().flatten().find(|s|!placeholder(s));
-                tx.execute("INSERT OR REPLACE INTO exif_index(asset_id,path,size,modified,camera,lens,iso,aperture,exposure,focal,ext,bucket) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",params![a.id,a.path,a.size,a.modified,camera(make.as_deref(),model.as_deref()),lens,number(v,"ISO").map(|x|x.round() as i64),number(v,"FNumber").or_else(||number(v,"Aperture")).map(aperture),number(v,"ExposureTime").map(|x|if x<1.0 {1.0/(1.0/x).round().max(1.0)} else {x}),number(v,"FocalLength").map(|x|x.round() as i64),a.ext.to_lowercase(),a.size.filter(|x|*x>=0.0).map(bucket)]).map_err(|e|e.to_string())?;count+=1;}}
-            tx.commit().map_err(|e|e.to_string())?;self.progress.lock().unwrap().done+=count;thread::sleep(Duration::from_millis(250));
+            for a in batch {
+                let v = match values.get(&crate::native_exif::path_key(&a.path)) {
+                    Some(value) => value,
+                    None if error.is_some() => continue,
+                    None => &Value::Null,
+                };
+                let row = index_values(v);
+                tx.execute("INSERT OR REPLACE INTO exif_index(asset_id,path,size,modified,camera,lens,iso,aperture,exposure,focal,ext,bucket) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                    params![a.id,a.path,a.size,a.modified,row.camera,row.lens,row.iso,row.aperture,row.exposure,row.focal,a.ext.to_lowercase(),a.size.filter(|x|*x>=0.0).map(bucket)]).map_err(|e|e.to_string())?;
+                count+=1;
+            }
+            tx.commit().map_err(|e|e.to_string())?;self.progress.lock().unwrap().done+=count;
+            if let Some(error) = error { return Err(error); }
+            thread::sleep(Duration::from_millis(250));
         }
         self.progress.lock().unwrap().running=false;Ok(())
     }
 }
-fn read_batch(tool:&Path,assets:&[Asset])->Result<HashMap<String,Value>,String>{
-    let mut cmd=Command::new(tool);cmd.args(["-charset","filename=UTF8","-j","-n","-fast2","-Make","-Model","-LensModel","-LensID","-Lens","-ISO","-FNumber","-Aperture","-ExposureTime","-FocalLength","-@","-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+pub(crate) const INDEX_TAGS: &[&str] = &["Make", "Model", "LensModel", "LensID", "Lens", "ISO", "FNumber", "Aperture", "ExposureTime", "FocalLength"];
+
+#[derive(Serialize)]
+pub(crate) struct IndexValues {
+    camera: Option<String>,
+    lens: Option<String>,
+    iso: Option<i64>,
+    aperture: Option<f64>,
+    exposure: Option<f64>,
+    focal: Option<i64>,
+}
+
+pub(crate) fn index_values(v: &Value) -> IndexValues {
+    let make = string(v, "Make");
+    let model = string(v, "Model");
+    IndexValues {
+        camera: camera(make.as_deref(), model.as_deref()),
+        lens: [string(v,"LensModel"),string(v,"LensID"),string(v,"Lens")].into_iter().flatten().find(|s|!placeholder(s)),
+        iso: number(v, "ISO").map(|x| x.round() as i64),
+        aperture: number(v, "FNumber").or_else(|| number(v, "Aperture")).map(aperture),
+        exposure: number(v, "ExposureTime").map(|x| if x < 1.0 { 1.0 / (1.0 / x).round().max(1.0) } else { x }),
+        focal: number(v, "FocalLength").map(|x| x.round() as i64),
+    }
+}
+
+pub(crate) fn index_complete(v: &Value) -> bool {
+    string(v, "LensModel").is_some_and(|lens| !placeholder(&lens))
+        && ["Make", "Model", "ISO", "FNumber", "ExposureTime", "FocalLength"].iter().all(|tag| v.get(*tag).is_some())
+}
+
+fn read_batch(tool: &Path, assets: &[Asset]) -> (HashMap<String, Value>, Option<String>) {
+    let paths = assets.iter().map(|asset| PathBuf::from(&asset.path)).collect::<Vec<_>>();
+    let (rows, error) = crate::native_exif::with_fallback(&paths, INDEX_TAGS, true, index_complete, |paths| read_exiftool(tool, paths));
+    (assets.iter().zip(rows).filter_map(|(asset, row)| {
+        Some((crate::native_exif::path_key(&asset.path), row?))
+    }).collect(), error)
+}
+
+pub(crate) fn read_exiftool(tool: &Path, paths: &[PathBuf]) -> Result<Vec<Value>, String> {
+    let mut cmd=Command::new(tool);
+    cmd.args(["-charset","filename=UTF8","-j","-n","-fast2"])
+        .args(INDEX_TAGS.iter().map(|tag| format!("-{tag}")))
+        .args(["-@","-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
     #[cfg(windows)] {use std::os::windows::process::CommandExt;cmd.creation_flags(0x0800_0000|0x0000_4000);}
     let mut child=cmd.spawn().map_err(|e|e.to_string())?;let mut input=child.stdin.take().ok_or("ExifTool stdin")?;
-    let paths=assets.iter().map(|a|a.path.clone()).collect::<Vec<_>>();
+    let paths=paths.iter().map(|path|path.to_string_lossy().into_owned()).collect::<Vec<_>>();
     let writer=thread::spawn(move||->std::io::Result<()>{for path in paths{if path.contains(['\n','\r']){continue}writeln!(input,"{path}")?;}Ok(())});
-    let output=child.wait_with_output().map_err(|e|e.to_string())?;writer.join().map_err(|_|"ExifTool input thread failed")?.map_err(|e|e.to_string())?;if output.stdout.iter().all(u8::is_ascii_whitespace){return Ok(HashMap::new())}let values:Vec<Value>=serde_json::from_slice(&output.stdout).map_err(|e|format!("ExifTool: {e}"))?;
-    Ok(values.into_iter().filter_map(|v|v.get("SourceFile").and_then(Value::as_str).map(|p|(p.to_lowercase().replace('/',"\\"),v.clone()))).collect())
+    let output=child.wait_with_output().map_err(|e|e.to_string())?;writer.join().map_err(|_|"ExifTool input thread failed")?.map_err(|e|e.to_string())?;if output.stdout.iter().all(u8::is_ascii_whitespace){return Ok(Vec::new())}
+    serde_json::from_slice(&output.stdout).map_err(|e|format!("ExifTool: {e}"))
 }
 pub fn field(group:&str)->Option<String>{GROUPS.iter().find(|g|g.0==group).map(|g|expr(g.0,g.2))}
 fn group_query(conn:&Connection)->Result<Vec<Group>,String>{let mut groups=Vec::new();for (key,name,field,order) in GROUPS{let e=expr(key,field);let order=if e==field{order}else{"1"};let sql=format!("SELECT {e},count(*) FROM exif_index WHERE {field} IS NOT NULL AND CAST({field} AS TEXT)<>'' GROUP BY 1 ORDER BY {order}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let mut rows=stmt.query([]).map_err(|e|e.to_string())?;let mut values=Vec::new();while let Some(r)=rows.next().map_err(|e|e.to_string())?{let raw=r.get_ref(0).map_err(|e|e.to_string())?;let label=match key{"aperture"=>format!("f/{:.1}",r.get::<_,f64>(0).unwrap()),"iso"=>range_label(&ISO_BOUNDS,r.get::<_,i64>(0).unwrap(),""),"exposure"=>exposure_label(r.get::<_,i64>(0).unwrap()),"focal"=>range_label(&FOCAL_BOUNDS,r.get::<_,i64>(0).unwrap()," mm"),"bucket"=>bucket_label(r.get::<_,i64>(0).unwrap()).to_string(),_=>match raw{rusqlite::types::ValueRef::Text(t)=>String::from_utf8_lossy(t).into_owned(),rusqlite::types::ValueRef::Integer(n)=>n.to_string(),_=>String::new()}};let value=match raw{rusqlite::types::ValueRef::Real(n)=>n.to_string(),rusqlite::types::ValueRef::Integer(n)=>n.to_string(),rusqlite::types::ValueRef::Text(t)=>String::from_utf8_lossy(t).into_owned(),_=>String::new()};values.push(GroupValue{value,label,count:r.get(1).map_err(|e|e.to_string())?});}if !values.is_empty(){groups.push(Group{key:key.into(),name:name.into(),values});}}Ok(groups)}

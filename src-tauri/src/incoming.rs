@@ -189,7 +189,7 @@ static CAPTURE_CACHE: LazyLock<Mutex<CaptureCache>> = LazyLock::new(Mutex::defau
 
 pub(crate) fn fill_capture_dates(exif: &crate::exiftool::ExifTool, photos: &mut [Photo], selected: impl Fn(i64) -> bool) {
     fill_cached_capture_dates(&CAPTURE_CACHE, photos, selected, |paths| {
-        exif.metadata_batch(paths, &["DateTimeOriginal"])
+        Ok(crate::native_exif::metadata_batch(exif, paths, &["DateTimeOriginal"]).into_iter().flatten().collect())
     });
 }
 

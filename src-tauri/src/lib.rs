@@ -12,6 +12,7 @@ mod formats;
 mod folder_rules;
 pub mod journal;
 mod incoming;
+mod native_exif;
 mod iptc_write;
 mod listing;
 mod metadata_view;
