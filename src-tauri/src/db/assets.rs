@@ -10,6 +10,8 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct Asset {
     pub id: i64,
     pub folder_id: Option<i64>,
@@ -46,13 +48,17 @@ pub struct Asset {
     #[serde(default)]
     pub display_keywords: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub quarantined_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub edit_pending_since: Option<i64>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetPage {
     pub items: Vec<Asset>,
     pub total: i64,
@@ -61,6 +67,8 @@ pub struct AssetPage {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetMetadata {
     pub asset: Asset,
     pub categories: Vec<String>,

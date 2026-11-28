@@ -23,6 +23,8 @@ pub async fn get_asset_iptc(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct IptcEditResult {
     #[serde(flatten)]
     summary: crate::iptc_write::WriteSummary,

@@ -10,6 +10,8 @@ use super::writer::{AssetIdRemap, ListedAsset, next_id, resolve_write_assets};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct SetAssetKeywordsResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -22,6 +24,8 @@ pub struct SetAssetKeywordsResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct KeywordMutationResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -33,6 +37,8 @@ pub struct KeywordMutationResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct KeywordDeleteInfo {
     pub id: i64,
     pub name: String,

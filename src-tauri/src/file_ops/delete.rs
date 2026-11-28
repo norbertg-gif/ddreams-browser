@@ -10,6 +10,8 @@ use super::{FileManager, FileOperationResult, Source};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct DeleteInfo {
     pub count: usize,
     pub names: Vec<String>,

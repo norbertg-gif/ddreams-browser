@@ -104,6 +104,8 @@ pub async fn rename_file(
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct FolderRenameResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -215,6 +217,8 @@ pub async fn create_folder(
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct FileProgress {
     pub operation: String,
     pub done: usize,
@@ -275,6 +279,8 @@ pub fn asset_action(
 }
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct Editor {
     pub(super) name: String,
     pub(super) path: String,

@@ -5,6 +5,8 @@ use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CatalogNode {
     pub id: i64,
     pub parent_id: Option<i64>,
@@ -14,11 +16,14 @@ pub struct CatalogNode {
     #[serde(default)]
     pub has_children: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(test, ts(optional))]
     pub icon_key: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct Root {
     pub id: i64,
     pub name: String,
@@ -33,6 +38,8 @@ pub struct Root {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CatalogAssetLinks {
     pub category_ids: Vec<i64>,
     pub category_paths: Vec<CategoryPath>,
@@ -45,6 +52,8 @@ pub struct CatalogAssetLinks {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CategoryPath {
     pub id: i64,
     pub path: String,
@@ -52,6 +61,8 @@ pub struct CategoryPath {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct KeywordOption {
     pub id: i64,
     pub name: String,

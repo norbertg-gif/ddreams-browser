@@ -1,42 +1,68 @@
-export type Asset = { quarantinedAt?: number; editPendingSince?: number | null;
-  id: number; folderId: number | null; name: string; ext: string; size: number | null;
-  width: number | null; height: number | null; bpp: number | null; caption: string | null;
-  notes: string | null; author: string | null; rating: number | null; tagged: number | null;
-  label: string | null; fileModified: string | null; exifDate: string | null;
-  acdseeDate: string | null; mdDirty: number | null; isOrphan: number | null; path: string | null;
-  isDirectory?: boolean; offline?: boolean; missing?: boolean;
-  hasCategories?: boolean; hasKeywords?: boolean;
-  displayCategories?: string | null; displayKeywords?: string | null;
-};
-export type TileExifMetadata = { iso?: string | null; aperture?: string | null; shutter?: string | null; focalLength?: string | null; lens?: string | null; camera?: string | null; dateTaken?: string | null };
-export type TileExifMetadataItem = TileExifMetadata & { assetId: number };
-export type View = { kind: "folder" | "auto" | "category" | "keyword" | "rating" | "label" | "special" | "date" | "ai" | "color" | "quality" | "series" | "people" | "quarantine_review"; id?: number; rootId?: number; ids?: number[]; groups?: number[]; bestIds?: number[]; seriesInfo?: { count: number; analyzed: number; truncated: boolean }; value?: string; title: string; folderPath?: string; dateFrom?: string; dateTo?: string; dateSource?: "taken" | "database" | "modified"; dateNoDate?: boolean; suggestion?: {kind:"category"|"keyword";labelId:number;path:string} };
-export type AssetFilter = { kind: View["kind"]; id?: number | null; rootId?: number | null; includeChildren?: boolean; ids?: number[] | null; folderPath?: string | null; value?: string | null; query?: string | null; sort?: string; descending?: boolean; offset?: number; limit?: number; ratingMode?: ViewFilters["ratingMode"] | null; ratingValue?: number | null; labelFilter?: string | null; taggedOnly?: boolean; categoryFilter?: ViewFilters["categoryFilter"] | null; keywordFilter?: ViewFilters["keywordFilter"] | null; fileGroup?: ViewFilters["fileGroup"] | null; dateFrom?: string | null; dateTo?: string | null; dateSource?: View["dateSource"] | null; dateNoDate?: boolean; includeCategories?: boolean; includeKeywords?: boolean };
-export type ViewFilters = { ratingMode?: "equal" | "atLeast" | "atMost" | "unrated"; ratingValue?: number; labelFilter?: string; taggedOnly?: boolean; categoryFilter?: "with" | "without"; keywordFilter?: "with" | "without"; fileGroup?: "images" | "raw" | "video" | "other" | "media" | "all" };
-export type Page = { items: Asset[]; total: number; totalSize: number };
-export type Folder = { id: number; parentId: number | null; rootId: number | null; name: string; path: string | null; count: number; folderIds: number[]; virtualNode?: string | null; offline?: boolean; missing?: boolean };
-export type Node = { id: number; parentId: number | null; rootId: number | null; name: string; count: number; hasChildren: boolean; iconKey?: string | null };
-export type Root = { id: number; name: string; count: number; mergedCategoryId: number | null; hasChildren: boolean; iconKey: string | null };
-export type CatalogAssetLinks = { categoryIds: number[]; categoryPaths: {id:number;path:string}[]; categoryAncestorIds: number[]; keywordIds: number[]; keywordPaths: {id:number;path:string}[]; keywordAncestorIds: number[]; rootIds: number[] };
-export type ValueCount = { value: string; count: number };
-export type AssetQuality = { assetId: number; sharp: number; hi: number; lo: number; mean: number; flags: string[] };
-export type MetadataRow = { group: string; subgroup: string; name: string; value: string };
-export type Metadata = { asset: Asset; offline: boolean; rows: MetadataRow[] };
-export type CatalogAssetMetadata = { asset: Asset; categories: string[]; keywords: string[] };
-export type IptcTextField = "caption" | "author";
-export type IptcPhoto = {
-  id: number;
-  caption: string | null;
-  author: string | null;
-  keywords: string[][];
-  file: { caption: string | null; author: string | null; keywords: string[]; revision: string } | null;
-  reason: string | null;
-};
-export type IptcTarget = { id: number; revision: string };
-export type IptcEdit = { kind: "text"; field: IptcTextField; value: string | null }
-  | { kind: "removeKeyword"; keyword: string } | { kind: "addKeywords" };
-export type IptcIssue = { path: string; message: string };
-export type IptcSummary = { written: number; unchanged: number; cancelled: number; errors: IptcIssue[]; warnings: IptcIssue[] };
+import type { Asset as IpcAsset } from "./bindings/Asset";
 
-export type FileFormat = { ext: string; group: "image" | "raw" | "video" | "document" | "other"; name: string; hidden?: boolean };
-export type FormatTable = { version: number; formats: FileFormat[] };
+// Local asset patches use null to clear a timestamp that IPC omits.
+export type Asset = Omit<IpcAsset, "editPendingSince"> & { editPendingSince?: IpcAsset["editPendingSince"] | null };
+export type TileExifMetadata = import("./bindings/TileExifValues").TileExifValues;
+export type TileExifMetadataItem = import("./bindings/TileExifItem").TileExifItem;
+export type View = {
+  kind:
+    | "folder"
+    | "auto"
+    | "category"
+    | "keyword"
+    | "rating"
+    | "label"
+    | "special"
+    | "date"
+    | "ai"
+    | "color"
+    | "quality"
+    | "series"
+    | "people"
+    | "quarantine_review";
+  id?: number;
+  rootId?: number;
+  ids?: number[];
+  groups?: number[];
+  bestIds?: number[];
+  seriesInfo?: { count: number; analyzed: number; truncated: boolean };
+  value?: string;
+  title: string;
+  folderPath?: string;
+  dateFrom?: string;
+  dateTo?: string;
+  dateSource?: "taken" | "database" | "modified";
+  dateNoDate?: boolean;
+  suggestion?: { kind: "category" | "keyword"; labelId: number; path: string };
+};
+export type AssetFilter = Pick<import("./bindings/AssetFilter").AssetFilter, "kind"> &
+  Partial<import("./bindings/AssetFilter").AssetFilter> &
+  Pick<View, "kind">;
+export type ViewFilters = {
+  ratingMode?: "equal" | "atLeast" | "atMost" | "unrated";
+  ratingValue?: number;
+  labelFilter?: string;
+  taggedOnly?: boolean;
+  categoryFilter?: "with" | "without";
+  keywordFilter?: "with" | "without";
+  fileGroup?: "images" | "raw" | "video" | "other" | "media" | "all";
+};
+export type Page = import("./bindings/AssetPage").AssetPage;
+export type Folder = import("./bindings/Folder").Folder;
+export type Node = import("./bindings/CatalogNode").CatalogNode;
+export type Root = import("./bindings/Root").Root;
+export type CatalogAssetLinks = import("./bindings/CatalogAssetLinks").CatalogAssetLinks;
+export type ValueCount = import("./bindings/ValueCount").ValueCount;
+export type AssetQuality = import("./bindings/AssetQuality").AssetQuality;
+export type MetadataRow = import("./bindings/MetadataRow").MetadataRow;
+export type Metadata = import("./bindings/MetadataResponse").MetadataResponse;
+export type CatalogAssetMetadata = import("./bindings/AssetMetadata").AssetMetadata;
+export type IptcTextField = import("./bindings/AssetTextField").AssetTextField;
+export type IptcPhoto = import("./bindings/EditorPhoto").EditorPhoto;
+export type IptcTarget = import("./bindings/EditorTarget").EditorTarget;
+export type IptcEdit = import("./bindings/ManualEdit").ManualEdit;
+export type IptcIssue = import("./bindings/Issue").Issue;
+export type IptcSummary = import("./bindings/WriteSummary").WriteSummary;
+
+export type FileFormat = import("./bindings/Format").Format;
+export type FormatTable = import("./bindings/FormatTable").FormatTable;

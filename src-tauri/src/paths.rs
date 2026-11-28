@@ -1,5 +1,10 @@
 use serde::Serialize;
-use std::{collections::HashMap, env, ffi::OsString, path::{Path, PathBuf}};
+use std::{
+    collections::HashMap,
+    env,
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 const DEV_EXIFTOOL: &str = r"G:\Programovanie\ddreams-browser\tools\exiftool\exiftool.exe";
 const DEV_CACHE: &str = r"G:\ddreams-work\thumb-cache";
@@ -27,6 +32,8 @@ pub struct Paths {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AppInfo {
     pub root: String,
     pub catalog: String,
@@ -53,36 +60,92 @@ impl Paths {
         let portable_catalog = root.join("catalog").join("catalog.sqlite");
         let portable = portable_catalog.is_file() || root.join("ddreams.portable").exists();
         let catalog = env_path(vars, "DDREAMS_CATALOG").unwrap_or_else(|| {
-            if portable { portable_catalog.clone() } else { dev_catalog_path(executable, cwd) }
+            if portable {
+                portable_catalog.clone()
+            } else {
+                dev_catalog_path(executable, cwd)
+            }
         });
-        let backups = if portable { root.join("backups") } else { catalog.parent().unwrap_or(cwd).join("backups") };
+        let backups = if portable {
+            root.join("backups")
+        } else {
+            catalog.parent().unwrap_or(cwd).join("backups")
+        };
         let cache = env_path(vars, "DDREAMS_CACHE").unwrap_or_else(|| {
-            if portable { root.join("cache") } else { PathBuf::from(DEV_CACHE) }
+            if portable {
+                root.join("cache")
+            } else {
+                PathBuf::from(DEV_CACHE)
+            }
         });
         let exiftool = env_path(vars, "DDREAMS_EXIFTOOL").unwrap_or_else(|| {
-            if portable { root.join("modules").join("exiftool").join("exiftool.exe") } else { PathBuf::from(DEV_EXIFTOOL) }
+            if portable {
+                root.join("modules").join("exiftool").join("exiftool.exe")
+            } else {
+                PathBuf::from(DEV_EXIFTOOL)
+            }
         });
         let formats = env_path(vars, "DDREAMS_FORMATS").or_else(|| {
-            let candidate = if portable { root.join("modules").join("formats.json") } else { root.join("formats.json") };
+            let candidate = if portable {
+                root.join("modules").join("formats.json")
+            } else {
+                root.join("formats.json")
+            };
             candidate.is_file().then_some(candidate)
         });
         let metadata_view = env_path(vars, "DDREAMS_METADATA_VIEW").or_else(|| {
-            let candidate = if portable { root.join("modules").join("metadata_view.json") } else { root.join("metadata_view.json") };
+            let candidate = if portable {
+                root.join("modules").join("metadata_view.json")
+            } else {
+                root.join("metadata_view.json")
+            };
             candidate.is_file().then_some(candidate)
         });
         let settings = root.join("settings.json");
-        let ai_dir = if portable { root.join("modules").join("ai") } else { cwd_repo(&catalog, cwd).join("ai") };
+        let ai_dir = if portable {
+            root.join("modules").join("ai")
+        } else {
+            cwd_repo(&catalog, cwd).join("ai")
+        };
         let ai_script = ai_dir.join("ddreams_ai.py");
-        let ai_model = if portable { ai_dir.join("model") } else { PathBuf::from(DEV_AI_MODEL) };
-        let ai_python = if portable { read_ai_python(&ai_dir.join("ai.json")) } else { Some(PathBuf::from(DEV_AI_PYTHON)) };
+        let ai_model = if portable {
+            ai_dir.join("model")
+        } else {
+            PathBuf::from(DEV_AI_MODEL)
+        };
+        let ai_python = if portable {
+            read_ai_python(&ai_dir.join("ai.json"))
+        } else {
+            Some(PathBuf::from(DEV_AI_PYTHON))
+        };
         let ai_db = catalog.parent().unwrap_or(cwd).join("ai.sqlite");
         let ai_log = catalog.parent().unwrap_or(cwd).join("ai.log");
-        let readonly = vars.get(&OsString::from("DDREAMS_READONLY")).is_some_and(|value| value == "1");
-        Self { root, portable, catalog, backups, cache, exiftool, formats, metadata_view, settings, ai_script, ai_model, ai_python, ai_db, ai_log, readonly }
+        let readonly = vars
+            .get(&OsString::from("DDREAMS_READONLY"))
+            .is_some_and(|value| value == "1");
+        Self {
+            root,
+            portable,
+            catalog,
+            backups,
+            cache,
+            exiftool,
+            formats,
+            metadata_view,
+            settings,
+            ai_script,
+            ai_model,
+            ai_python,
+            ai_db,
+            ai_log,
+            readonly,
+        }
     }
 
     pub fn ensure_runtime_dirs(&self) -> std::io::Result<()> {
-        if let Some(parent) = self.catalog.parent() { std::fs::create_dir_all(parent)?; }
+        if let Some(parent) = self.catalog.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         std::fs::create_dir_all(&self.backups)?;
         std::fs::create_dir_all(&self.cache)?;
         Ok(())
@@ -90,11 +153,16 @@ impl Paths {
 
     pub fn info(&self) -> AppInfo {
         AppInfo {
-            root: self.root.display().to_string(), catalog: self.catalog.display().to_string(),
-            backups: self.backups.display().to_string(), cache: self.cache.display().to_string(),
-            exiftool: self.exiftool.display().to_string(), formats: display_optional(&self.formats),
-            metadata_view: display_optional(&self.metadata_view), settings: self.settings.display().to_string(),
-            portable: self.portable, readonly: self.readonly,
+            root: self.root.display().to_string(),
+            catalog: self.catalog.display().to_string(),
+            backups: self.backups.display().to_string(),
+            cache: self.cache.display().to_string(),
+            exiftool: self.exiftool.display().to_string(),
+            formats: display_optional(&self.formats),
+            metadata_view: display_optional(&self.metadata_view),
+            settings: self.settings.display().to_string(),
+            portable: self.portable,
+            readonly: self.readonly,
         }
     }
 }
@@ -107,7 +175,11 @@ fn read_ai_python(path: &Path) -> Option<PathBuf> {
     let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
     let python = PathBuf::from(value.get("python")?.as_str().filter(|value| !value.trim().is_empty())?);
     // A relative path is resolved against the folder of ai.json, so the installation can be moved.
-    Some(if python.is_relative() { lexically_normalized(&path.parent().unwrap_or(Path::new("")).join(python)) } else { python })
+    Some(if python.is_relative() {
+        lexically_normalized(&path.parent().unwrap_or(Path::new("")).join(python))
+    } else {
+        python
+    })
 }
 
 /// Resolves `.` and `..` without touching the disk (Python warns about `..` in its own prefix).
@@ -117,7 +189,11 @@ fn lexically_normalized(path: &Path) -> PathBuf {
     for part in path.components() {
         match part {
             Component::CurDir => {}
-            Component::ParentDir => { if !out.pop() { out.push(".."); } }
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
             other => out.push(other.as_os_str()),
         }
     }
@@ -125,15 +201,22 @@ fn lexically_normalized(path: &Path) -> PathBuf {
 }
 
 fn display_optional(path: &Option<PathBuf>) -> String {
-    path.as_ref().map(|value| value.display().to_string()).unwrap_or_else(|| "Vstavané predvolené hodnoty".into())
+    path.as_ref()
+        .map(|value| value.display().to_string())
+        .unwrap_or_else(|| "Vstavané predvolené hodnoty".into())
 }
 
 fn env_path(vars: &HashMap<OsString, OsString>, name: &str) -> Option<PathBuf> {
-    vars.get(&OsString::from(name)).filter(|value| !value.is_empty()).map(PathBuf::from)
+    vars.get(&OsString::from(name))
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
 }
 
 fn dev_catalog_path(executable: &Path, cwd: &Path) -> PathBuf {
-    executable.parent().into_iter().flat_map(Path::ancestors)
+    executable
+        .parent()
+        .into_iter()
+        .flat_map(Path::ancestors)
         .chain(cwd.ancestors())
         .map(|directory| directory.join(".local").join("catalog.sqlite"))
         .find(|path| path.exists())
@@ -146,7 +229,11 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root() -> PathBuf {
-        let path = env::temp_dir().join(format!("ddreams-paths-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+        let path = env::temp_dir().join(format!(
+            "ddreams-paths-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
         std::fs::create_dir_all(&path).unwrap();
         path
     }
@@ -201,7 +288,11 @@ mod tests {
         assert_eq!(paths.ai_model, ai_dir.join("model"));
         assert_eq!(paths.ai_python, Some(PathBuf::from(r"C:\python.exe")));
         assert_eq!(paths.ai_db, root.join("catalog/ai.sqlite"));
-        std::fs::write(ai_dir.join("ai.json"), br#"{"python":"..\\python\\Scripts\\python.exe"}"#).unwrap();
+        std::fs::write(
+            ai_dir.join("ai.json"),
+            br#"{"python":"..\\python\\Scripts\\python.exe"}"#,
+        )
+        .unwrap();
         let moved = Paths::resolve_with(&root.join("ddreams.exe"), &root, &HashMap::new());
         assert_eq!(moved.ai_python, Some(root.join(r"modules\python\Scripts\python.exe")));
         let _ = std::fs::remove_dir_all(root);
@@ -213,10 +304,15 @@ mod tests {
         let exe = root.join("ddreams-browser.exe");
         let mut vars = HashMap::new();
         for (key, value) in [
-            ("DDREAMS_CATALOG", "X:/catalog.sqlite"), ("DDREAMS_CACHE", "X:/cache"),
-            ("DDREAMS_EXIFTOOL", "X:/exiftool.exe"), ("DDREAMS_FORMATS", "X:/formats.json"),
-            ("DDREAMS_METADATA_VIEW", "X:/metadata.json"), ("DDREAMS_READONLY", "1"),
-        ] { vars.insert(OsString::from(key), OsString::from(value)); }
+            ("DDREAMS_CATALOG", "X:/catalog.sqlite"),
+            ("DDREAMS_CACHE", "X:/cache"),
+            ("DDREAMS_EXIFTOOL", "X:/exiftool.exe"),
+            ("DDREAMS_FORMATS", "X:/formats.json"),
+            ("DDREAMS_METADATA_VIEW", "X:/metadata.json"),
+            ("DDREAMS_READONLY", "1"),
+        ] {
+            vars.insert(OsString::from(key), OsString::from(value));
+        }
         let paths = Paths::resolve_with(&exe, &root, &vars);
         assert_eq!(paths.catalog, PathBuf::from("X:/catalog.sqlite"));
         assert_eq!(paths.cache, PathBuf::from("X:/cache"));

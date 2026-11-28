@@ -33,6 +33,8 @@ use transfer::{combine_error, move_transfers, rollback_moves};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct FileOperationResult {
     pub change_id: Option<i64>,
     pub summary: String,

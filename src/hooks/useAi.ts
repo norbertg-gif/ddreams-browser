@@ -7,25 +7,10 @@ import { readStored, writeStored } from "../storage";
 import type { useNavigation } from "./useNavigation";
 import type { useAssetValues } from "./useAssetValues";
 
-type AiStatus = {
-  available: boolean;
-  reason: string | null;
-  state: string;
-  modelState: string;
-  waiting: number;
-  indexed: number;
-  queued: number;
-  done: number;
-  failed: number;
-  offline: number;
-  total: number;
-  ratePerS: number;
-  etaS: number | null;
-  lastError: string | null;
-};
-type AiSearchPage = { ids: number[]; searched: number };
+type AiStatus = import("../bindings/AiStatus").AiStatus;
+type AiSearchPage = import("../bindings/AiSearchResult").AiSearchResult;
 export type SeriesPreset = "strict" | "normal" | "loose";
-type AiSeriesResponse = { groups: { ids: number[]; best: number }[]; analyzed: number; truncated: boolean };
+type AiSeriesResponse = import("../bindings/AiSeriesResult").AiSeriesResult;
 
 export function useSeriesSearchSettings() {
   const [seriesPreset, setSeriesPreset] = useState<SeriesPreset>(() => {
@@ -304,7 +289,7 @@ export function useAi({ setToast, assetFilter, navigation, series, aiSettings }:
     if (!aiReady || seriesBusy) return;
     setSeriesBusy(true);
     try {
-      const filter = { ...assetFilter, offset: 0, limit: 500 };
+      const filter = { ...assetFilter, offset: 0, limit: 500 } satisfies import("../bindings/AssetFilter").AssetFilter;
       const result = await invoke<AiSeriesResponse>("ai_series", { filter, preset: seriesPreset });
       const ids: number[] = [],
         groups: number[] = [],

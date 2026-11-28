@@ -12,6 +12,8 @@ use super::{FileManager, FileOperationResult, Plan, Source, Transfer};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub enum ConflictPolicy {
     Skip,
     KeepBoth,

@@ -7,6 +7,8 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct FolderPreviewAsset {
     pub id: i64,
     pub path: String,
@@ -107,6 +109,8 @@ pub fn folder_previews(
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct Folder {
     pub id: i64,
     pub parent_id: Option<i64>,

@@ -9,6 +9,8 @@ use super::writer::{AssetIdRemap, ListedAsset, next_id, resolve_write_assets};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct SetAssetCategoriesResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -18,6 +20,8 @@ pub struct SetAssetCategoriesResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CategoryMutationResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -31,6 +35,8 @@ pub struct CategoryMutationResult {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CategoryDeleteInfo {
     pub id: i64,
     pub name: String,

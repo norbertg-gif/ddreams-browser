@@ -2,7 +2,7 @@ import { useCallback, useState, type Dispatch, type SetStateAction } from "react
 import { invoke } from "@tauri-apps/api/core";
 import type { IptcEdit, IptcSummary, IptcTarget } from "../types";
 import type { useFileOperations } from "./useFileOperations";
-import type { AssetEditValues, useAssetValueState, useAssetValues } from "./useAssetValues";
+import type { useAssetValueState, useAssetValues } from "./useAssetValues";
 import type { AppInfo, useListingRefresh } from "./useNavigation";
 
 type IptcOptions = {
@@ -26,10 +26,10 @@ export function useIptc({ appInfo, setToast, files, assetValueState, listing, as
     (targets: IptcTarget[], action: IptcEdit) => {
       const write = async () => {
         try {
-          const result = await invoke<IptcSummary & { text: AssetEditValues | null; catalogKeywordsChanged: boolean }>(
-            "edit_asset_iptc",
-            { targets, action },
-          );
+          const result = await invoke<import("../bindings/IptcEditResult").IptcEditResult>("edit_asset_iptc", {
+            targets,
+            action,
+          });
           if (action.kind === "text" && result.text) applyAssetValues(result.text, { [action.field]: action.value });
           if (result.catalogKeywordsChanged) refreshAfterWrite();
           if (result.errors.length || result.warnings.length) setIptcEditIssues(result);

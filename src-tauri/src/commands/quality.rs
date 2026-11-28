@@ -7,6 +7,8 @@ use tauri::State;
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct ColorCount {
     pub value: String,
     pub name: String,
@@ -16,6 +18,8 @@ pub struct ColorCount {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetColorState {
     pub value: String,
     pub name: String,
@@ -27,6 +31,8 @@ pub struct AssetColorState {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetColors {
     pub asset_id: i64,
     pub computed: bool,
@@ -192,6 +198,8 @@ pub fn get_color_counts(db: State<'_, BackgroundDbState>, ai: State<'_, AiState>
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetQuality {
     pub asset_id: i64,
     pub sharp: f64,

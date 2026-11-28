@@ -140,7 +140,7 @@ export default function App() {
   const [refreshTick, setRefreshTick] = useState(0);
   const [calendarCatalogueTick, setCalendarCatalogueTick] = useState(0);
   useEffect(() => {
-    const subscription = listen("folder-catalogue-changed", () => setCalendarCatalogueTick((tick) => tick + 1));
+    const subscription = listen<null>("folder-catalogue-changed", () => setCalendarCatalogueTick((tick) => tick + 1));
     return () => {
       void subscription.then((unlisten) => unlisten()).catch(() => {});
     };
@@ -285,7 +285,9 @@ export default function App() {
   const copyCurrentResult = useCallback(async () => {
     let lines: string[] = [];
     for (let offset = 0; offset < total; offset += 500) {
-      const p = await invoke<Page>("get_assets", { filter: { ...assetFilter, offset, limit: 500 } });
+      const p = await invoke<Page>("get_assets", {
+        filter: { ...assetFilter, offset, limit: 500 } satisfies import("./bindings/AssetFilter").AssetFilter,
+      });
       for (const a of p.items)
         if (!a.isDirectory)
           lines.push(

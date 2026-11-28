@@ -7,6 +7,8 @@ use super::values::update_column;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct ChangeSummary {
     pub id: i64,
     pub ts: String,
@@ -15,6 +17,8 @@ pub struct ChangeSummary {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct DeletionSuggestionChange {
     pub change_id: Option<i64>,
     pub summary: String,

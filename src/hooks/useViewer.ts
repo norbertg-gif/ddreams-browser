@@ -354,7 +354,10 @@ export function useViewerAssets({ formats, currentAssetFilter, selection, viewer
     showViewerAsset(photo.asset, photo.index);
     const shown = currentViewer.current;
     const filter = currentAssetFilter.current;
-    void invoke<number | null>("locate_asset", { filter: { ...filter, offset: 0, limit: 1 }, id: photo.asset.id })
+    void invoke<number | null>("locate_asset", {
+      filter: { ...filter, offset: 0, limit: 1 } satisfies import("../bindings/AssetFilter").AssetFilter,
+      id: photo.asset.id,
+    })
       .then((index) => {
         if (index === null || index === photo.index || currentAssetFilter.current !== filter) return;
         setViewer((current) => (current && current === shown ? { ...current, index } : current));
@@ -381,7 +384,9 @@ export function useViewerAssets({ formats, currentAssetFilter, selection, viewer
       try {
         let total = 0;
         for (let offset = shown.index; ; offset += pageSize) {
-          const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: pageSize } });
+          const page = await invoke<Page>("get_assets", {
+            filter: { ...filter, offset, limit: pageSize } satisfies import("../bindings/AssetFilter").AssetFilter,
+          });
           if (!stillShowing()) return;
           total = page.total;
           const index = page.items.findIndex(canShow);
@@ -393,7 +398,9 @@ export function useViewerAssets({ formats, currentAssetFilter, selection, viewer
         }
         for (let end = Math.min(shown.index, total); end > 0;) {
           const offset = Math.max(0, end - pageSize);
-          const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: end - offset } });
+          const page = await invoke<Page>("get_assets", {
+            filter: { ...filter, offset, limit: end - offset } satisfies import("../bindings/AssetFilter").AssetFilter,
+          });
           if (!stillShowing()) return;
           for (let index = page.items.length - 1; index >= 0; index--) {
             if (canShow(page.items[index])) {
@@ -483,7 +490,9 @@ export function useViewerControls({
       if (!viewer) return;
       let index = viewer.index + delta;
       while (index >= 0 && index < total) {
-        const page = await invoke<Page>("get_assets", { filter: { ...assetFilter, offset: index, limit: 1 } });
+        const page = await invoke<Page>("get_assets", {
+          filter: { ...assetFilter, offset: index, limit: 1 } satisfies import("../bindings/AssetFilter").AssetFilter,
+        });
         const asset = page.items[0];
         if (!asset) break;
         if (!asset.isDirectory && isImage(asset, formats)) {
@@ -607,7 +616,9 @@ export function useViewerControls({
     for (const offset of [-1, 1]) {
       const index = viewer.index + offset;
       if (index < 0 || index >= total) continue;
-      void invoke<Page>("get_assets", { filter: { ...assetFilter, offset: index, limit: 1 } })
+      void invoke<Page>("get_assets", {
+        filter: { ...assetFilter, offset: index, limit: 1 } satisfies import("../bindings/AssetFilter").AssetFilter,
+      })
         .then((page) => {
           const asset = page.items[0];
           if (asset && !asset.isDirectory && asset.path) {

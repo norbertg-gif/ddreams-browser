@@ -22,6 +22,8 @@ pub struct ListedAsset {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetIdRemap {
     pub old_id: i64,
     pub new_id: i64,

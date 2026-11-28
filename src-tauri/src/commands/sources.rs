@@ -50,6 +50,8 @@ pub(super) fn tree_children_from_listing(disk: Vec<db::Folder>, _catalogue: Vec<
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CatalogSourceStatus {
     pub path: String,
     pub assets: usize,
@@ -148,6 +150,8 @@ pub fn get_catalog_missing_sources(state: State<'_, BackgroundDbState>) -> Resul
 
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct RemoveCatalogInfo {
     pub assets: usize,
     pub folders: usize,

@@ -60,6 +60,8 @@ pub fn set_asset_categories(
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct CategorySelectionCounts {
     pub total_files: usize,
     pub assigned: std::collections::HashMap<i64, usize>,

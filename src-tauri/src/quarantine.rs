@@ -1,8 +1,6 @@
 use crate::{
     ai::AiState,
-    commands::{
-        AppInfoState, DatabaseState, ExifState, FileManagerState, FileProgress, FormatsState,
-    },
+    commands::{AppInfoState, DatabaseState, ExifState, FileManagerState, FileProgress, FormatsState},
     db::Db,
     file_ops::{ConflictPolicy, DeleteInfo},
     formats::FormatTable,
@@ -24,6 +22,8 @@ pub(crate) const EDIT_MTIME_GRACE: i64 = 60;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct Preferences {
     folder: String,
     pub move_after_days: u32,
@@ -33,10 +33,14 @@ pub(crate) struct Preferences {
     pub manage_from: String,
 }
 
-fn default_edit_after_days() -> u32 { 90 }
+fn default_edit_after_days() -> u32 {
+    90
+}
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct Settings {
     #[serde(flatten)]
     preferences: Preferences,
@@ -86,7 +90,9 @@ pub(crate) fn now() -> i64 {
 }
 
 pub(crate) fn modified_after_mark(modified: SystemTime, since: i64) -> bool {
-    modified.duration_since(UNIX_EPOCH).ok()
+    modified
+        .duration_since(UNIX_EPOCH)
+        .ok()
         .is_some_and(|age| age.as_secs() as i64 > since.saturating_add(EDIT_MTIME_GRACE))
 }
 
@@ -112,10 +118,7 @@ fn make_settings(incoming_folder: String, preferences: Preferences) -> Settings 
 }
 
 fn configured_path(values: &Map<String, Value>) -> &str {
-    values
-        .get("incomingFolder")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
+    values.get("incomingFolder").and_then(Value::as_str).unwrap_or_default()
 }
 
 fn load(path: &Path, db: &Db, writable: bool) -> Result<Settings, String> {
@@ -157,11 +160,7 @@ fn load(path: &Path, db: &Db, writable: bool) -> Result<Settings, String> {
     result.ok_or_else(|| "Nastavenia karantény sa nedajú načítať".into())
 }
 
-pub(crate) fn initialize(
-    path: &Path,
-    db: &Db,
-    writer: &crate::journal::CatalogWriter,
-) -> Result<(), String> {
+pub(crate) fn initialize(path: &Path, db: &Db, writer: &crate::journal::CatalogWriter) -> Result<(), String> {
     let settings = load(path, db, true)?;
     writer.sync_incoming(&settings.incoming_folder)
 }
@@ -172,20 +171,13 @@ pub(crate) fn quarantine_path(values: &Map<String, Value>, input: &str) -> Strin
         .and_then(|v| v.get("folder"))
         .and_then(Value::as_str)
         .filter(|v| !v.is_empty());
-    custom
-        .map(str::to_owned)
-        .unwrap_or_else(|| default_folder(input))
+    custom.map(str::to_owned).unwrap_or_else(|| default_folder(input))
 }
 
-pub(crate) fn validate_incoming_setting(
-    values: &Map<String, Value>,
-    input: &str,
-) -> Result<(), String> {
+pub(crate) fn validate_incoming_setting(values: &Map<String, Value>, input: &str) -> Result<(), String> {
     let quarantine = quarantine_path(values, input);
     if !input.is_empty() && quarantine.is_empty() {
-        return Err(
-            "Importovací priečinok musí mať nadradený priečinok alebo nastavenú karanténu".into(),
-        );
+        return Err("Importovací priečinok musí mať nadradený priečinok alebo nastavenú karanténu".into());
     }
     validate_roots(Path::new(input), Path::new(&quarantine))
 }
@@ -209,10 +201,7 @@ pub(crate) fn checked_path(path: &Path) -> Result<PathBuf, String> {
             _ => false,
         })
     {
-        return Err(format!(
-            "Nepovolená cesta pre karanténu: {}",
-            path.display()
-        ));
+        return Err(format!("Nepovolená cesta pre karanténu: {}", path.display()));
     }
     let mut existing = None;
     for ancestor in path.ancestors() {
@@ -342,12 +331,7 @@ pub(crate) fn due_candidates(
                 capture: r.get(2)?,
             })
         })
-        .filter(|row| {
-            row.as_ref().is_err()
-                || row
-                    .as_ref()
-                    .is_ok_and(|photo| inside(Path::new(&photo.path), root))
-        })
+        .filter(|row| row.as_ref().is_err() || row.as_ref().is_ok_and(|photo| inside(Path::new(&photo.path), root)))
         .collect::<rusqlite::Result<_>>()
         .map_err(|e| e.to_string())
 }
@@ -369,6 +353,8 @@ pub(crate) struct Snapshot {
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct ReviewList {
     pub ids: Vec<i64>,
     pub bytes: u64,
@@ -376,6 +362,8 @@ pub(crate) struct ReviewList {
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct ReviewPreview {
     pub moves: ReviewList,
     pub deletes: ReviewList,
@@ -386,6 +374,8 @@ pub(crate) struct ReviewPreview {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct ReviewSelection {
     pub moves: bool,
     pub deletes: bool,
@@ -394,6 +384,8 @@ pub(crate) struct ReviewSelection {
 
 #[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub(crate) struct Outcome {
     pub moved: usize,
     pub restored: usize,
@@ -465,9 +457,7 @@ pub(crate) fn preview_quarantine_review(
     }
     let _operation = manager.0.lock_operation()?;
     let settings = load(Path::new(&info.0.settings), &db.0, true)?;
-    manager
-        .0
-        .prepare_quarantine_review(settings, &formats.0, Some(&exif.0))
+    manager.0.prepare_quarantine_review(settings, &formats.0, Some(&exif.0))
 }
 
 fn progress(app: &AppHandle, operation: &str, done: usize, total: usize) {
@@ -542,11 +532,9 @@ pub(crate) fn restore_from_quarantine(
 ) -> Result<Outcome, String> {
     let _operation = manager.0.lock_operation()?;
     let settings = load(Path::new(&info.0.settings), &db.0, false)?;
-    manager
-        .0
-        .restore_from_quarantine(&asset_ids, &settings, |done, total| {
-            progress(&app, "Vraciam z karantény", done, total)
-        })
+    manager.0.restore_from_quarantine(&asset_ids, &settings, |done, total| {
+        progress(&app, "Vraciam z karantény", done, total)
+    })
 }
 
 #[tauri::command(async)]
@@ -574,12 +562,11 @@ pub(crate) fn delete_from_quarantine(
     let result = {
         let _operation = manager.0.lock_operation()?;
         let settings = load(Path::new(&info.0.settings), &db.0, false)?;
-        manager.0.delete_from_quarantine(
-            &asset_ids,
-            &settings,
-            &confirmed_no_bin_drives,
-            |done, total| progress(&app, "Mažem z karantény", done, total),
-        )?
+        manager
+            .0
+            .delete_from_quarantine(&asset_ids, &settings, &confirmed_no_bin_drives, |done, total| {
+                progress(&app, "Mažem z karantény", done, total)
+            })?
     };
     ai.0.forget(result.purged.clone());
     Ok(result)
@@ -599,10 +586,13 @@ mod tests {
     #[test]
     fn stale_edits_are_due_at_the_cutoff_only_in_import_and_can_be_disabled() {
         let db = Connection::open_in_memory().unwrap();
-        db.execute_batch("CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT,is_listed INTEGER,ext_lower TEXT,
+        db.execute_batch(
+            "CREATE TABLE assets(id INTEGER PRIMARY KEY,path TEXT,is_listed INTEGER,ext_lower TEXT,
             exif_date TEXT,incoming_seen_at INTEGER,quarantined_at INTEGER,edit_pending_since INTEGER,
             rating INTEGER,label TEXT,tagged INTEGER);
-            CREATE TABLE asset_categories(asset_id INTEGER);").unwrap();
+            CREATE TABLE asset_categories(asset_id INTEGER);",
+        )
+        .unwrap();
         let root = std::env::temp_dir();
         let mut settings = Settings::fixture(&root.join("import"), &root.join("quarantine"));
         let at = 1_800_000_000;
@@ -621,8 +611,13 @@ mod tests {
                 (id, path.to_string_lossy().as_ref(), listed, cutoff, quarantined, pending)).unwrap();
         }
         let formats = FormatTable::parse(include_str!("../formats.json")).unwrap();
-        let ids = |settings: &Settings, stage| due_candidates(&db, settings, &formats, stage, at, None)
-            .unwrap().into_iter().map(|photo| photo.id).collect::<Vec<_>>();
+        let ids = |settings: &Settings, stage| {
+            due_candidates(&db, settings, &formats, stage, at, None)
+                .unwrap()
+                .into_iter()
+                .map(|photo| photo.id)
+                .collect::<Vec<_>>()
+        };
         assert_eq!(ids(&settings, Stage::Move), vec![6]);
         assert_eq!(ids(&settings, Stage::StaleEdit), vec![1]);
         settings.preferences.edit_after_days = 0;

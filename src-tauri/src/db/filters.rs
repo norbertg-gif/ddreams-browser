@@ -27,53 +27,77 @@ pub(super) fn asset_cols(
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetFilter {
     pub kind: String,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub id: Option<i64>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub root_id: Option<i64>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub include_children: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub folder_path: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub ids: Option<Vec<i64>>,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub value: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     pub query: Option<String>,
     pub sort: String,
     pub descending: bool,
     pub offset: i64,
     pub limit: i64,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub rating_mode: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub rating_value: Option<i64>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub label_filter: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub tagged_only: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub category_filter: Option<AssignmentFilter>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub keyword_filter: Option<AssignmentFilter>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub file_group: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub include_categories: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub include_keywords: bool,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub date_from: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub date_to: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub date_source: Option<String>,
+    #[cfg_attr(test, ts(optional = nullable))]
     #[serde(default)]
     pub date_no_date: bool,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub enum AssignmentFilter {
     With,
     Without,

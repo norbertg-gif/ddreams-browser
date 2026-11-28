@@ -43,6 +43,8 @@ pub fn ai_reindex(state: State<'_, AiState>) -> Result<AiStatus, String> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiMapCluster {
     pub id: u32,
     pub x: f32,
@@ -54,6 +56,8 @@ pub struct AiMapCluster {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiMapData {
     pub ids: Vec<i64>,
     pub x: Vec<f32>,
@@ -197,6 +201,8 @@ pub fn ai_duplicate_groups(state: State<'_, AiState>, level: String) -> Result<V
 }
 
 #[derive(Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiSeriesGroup {
     pub ids: Vec<i64>,
     pub best: i64,
@@ -204,6 +210,8 @@ pub struct AiSeriesGroup {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiSeriesResult {
     pub groups: Vec<AiSeriesGroup>,
     pub analyzed: usize,
@@ -443,6 +451,8 @@ pub fn ai_suggestion_groups(state: State<'_, AiState>, kind: String) -> Result<V
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiUnsortedCluster {
     pub ids: Vec<i64>,
     pub total: usize,
@@ -454,6 +464,8 @@ pub struct AiUnsortedCluster {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiUnsortedClusters {
     pub groups: Vec<AiUnsortedCluster>,
     pub unlabeled: usize,

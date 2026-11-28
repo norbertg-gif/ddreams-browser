@@ -13,6 +13,8 @@ use tauri::State;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct MetadataRow {
     pub group: String,
     pub subgroup: String,
@@ -22,6 +24,8 @@ pub struct MetadataRow {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct MetadataResponse {
     pub asset: db::Asset,
     pub offline: bool,

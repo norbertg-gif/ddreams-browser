@@ -7,6 +7,8 @@ use tauri::State;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFacesStatus {
     pub available: bool,
     pub scanned: usize,
@@ -19,6 +21,8 @@ pub struct AiFacesStatus {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFacePerson {
     pub id: i64,
     pub name: String,
@@ -30,12 +34,16 @@ pub struct AiFacePerson {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFacesPersons {
     pub persons: Vec<AiFacePerson>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFaceReview {
     pub face_id: i64,
     pub asset_id: i64,
@@ -44,12 +52,16 @@ pub struct AiFaceReview {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFacesReview {
     pub faces: Vec<AiFaceReview>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFaceClusterGuess {
     pub person_id: i64,
     pub name: String,
@@ -58,6 +70,8 @@ pub struct AiFaceClusterGuess {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFaceCluster {
     pub face_ids: Vec<i64>,
     pub total: usize,
@@ -68,6 +82,8 @@ pub struct AiFaceCluster {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFacesClusters {
     pub available: bool,
     pub groups: Vec<AiFaceCluster>,
@@ -77,6 +93,8 @@ pub struct AiFacesClusters {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFaceAsset {
     pub face_id: i64,
     pub asset_id: i64,
@@ -92,6 +110,8 @@ pub struct AiFaceAsset {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AiFaceThumb {
     pub face_id: i64,
     pub data_url: String,

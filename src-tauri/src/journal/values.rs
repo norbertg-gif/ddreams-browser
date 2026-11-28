@@ -9,6 +9,8 @@ use super::writer::{AssetIdRemap, ListedAsset, resolve_write_assets};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct AssetValueState {
     pub id: i64,
     pub rating: Option<i64>,
@@ -19,6 +21,8 @@ pub struct AssetValueState {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct SetAssetValuesResult {
     pub change_id: Option<i64>,
     pub summary: String,
@@ -28,6 +32,8 @@ pub struct SetAssetValuesResult {
 
 #[derive(Clone, Copy, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub enum AssetTextField {
     Caption,
     Author,
@@ -60,6 +66,8 @@ impl AssetTextField {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct SetAssetTextResult {
     #[serde(flatten)]
     pub(super) result: SetAssetValuesResult,

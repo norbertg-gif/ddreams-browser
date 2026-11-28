@@ -2,60 +2,318 @@ use crate::{db::Db, formats::FormatTable};
 use rusqlite::{Connection, params};
 use serde::Serialize;
 use serde_json::Value;
-use std::{collections::HashMap, io::Write, path::{Path, PathBuf}, process::{Command, Stdio}, sync::{Arc, Mutex}, thread, time::Duration};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::{Arc, Mutex},
+    thread,
+    time::Duration,
+};
 
 #[derive(Clone)]
-struct Asset { id:i64, path:String, size:Option<f64>, modified:Option<String>, ext:String }
-#[derive(Default,Clone,Serialize)]
-pub struct Progress { pub done:usize, pub total:usize, pub running:bool, pub error:Option<String> }
+struct Asset {
+    id: i64,
+    path: String,
+    size: Option<f64>,
+    modified: Option<String>,
+    ext: String,
+}
+#[derive(Default, Clone, Serialize)]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
+pub struct Progress {
+    pub done: usize,
+    pub total: usize,
+    pub running: bool,
+    pub error: Option<String>,
+}
 #[derive(Serialize)]
-pub struct Group { pub key:String, pub name:String, pub values:Vec<GroupValue> }
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
+pub struct Group {
+    pub key: String,
+    pub name: String,
+    pub values: Vec<GroupValue>,
+}
 #[derive(Serialize)]
-pub struct GroupValue { pub value:String, pub label:String, pub count:i64 }
-pub struct ExifIndex { path:PathBuf, catalog:PathBuf, tool:PathBuf, formats:Arc<FormatTable>, progress:Mutex<Progress> }
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
+pub struct GroupValue {
+    pub value: String,
+    pub label: String,
+    pub count: i64,
+}
+pub struct ExifIndex {
+    path: PathBuf,
+    catalog: PathBuf,
+    tool: PathBuf,
+    formats: Arc<FormatTable>,
+    progress: Mutex<Progress>,
+}
 
-const SCHEMA:&str="CREATE TABLE IF NOT EXISTS exif_index(asset_id INTEGER PRIMARY KEY,path TEXT NOT NULL,size REAL,modified TEXT,camera TEXT,lens TEXT,iso INTEGER,aperture REAL,exposure REAL,focal INTEGER,ext TEXT,bucket INTEGER,scanned_at TEXT DEFAULT CURRENT_TIMESTAMP);";
-const GROUPS:[(&str,&str,&str,&str);8]=[("camera","Fotoaparát","camera","camera COLLATE NOCASE"),("lens","Objektív","lens","lens COLLATE NOCASE"),("iso","ISO","iso","iso"),("aperture","Clona","aperture","aperture"),("exposure","Expozičný čas","exposure","exposure"),("focal","Ohnisková vzdialenosť","focal","focal"),("ext","Typ súboru","ext","ext COLLATE NOCASE"),("bucket","Veľkosť súboru","bucket","bucket")];
-fn camera(make:Option<&str>,model:Option<&str>)->Option<String>{let make=make.unwrap_or("").trim();let model=model.unwrap_or("").trim();if model.is_empty(){return (!make.is_empty()).then(||make.to_string())}if make.is_empty()||model.to_lowercase().starts_with(&make.to_lowercase()){Some(model.to_string())}else{Some(format!("{make} {model}"))}}
+const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS exif_index(asset_id INTEGER PRIMARY KEY,path TEXT NOT NULL,size REAL,modified TEXT,camera TEXT,lens TEXT,iso INTEGER,aperture REAL,exposure REAL,focal INTEGER,ext TEXT,bucket INTEGER,scanned_at TEXT DEFAULT CURRENT_TIMESTAMP);";
+const GROUPS: [(&str, &str, &str, &str); 8] = [
+    ("camera", "Fotoaparát", "camera", "camera COLLATE NOCASE"),
+    ("lens", "Objektív", "lens", "lens COLLATE NOCASE"),
+    ("iso", "ISO", "iso", "iso"),
+    ("aperture", "Clona", "aperture", "aperture"),
+    ("exposure", "Expozičný čas", "exposure", "exposure"),
+    ("focal", "Ohnisková vzdialenosť", "focal", "focal"),
+    ("ext", "Typ súboru", "ext", "ext COLLATE NOCASE"),
+    ("bucket", "Veľkosť súboru", "bucket", "bucket"),
+];
+fn camera(make: Option<&str>, model: Option<&str>) -> Option<String> {
+    let make = make.unwrap_or("").trim();
+    let model = model.unwrap_or("").trim();
+    if model.is_empty() {
+        return (!make.is_empty()).then(|| make.to_string());
+    }
+    if make.is_empty() || model.to_lowercase().starts_with(&make.to_lowercase()) {
+        Some(model.to_string())
+    } else {
+        Some(format!("{make} {model}"))
+    }
+}
 /// Cameras fill unknown lens fields with dashes, zeros or "Unknown"; those are not lenses.
-fn placeholder(s:&str)->bool{let t=s.trim();t.chars().all(|c|c=='-'||c=='0'||c==' '||c=='.')||matches!(t.to_ascii_lowercase().as_str(),"unknown"|"n/a"|"none")}
-fn aperture(v:f64)->f64{(v*10.0).round()/10.0}
+fn placeholder(s: &str) -> bool {
+    let t = s.trim();
+    t.chars().all(|c| c == '-' || c == '0' || c == ' ' || c == '.')
+        || matches!(t.to_ascii_lowercase().as_str(), "unknown" | "n/a" | "none")
+}
+fn aperture(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
 // ISO, shutter time and focal length are browsed as ranges, not as single values. The ranges are
 // computed in SQL from the raw columns, so changing them needs no re-indexing.
-const ISO_BOUNDS:[i64;12]=[50,100,200,400,800,1600,3200,6400,12800,25600,51200,102400];
-const FOCAL_BOUNDS:[i64;8]=[16,24,35,50,85,135,200,400];
-const EXPOSURE_BOUNDS:[(f64,&str);19]=[(1.0/8000.0,"1/8000"),(1.0/4000.0,"1/4000"),(1.0/2000.0,"1/2000"),(1.0/1000.0,"1/1000"),(1.0/500.0,"1/500"),(1.0/250.0,"1/250"),(1.0/125.0,"1/125"),(1.0/60.0,"1/60"),(1.0/30.0,"1/30"),(1.0/15.0,"1/15"),(1.0/8.0,"1/8"),(1.0/4.0,"1/4"),(1.0/2.0,"1/2"),(1.0,"1"),(2.0,"2"),(4.0,"4"),(8.0,"8"),(15.0,"15"),(30.0,"30")];
-fn ranges(field:&str,bounds:impl Iterator<Item=f64>)->String{let mut sql=format!("CASE WHEN {field} IS NULL THEN NULL");let mut n=0;for b in bounds{sql.push_str(&format!(" WHEN {field}<={b} THEN {n}"));n+=1;}sql.push_str(&format!(" ELSE {n} END"));sql}
+const ISO_BOUNDS: [i64; 12] = [50, 100, 200, 400, 800, 1600, 3200, 6400, 12800, 25600, 51200, 102400];
+const FOCAL_BOUNDS: [i64; 8] = [16, 24, 35, 50, 85, 135, 200, 400];
+const EXPOSURE_BOUNDS: [(f64, &str); 19] = [
+    (1.0 / 8000.0, "1/8000"),
+    (1.0 / 4000.0, "1/4000"),
+    (1.0 / 2000.0, "1/2000"),
+    (1.0 / 1000.0, "1/1000"),
+    (1.0 / 500.0, "1/500"),
+    (1.0 / 250.0, "1/250"),
+    (1.0 / 125.0, "1/125"),
+    (1.0 / 60.0, "1/60"),
+    (1.0 / 30.0, "1/30"),
+    (1.0 / 15.0, "1/15"),
+    (1.0 / 8.0, "1/8"),
+    (1.0 / 4.0, "1/4"),
+    (1.0 / 2.0, "1/2"),
+    (1.0, "1"),
+    (2.0, "2"),
+    (4.0, "4"),
+    (8.0, "8"),
+    (15.0, "15"),
+    (30.0, "30"),
+];
+fn ranges(field: &str, bounds: impl Iterator<Item = f64>) -> String {
+    let mut sql = format!("CASE WHEN {field} IS NULL THEN NULL");
+    let mut n = 0;
+    for b in bounds {
+        sql.push_str(&format!(" WHEN {field}<={b} THEN {n}"));
+        n += 1;
+    }
+    sql.push_str(&format!(" ELSE {n} END"));
+    sql
+}
 /// SQL expression a group is browsed and filtered by: the range index for ranged groups, else the column.
-fn expr(key:&str,field:&str)->String{match key{"iso"=>ranges(field,ISO_BOUNDS.iter().map(|b|*b as f64)),"focal"=>ranges(field,FOCAL_BOUNDS.iter().map(|b|*b as f64)),"exposure"=>ranges(field,EXPOSURE_BOUNDS.iter().map(|b|b.0*1.0001)),_=>field.to_string()}}
-fn range_label(bounds:&[i64],i:i64,unit:&str)->String{let i=i.max(0) as usize;if i==0{format!("1 – {}{unit}",bounds[0])}else if i>=bounds.len(){format!("{}+{unit}",bounds[bounds.len()-1]+1)}else{format!("{} – {}{unit}",bounds[i-1]+1,bounds[i])}}
-fn exposure_label(i:i64)->String{let i=i.max(0) as usize;let b=&EXPOSURE_BOUNDS;if i==0{format!("{} s a kratší",b[0].1)}else if i>=b.len(){format!("dlhší než {} s",b[b.len()-1].1)}else{format!("{} – {} s",b[i-1].1,b[i].1)}}
-fn bucket(v:f64)->i64{if v<1_000_000.0{0}else if v<5_000_000.0{1}else if v<20_000_000.0{2}else if v<50_000_000.0{3}else{4}}
-fn bucket_label(v:i64)->&'static str{["< 1 MB","1–5 MB","5–20 MB","20–50 MB","> 50 MB"].get(v as usize).copied().unwrap_or("")}
-fn same(a:&Asset,old:Option<(String,Option<f64>,Option<String>)>)->bool{old.is_some_and(|(p,s,m)|p==a.path&&s==a.size&&m==a.modified)}
-fn string(v:&Value,k:&str)->Option<String>{v.get(k).and_then(Value::as_str).map(str::trim).filter(|s|!s.is_empty()).map(str::to_owned)}
-fn number(v:&Value,k:&str)->Option<f64>{v.get(k).and_then(|x|x.as_f64().or_else(||x.as_str()?.parse().ok())).filter(|x|x.is_finite()&&*x>0.0)}
-fn index_open(path:&Path)->Result<Connection,String>{let conn=Connection::open(path).map_err(|e|e.to_string())?;conn.busy_timeout(Duration::from_secs(3)).map_err(|e|e.to_string())?;conn.execute_batch("PRAGMA journal_mode=WAL;").map_err(|e|e.to_string())?;conn.execute_batch(SCHEMA).map_err(|e|e.to_string())?;Ok(conn)}
+fn expr(key: &str, field: &str) -> String {
+    match key {
+        "iso" => ranges(field, ISO_BOUNDS.iter().map(|b| *b as f64)),
+        "focal" => ranges(field, FOCAL_BOUNDS.iter().map(|b| *b as f64)),
+        "exposure" => ranges(field, EXPOSURE_BOUNDS.iter().map(|b| b.0 * 1.0001)),
+        _ => field.to_string(),
+    }
+}
+fn range_label(bounds: &[i64], i: i64, unit: &str) -> String {
+    let i = i.max(0) as usize;
+    if i == 0 {
+        format!("1 – {}{unit}", bounds[0])
+    } else if i >= bounds.len() {
+        format!("{}+{unit}", bounds[bounds.len() - 1] + 1)
+    } else {
+        format!("{} – {}{unit}", bounds[i - 1] + 1, bounds[i])
+    }
+}
+fn exposure_label(i: i64) -> String {
+    let i = i.max(0) as usize;
+    let b = &EXPOSURE_BOUNDS;
+    if i == 0 {
+        format!("{} s a kratší", b[0].1)
+    } else if i >= b.len() {
+        format!("dlhší než {} s", b[b.len() - 1].1)
+    } else {
+        format!("{} – {} s", b[i - 1].1, b[i].1)
+    }
+}
+fn bucket(v: f64) -> i64 {
+    if v < 1_000_000.0 {
+        0
+    } else if v < 5_000_000.0 {
+        1
+    } else if v < 20_000_000.0 {
+        2
+    } else if v < 50_000_000.0 {
+        3
+    } else {
+        4
+    }
+}
+fn bucket_label(v: i64) -> &'static str {
+    ["< 1 MB", "1–5 MB", "5–20 MB", "20–50 MB", "> 50 MB"]
+        .get(v as usize)
+        .copied()
+        .unwrap_or("")
+}
+fn same(a: &Asset, old: Option<(String, Option<f64>, Option<String>)>) -> bool {
+    old.is_some_and(|(p, s, m)| p == a.path && s == a.size && m == a.modified)
+}
+fn string(v: &Value, k: &str) -> Option<String> {
+    v.get(k)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+fn number(v: &Value, k: &str) -> Option<f64> {
+    v.get(k)
+        .and_then(|x| x.as_f64().or_else(|| x.as_str()?.parse().ok()))
+        .filter(|x| x.is_finite() && *x > 0.0)
+}
+fn index_open(path: &Path) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|e| e.to_string())?;
+    conn.busy_timeout(Duration::from_secs(3)).map_err(|e| e.to_string())?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")
+        .map_err(|e| e.to_string())?;
+    conn.execute_batch(SCHEMA).map_err(|e| e.to_string())?;
+    Ok(conn)
+}
 impl ExifIndex {
-    pub fn new(catalog:PathBuf,tool:PathBuf,formats:Arc<FormatTable>,db:&Db)->Arc<Self>{
-        let path=catalog.parent().unwrap_or(Path::new(".")).join("exif.sqlite");
-        let service=Arc::new(Self{path:path.clone(),catalog,tool,formats,progress:Mutex::new(Progress::default())});
-        match index_open(&path).and_then(|_|db.lock().map_err(|e|e.to_string())?.execute("ATTACH DATABASE ? AS auto_exif",[path.to_string_lossy().as_ref()]).map(|_|()).map_err(|e|e.to_string())){Ok(())=>{let worker=service.clone();thread::spawn(move||{thread::sleep(Duration::from_secs(5));loop{if let Err(e)=worker.scan(){if let Ok(mut p)=worker.progress.lock(){p.running=false;p.error=Some(e)}}thread::sleep(Duration::from_secs(60));}});},Err(e)=>service.progress.lock().unwrap().error=Some(e)}
+    pub fn new(catalog: PathBuf, tool: PathBuf, formats: Arc<FormatTable>, db: &Db) -> Arc<Self> {
+        let path = catalog.parent().unwrap_or(Path::new(".")).join("exif.sqlite");
+        let service = Arc::new(Self {
+            path: path.clone(),
+            catalog,
+            tool,
+            formats,
+            progress: Mutex::new(Progress::default()),
+        });
+        match index_open(&path).and_then(|_| {
+            db.lock()
+                .map_err(|e| e.to_string())?
+                .execute("ATTACH DATABASE ? AS auto_exif", [path.to_string_lossy().as_ref()])
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(()) => {
+                let worker = service.clone();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_secs(5));
+                    loop {
+                        if let Err(e) = worker.scan() {
+                            if let Ok(mut p) = worker.progress.lock() {
+                                p.running = false;
+                                p.error = Some(e)
+                            }
+                        }
+                        thread::sleep(Duration::from_secs(60));
+                    }
+                });
+            }
+            Err(e) => service.progress.lock().unwrap().error = Some(e),
+        }
         service
     }
-    pub fn snapshot(&self)->Result<(Vec<Group>,Progress),String>{let conn=Connection::open_with_flags(&self.path,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;let groups=group_query(&conn)?;Ok((groups,self.progress.lock().map_err(|e|e.to_string())?.clone()))}
-    fn scan(&self)->Result<(),String>{
-        let catalog=Connection::open_with_flags(&self.catalog,rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(|e|e.to_string())?;
+    pub fn snapshot(&self) -> Result<(Vec<Group>, Progress), String> {
+        let conn = Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
+        let groups = group_query(&conn)?;
+        Ok((groups, self.progress.lock().map_err(|e| e.to_string())?.clone()))
+    }
+    fn scan(&self) -> Result<(), String> {
+        let catalog = Connection::open_with_flags(&self.catalog, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|e| e.to_string())?;
         let mut stmt=catalog.prepare("SELECT id,path,size,file_modified,coalesce(ext_lower,ext,'') FROM assets WHERE is_listed=1 AND path IS NOT NULL AND path<>''").map_err(|e|e.to_string())?;
-        let assets=stmt.query_map([],|r|Ok(Asset{id:r.get(0)?,path:r.get(1)?,size:r.get(2)?,modified:r.get(3)?,ext:r.get(4)?})).map_err(|e|e.to_string())?.filter_map(Result::ok).filter(|a|matches!(self.formats.group(&a.ext),Some("image"|"raw"))).collect::<Vec<_>>();
-        drop(stmt);let mut conn=index_open(&self.path)?;
-        let old={let mut s=conn.prepare("SELECT asset_id,path,size,modified FROM exif_index").map_err(|e|e.to_string())?;let rows=s.query_map([],|r|Ok((r.get::<_,i64>(0)?,(r.get::<_,String>(1)?,r.get::<_,Option<f64>>(2)?,r.get::<_,Option<String>>(3)?)))).map_err(|e|e.to_string())?;rows.filter_map(Result::ok).collect::<HashMap<_,_>>()};
-        let ids=assets.iter().map(|a|a.id).collect::<std::collections::HashSet<_>>();
-        {let tx=conn.transaction().map_err(|e|e.to_string())?;for id in old.keys().filter(|id|!ids.contains(id)){tx.execute("DELETE FROM exif_index WHERE asset_id=?",[id]).map_err(|e|e.to_string())?;}tx.commit().map_err(|e|e.to_string())?;}
-        let mut todo=Vec::new();let mut done=0;let mut stale=Vec::new();for a in assets.iter(){if same(a,old.get(&a.id).cloned()){done+=1}else {if old.contains_key(&a.id){stale.push(a.id)}if Path::new(&a.path).is_file(){todo.push(a.clone())}}}
-        {let tx=conn.transaction().map_err(|e|e.to_string())?;for id in stale{tx.execute("DELETE FROM exif_index WHERE asset_id=?",[id]).map_err(|e|e.to_string())?;}tx.commit().map_err(|e|e.to_string())?;}
-        *self.progress.lock().unwrap()=Progress{done,total:assets.len(),running:!todo.is_empty(),error:None};
-        for batch in todo.chunks(200){let (values, error)=read_batch(&self.tool,batch);let tx=conn.transaction().map_err(|e|e.to_string())?;let mut count=0;
+        let assets = stmt
+            .query_map([], |r| {
+                Ok(Asset {
+                    id: r.get(0)?,
+                    path: r.get(1)?,
+                    size: r.get(2)?,
+                    modified: r.get(3)?,
+                    ext: r.get(4)?,
+                })
+            })
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .filter(|a| matches!(self.formats.group(&a.ext), Some("image" | "raw")))
+            .collect::<Vec<_>>();
+        drop(stmt);
+        let mut conn = index_open(&self.path)?;
+        let old = {
+            let mut s = conn
+                .prepare("SELECT asset_id,path,size,modified FROM exif_index")
+                .map_err(|e| e.to_string())?;
+            let rows = s
+                .query_map([], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        (
+                            r.get::<_, String>(1)?,
+                            r.get::<_, Option<f64>>(2)?,
+                            r.get::<_, Option<String>>(3)?,
+                        ),
+                    ))
+                })
+                .map_err(|e| e.to_string())?;
+            rows.filter_map(Result::ok).collect::<HashMap<_, _>>()
+        };
+        let ids = assets.iter().map(|a| a.id).collect::<std::collections::HashSet<_>>();
+        {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for id in old.keys().filter(|id| !ids.contains(id)) {
+                tx.execute("DELETE FROM exif_index WHERE asset_id=?", [id])
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        let mut todo = Vec::new();
+        let mut done = 0;
+        let mut stale = Vec::new();
+        for a in assets.iter() {
+            if same(a, old.get(&a.id).cloned()) {
+                done += 1
+            } else {
+                if old.contains_key(&a.id) {
+                    stale.push(a.id)
+                }
+                if Path::new(&a.path).is_file() {
+                    todo.push(a.clone())
+                }
+            }
+        }
+        {
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            for id in stale {
+                tx.execute("DELETE FROM exif_index WHERE asset_id=?", [id])
+                    .map_err(|e| e.to_string())?;
+            }
+            tx.commit().map_err(|e| e.to_string())?;
+        }
+        *self.progress.lock().unwrap() = Progress {
+            done,
+            total: assets.len(),
+            running: !todo.is_empty(),
+            error: None,
+        };
+        for batch in todo.chunks(200) {
+            let (values, error) = read_batch(&self.tool, batch);
+            let tx = conn.transaction().map_err(|e| e.to_string())?;
+            let mut count = 0;
             // Every file of the batch gets a row, even without EXIF, so it is not re-read on every pass.
             for a in batch {
                 let v = match values.get(&crate::native_exif::path_key(&a.path)) {
@@ -66,16 +324,31 @@ impl ExifIndex {
                 let row = index_values(v);
                 tx.execute("INSERT OR REPLACE INTO exif_index(asset_id,path,size,modified,camera,lens,iso,aperture,exposure,focal,ext,bucket) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                     params![a.id,a.path,a.size,a.modified,row.camera,row.lens,row.iso,row.aperture,row.exposure,row.focal,a.ext.to_lowercase(),a.size.filter(|x|*x>=0.0).map(bucket)]).map_err(|e|e.to_string())?;
-                count+=1;
+                count += 1;
             }
-            tx.commit().map_err(|e|e.to_string())?;self.progress.lock().unwrap().done+=count;
-            if let Some(error) = error { return Err(error); }
+            tx.commit().map_err(|e| e.to_string())?;
+            self.progress.lock().unwrap().done += count;
+            if let Some(error) = error {
+                return Err(error);
+            }
             thread::sleep(Duration::from_millis(250));
         }
-        self.progress.lock().unwrap().running=false;Ok(())
+        self.progress.lock().unwrap().running = false;
+        Ok(())
     }
 }
-pub(crate) const INDEX_TAGS: &[&str] = &["Make", "Model", "LensModel", "LensID", "Lens", "ISO", "FNumber", "Aperture", "ExposureTime", "FocalLength"];
+pub(crate) const INDEX_TAGS: &[&str] = &[
+    "Make",
+    "Model",
+    "LensModel",
+    "LensID",
+    "Lens",
+    "ISO",
+    "FNumber",
+    "Aperture",
+    "ExposureTime",
+    "FocalLength",
+];
 
 #[derive(Serialize)]
 pub(crate) struct IndexValues {
@@ -92,7 +365,10 @@ pub(crate) fn index_values(v: &Value) -> IndexValues {
     let model = string(v, "Model");
     IndexValues {
         camera: camera(make.as_deref(), model.as_deref()),
-        lens: [string(v,"LensModel"),string(v,"LensID"),string(v,"Lens")].into_iter().flatten().find(|s|!placeholder(s)),
+        lens: [string(v, "LensModel"), string(v, "LensID"), string(v, "Lens")]
+            .into_iter()
+            .flatten()
+            .find(|s| !placeholder(s)),
         iso: number(v, "ISO").map(|x| x.round() as i64),
         aperture: number(v, "FNumber").or_else(|| number(v, "Aperture")).map(aperture),
         exposure: number(v, "ExposureTime").map(|x| if x < 1.0 { 1.0 / (1.0 / x).round().max(1.0) } else { x }),
@@ -102,34 +378,213 @@ pub(crate) fn index_values(v: &Value) -> IndexValues {
 
 pub(crate) fn index_complete(v: &Value) -> bool {
     string(v, "LensModel").is_some_and(|lens| !placeholder(&lens))
-        && ["Make", "Model", "ISO", "FNumber", "ExposureTime", "FocalLength"].iter().all(|tag| v.get(*tag).is_some())
+        && ["Make", "Model", "ISO", "FNumber", "ExposureTime", "FocalLength"]
+            .iter()
+            .all(|tag| v.get(*tag).is_some())
 }
 
 fn read_batch(tool: &Path, assets: &[Asset]) -> (HashMap<String, Value>, Option<String>) {
-    let paths = assets.iter().map(|asset| PathBuf::from(&asset.path)).collect::<Vec<_>>();
-    let (rows, error) = crate::native_exif::with_fallback(&paths, INDEX_TAGS, true, index_complete, |paths| read_exiftool(tool, paths));
-    (assets.iter().zip(rows).filter_map(|(asset, row)| {
-        Some((crate::native_exif::path_key(&asset.path), row?))
-    }).collect(), error)
+    let paths = assets
+        .iter()
+        .map(|asset| PathBuf::from(&asset.path))
+        .collect::<Vec<_>>();
+    let (rows, error) = crate::native_exif::with_fallback(&paths, INDEX_TAGS, true, index_complete, |paths| {
+        read_exiftool(tool, paths)
+    });
+    (
+        assets
+            .iter()
+            .zip(rows)
+            .filter_map(|(asset, row)| Some((crate::native_exif::path_key(&asset.path), row?)))
+            .collect(),
+        error,
+    )
 }
 
 pub(crate) fn read_exiftool(tool: &Path, paths: &[PathBuf]) -> Result<Vec<Value>, String> {
-    let mut cmd=Command::new(tool);
-    cmd.args(["-charset","filename=UTF8","-j","-n","-fast2"])
+    let mut cmd = Command::new(tool);
+    cmd.args(["-charset", "filename=UTF8", "-j", "-n", "-fast2"])
         .args(INDEX_TAGS.iter().map(|tag| format!("-{tag}")))
-        .args(["-@","-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
-    #[cfg(windows)] {use std::os::windows::process::CommandExt;cmd.creation_flags(0x0800_0000|0x0000_4000);}
-    let mut child=cmd.spawn().map_err(|e|e.to_string())?;let mut input=child.stdin.take().ok_or("ExifTool stdin")?;
-    let paths=paths.iter().map(|path|path.to_string_lossy().into_owned()).collect::<Vec<_>>();
-    let writer=thread::spawn(move||->std::io::Result<()>{for path in paths{if path.contains(['\n','\r']){continue}writeln!(input,"{path}")?;}Ok(())});
-    let output=child.wait_with_output().map_err(|e|e.to_string())?;writer.join().map_err(|_|"ExifTool input thread failed")?.map_err(|e|e.to_string())?;if output.stdout.iter().all(u8::is_ascii_whitespace){return Ok(Vec::new())}
-    serde_json::from_slice(&output.stdout).map_err(|e|format!("ExifTool: {e}"))
+        .args(["-@", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000 | 0x0000_4000);
+    }
+    let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+    let mut input = child.stdin.take().ok_or("ExifTool stdin")?;
+    let paths = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let writer = thread::spawn(move || -> std::io::Result<()> {
+        for path in paths {
+            if path.contains(['\n', '\r']) {
+                continue;
+            }
+            writeln!(input, "{path}")?;
+        }
+        Ok(())
+    });
+    let output = child.wait_with_output().map_err(|e| e.to_string())?;
+    writer
+        .join()
+        .map_err(|_| "ExifTool input thread failed")?
+        .map_err(|e| e.to_string())?;
+    if output.stdout.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    serde_json::from_slice(&output.stdout).map_err(|e| format!("ExifTool: {e}"))
 }
-pub fn field(group:&str)->Option<String>{GROUPS.iter().find(|g|g.0==group).map(|g|expr(g.0,g.2))}
-fn group_query(conn:&Connection)->Result<Vec<Group>,String>{let mut groups=Vec::new();for (key,name,field,order) in GROUPS{let e=expr(key,field);let order=if e==field{order}else{"1"};let sql=format!("SELECT {e},count(*) FROM exif_index WHERE {field} IS NOT NULL AND CAST({field} AS TEXT)<>'' GROUP BY 1 ORDER BY {order}");let mut stmt=conn.prepare(&sql).map_err(|e|e.to_string())?;let mut rows=stmt.query([]).map_err(|e|e.to_string())?;let mut values=Vec::new();while let Some(r)=rows.next().map_err(|e|e.to_string())?{let raw=r.get_ref(0).map_err(|e|e.to_string())?;let label=match key{"aperture"=>format!("f/{:.1}",r.get::<_,f64>(0).unwrap()),"iso"=>range_label(&ISO_BOUNDS,r.get::<_,i64>(0).unwrap(),""),"exposure"=>exposure_label(r.get::<_,i64>(0).unwrap()),"focal"=>range_label(&FOCAL_BOUNDS,r.get::<_,i64>(0).unwrap()," mm"),"bucket"=>bucket_label(r.get::<_,i64>(0).unwrap()).to_string(),_=>match raw{rusqlite::types::ValueRef::Text(t)=>String::from_utf8_lossy(t).into_owned(),rusqlite::types::ValueRef::Integer(n)=>n.to_string(),_=>String::new()}};let value=match raw{rusqlite::types::ValueRef::Real(n)=>n.to_string(),rusqlite::types::ValueRef::Integer(n)=>n.to_string(),rusqlite::types::ValueRef::Text(t)=>String::from_utf8_lossy(t).into_owned(),_=>String::new()};values.push(GroupValue{value,label,count:r.get(1).map_err(|e|e.to_string())?});}if !values.is_empty(){groups.push(Group{key:key.into(),name:name.into(),values});}}Ok(groups)}
+pub fn field(group: &str) -> Option<String> {
+    GROUPS.iter().find(|g| g.0 == group).map(|g| expr(g.0, g.2))
+}
+fn group_query(conn: &Connection) -> Result<Vec<Group>, String> {
+    let mut groups = Vec::new();
+    for (key, name, field, order) in GROUPS {
+        let e = expr(key, field);
+        let order = if e == field { order } else { "1" };
+        let sql = format!(
+            "SELECT {e},count(*) FROM exif_index WHERE {field} IS NOT NULL AND CAST({field} AS TEXT)<>'' GROUP BY 1 ORDER BY {order}"
+        );
+        let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+        let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
+        let mut values = Vec::new();
+        while let Some(r) = rows.next().map_err(|e| e.to_string())? {
+            let raw = r.get_ref(0).map_err(|e| e.to_string())?;
+            let label = match key {
+                "aperture" => format!("f/{:.1}", r.get::<_, f64>(0).unwrap()),
+                "iso" => range_label(&ISO_BOUNDS, r.get::<_, i64>(0).unwrap(), ""),
+                "exposure" => exposure_label(r.get::<_, i64>(0).unwrap()),
+                "focal" => range_label(&FOCAL_BOUNDS, r.get::<_, i64>(0).unwrap(), " mm"),
+                "bucket" => bucket_label(r.get::<_, i64>(0).unwrap()).to_string(),
+                _ => match raw {
+                    rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                    rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                    _ => String::new(),
+                },
+            };
+            let value = match raw {
+                rusqlite::types::ValueRef::Real(n) => n.to_string(),
+                rusqlite::types::ValueRef::Integer(n) => n.to_string(),
+                rusqlite::types::ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
+                _ => String::new(),
+            };
+            values.push(GroupValue {
+                value,
+                label,
+                count: r.get(1).map_err(|e| e.to_string())?,
+            });
+        }
+        if !values.is_empty() {
+            groups.push(Group {
+                key: key.into(),
+                name: name.into(),
+                values,
+            });
+        }
+    }
+    Ok(groups)
+}
 
-#[cfg(test)] mod tests{use super::*; use rusqlite::OptionalExtension;
-#[test]fn normalization(){assert_eq!(camera(Some(" Canon "),Some("Canon EOS R6")).as_deref(),Some("Canon EOS R6"));assert_eq!(camera(Some("Canon"),Some("EOS R6")).as_deref(),Some("Canon EOS R6"));assert_eq!(aperture(2.84),2.8);assert!(placeholder("----")&&placeholder("0.0 mm")==false&&placeholder("Unknown")&&!placeholder("E 28-75mm F2.8"));assert_eq!(range_label(&ISO_BOUNDS,0,""),"1 – 50");assert_eq!(range_label(&ISO_BOUNDS,3,""),"201 – 400");assert_eq!(range_label(&ISO_BOUNDS,12,""),"102401+");assert_eq!(exposure_label(0),"1/8000 s a kratší");assert_eq!(exposure_label(5),"1/500 – 1/250 s");assert_eq!(exposure_label(19),"dlhší než 30 s");assert_eq!([bucket(0.0),bucket(1_000_000.0),bucket(5_000_000.0),bucket(20_000_000.0),bucket(50_000_000.0)],[0,1,2,3,4]);}
-#[test]fn skip_reindex(){let c=Connection::open_in_memory().unwrap();c.execute_batch(SCHEMA).unwrap();c.execute("INSERT INTO exif_index(asset_id,path,size,modified) VALUES(1,'a',10,'x')",[]).unwrap();let old=c.query_row("SELECT path,size,modified FROM exif_index WHERE asset_id=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().unwrap();let mut a=Asset{id:1,path:"a".into(),size:Some(10.0),modified:Some("x".into()),ext:"jpg".into()};assert!(same(&a,old.clone()));a.modified=Some("y".into());assert!(!same(&a,old));}
-#[test]fn grouping(){let c=Connection::open_in_memory().unwrap();c.execute_batch(SCHEMA).unwrap();c.execute_batch("INSERT INTO exif_index(asset_id,path,camera,iso) VALUES(1,'a','Canon',100),(2,'b','Canon',200),(3,'c','Nikon',100)").unwrap();let g=group_query(&c).unwrap();assert_eq!(g[0].values[0].count,2);assert_eq!(g[1].values[0].count,2);}
-#[test]fn ranged_groups(){let c=Connection::open_in_memory().unwrap();c.execute_batch(SCHEMA).unwrap();c.execute_batch("INSERT INTO exif_index(asset_id,path,iso,exposure,focal) VALUES(1,'a',64,0.004,24),(2,'b',100,0.003125,25),(3,'c',125,1.0/2625,600),(4,'d',NULL,NULL,NULL)").unwrap();let g=group_query(&c).unwrap();let labels=|k:&str|g.iter().find(|x|x.key==k).unwrap().values.iter().map(|v|format!("{}={}",v.label,v.count)).collect::<Vec<_>>();assert_eq!(labels("iso"),["51 – 100=2","101 – 200=1"]);assert_eq!(labels("exposure"),["1/4000 – 1/2000 s=1","1/500 – 1/250 s=2"]);assert_eq!(labels("focal"),["17 – 24 mm=1","25 – 35 mm=1","401+ mm=1"]);let n:i64=c.query_row(&format!("SELECT count(*) FROM exif_index WHERE {}=?",field("iso").unwrap()),[1],|r|r.get(0)).unwrap();assert_eq!(n,2);}}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::OptionalExtension;
+    #[test]
+    fn normalization() {
+        assert_eq!(
+            camera(Some(" Canon "), Some("Canon EOS R6")).as_deref(),
+            Some("Canon EOS R6")
+        );
+        assert_eq!(camera(Some("Canon"), Some("EOS R6")).as_deref(), Some("Canon EOS R6"));
+        assert_eq!(aperture(2.84), 2.8);
+        assert!(
+            placeholder("----")
+                && placeholder("0.0 mm") == false
+                && placeholder("Unknown")
+                && !placeholder("E 28-75mm F2.8")
+        );
+        assert_eq!(range_label(&ISO_BOUNDS, 0, ""), "1 – 50");
+        assert_eq!(range_label(&ISO_BOUNDS, 3, ""), "201 – 400");
+        assert_eq!(range_label(&ISO_BOUNDS, 12, ""), "102401+");
+        assert_eq!(exposure_label(0), "1/8000 s a kratší");
+        assert_eq!(exposure_label(5), "1/500 – 1/250 s");
+        assert_eq!(exposure_label(19), "dlhší než 30 s");
+        assert_eq!(
+            [
+                bucket(0.0),
+                bucket(1_000_000.0),
+                bucket(5_000_000.0),
+                bucket(20_000_000.0),
+                bucket(50_000_000.0)
+            ],
+            [0, 1, 2, 3, 4]
+        );
+    }
+    #[test]
+    fn skip_reindex() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute(
+            "INSERT INTO exif_index(asset_id,path,size,modified) VALUES(1,'a',10,'x')",
+            [],
+        )
+        .unwrap();
+        let old = c
+            .query_row("SELECT path,size,modified FROM exif_index WHERE asset_id=1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .optional()
+            .unwrap();
+        let mut a = Asset {
+            id: 1,
+            path: "a".into(),
+            size: Some(10.0),
+            modified: Some("x".into()),
+            ext: "jpg".into(),
+        };
+        assert!(same(&a, old.clone()));
+        a.modified = Some("y".into());
+        assert!(!same(&a, old));
+    }
+    #[test]
+    fn grouping() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute_batch("INSERT INTO exif_index(asset_id,path,camera,iso) VALUES(1,'a','Canon',100),(2,'b','Canon',200),(3,'c','Nikon',100)").unwrap();
+        let g = group_query(&c).unwrap();
+        assert_eq!(g[0].values[0].count, 2);
+        assert_eq!(g[1].values[0].count, 2);
+    }
+    #[test]
+    fn ranged_groups() {
+        let c = Connection::open_in_memory().unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        c.execute_batch("INSERT INTO exif_index(asset_id,path,iso,exposure,focal) VALUES(1,'a',64,0.004,24),(2,'b',100,0.003125,25),(3,'c',125,1.0/2625,600),(4,'d',NULL,NULL,NULL)").unwrap();
+        let g = group_query(&c).unwrap();
+        let labels = |k: &str| {
+            g.iter()
+                .find(|x| x.key == k)
+                .unwrap()
+                .values
+                .iter()
+                .map(|v| format!("{}={}", v.label, v.count))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(labels("iso"), ["51 – 100=2", "101 – 200=1"]);
+        assert_eq!(labels("exposure"), ["1/4000 – 1/2000 s=1", "1/500 – 1/250 s=2"]);
+        assert_eq!(labels("focal"), ["17 – 24 mm=1", "25 – 35 mm=1", "401+ mm=1"]);
+        let n: i64 = c
+            .query_row(
+                &format!("SELECT count(*) FROM exif_index WHERE {}=?", field("iso").unwrap()),
+                [1],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+}

@@ -18,19 +18,8 @@ import { buildAssetFilter, effectiveViewFilters } from "../assetFilter";
 import type { useGridSelectionState } from "./useAssetValues";
 import type { useViewer } from "./useViewer";
 
-export type AppInfo = {
-  root: string;
-  catalog: string;
-  backups: string;
-  cache: string;
-  exiftool: string;
-  formats: string;
-  metadataView: string;
-  settings: string;
-  portable: boolean;
-  readonly: boolean;
-};
-type RecentChange = { id: number; ts: string; summary: string };
+export type AppInfo = import("../bindings/AppInfo").AppInfo;
+type RecentChange = import("../bindings/ChangeSummary").ChangeSummary;
 
 // The last opened folder, or the Windows Pictures folder on the very first start.
 async function initialFolderPath(): Promise<string> {
@@ -126,7 +115,7 @@ export function useNavigation({
             ...buildAssetFilter(next, "", "name", false, effectiveViewFilters({}, showOtherFiles), false),
             offset: 0,
             limit: 1,
-          },
+          } satisfies import("../bindings/AssetFilter").AssetFilter,
         });
         const asset = page.items[0];
         if (asset) {

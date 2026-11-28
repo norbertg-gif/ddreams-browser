@@ -32,6 +32,8 @@ pub struct FileCatalogCopy {
 
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct ExclusionImpact {
     pub files: usize,
     pub with_categories: usize,
@@ -42,6 +44,8 @@ pub struct ExclusionImpact {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct RemoveCatalogResult {
     pub change_id: Option<i64>,
     pub summary: String,

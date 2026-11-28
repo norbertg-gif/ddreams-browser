@@ -109,6 +109,8 @@ Premenné prostredia: `DDREAMS_CATALOG`, `DDREAMS_CACHE`, `DDREAMS_EXIFTOOL`, `D
 
 Testy:
 
+Porovnanie vygenerovaných typov Tauri IPC s verziou v repozitári: `npm run check:bindings`.
+
 ```powershell
 cd src-tauri; cargo test; cd ..
 npx tsc --noEmit

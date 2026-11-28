@@ -8,6 +8,8 @@ use super::{FileManager, FileOperationResult, validate_windows_name};
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+#[cfg_attr(test, derive(ts_rs::TS))]
+#[cfg_attr(test, ts(export, export_to = "./"))]
 pub struct DeleteFolderInfo {
     pub files: usize,
     pub folders: usize,

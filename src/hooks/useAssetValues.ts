@@ -16,38 +16,12 @@ import type { Asset, IptcTextField, Page } from "../types";
 import type { AppInfo, useNavigation, useListingRefresh } from "./useNavigation";
 import type { useViewer } from "./useViewer";
 
-export type AssetEditValues = {
-  changeId: number | null;
-  summary: string;
-  value?: string | null;
-  remappedIds: { oldId: number; newId: number }[];
-  assets: {
-    id: number;
-    rating: number | null;
-    label: string | null;
-    tagged: boolean;
-    editPendingSince: number | null;
-  }[];
-};
+type AssetEditValues = import("../bindings/SetAssetValuesResult").SetAssetValuesResult;
+type AssetValueUpdate = AssetEditValues &
+  Partial<Pick<import("../bindings/SetAssetTextResult").SetAssetTextResult, "value">>;
 
-type CategoryMutation = {
-  changeId: number | null;
-  summary: string;
-  categoryId: number | null;
-  parentId: number | null;
-  rootId: number | null;
-  ancestorIds: number[];
-  deletedCategoryIds: number[];
-  deletedRootIds: number[];
-};
-type KeywordMutation = {
-  changeId: number | null;
-  summary: string;
-  keywordId: number | null;
-  parentId: number | null;
-  ancestorIds: number[];
-  deletedKeywordIds: number[];
-};
+type CategoryMutation = import("../bindings/CategoryMutationResult").CategoryMutationResult;
+type KeywordMutation = import("../bindings/KeywordMutationResult").KeywordMutationResult;
 
 export function useGridSelectionState() {
   const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
@@ -138,7 +112,9 @@ export function useGridSelection({ assetFilter, selection }: GridSelectionOption
         return;
       }
       const wanted = new Set(ids);
-      const page = await invoke<Page>("get_assets", { filter: { ...assetFilter, offset: 0, limit: 500 } });
+      const page = await invoke<Page>("get_assets", {
+        filter: { ...assetFilter, offset: 0, limit: 500 } satisfies import("../bindings/AssetFilter").AssetFilter,
+      });
       const asset = page.items.find((a) => wanted.has(a.id));
       if (asset) {
         setPrimaryId(asset.id);
@@ -149,16 +125,22 @@ export function useGridSelection({ assetFilter, selection }: GridSelectionOption
   );
   const selectTaggedInView = useCallback(async () => {
     const filter = { ...assetFilter, taggedOnly: true };
-    const first = await invoke<Page>("get_assets", { filter: { ...filter, offset: 0, limit: 1 } });
+    const first = await invoke<Page>("get_assets", {
+      filter: { ...filter, offset: 0, limit: 1 } satisfies import("../bindings/AssetFilter").AssetFilter,
+    });
     const ids: number[] = [];
     for (let offset = 0; offset < first.total; offset += 500) {
-      const page = await invoke<Page>("get_assets", { filter: { ...filter, offset, limit: 500 } });
+      const page = await invoke<Page>("get_assets", {
+        filter: { ...filter, offset, limit: 500 } satisfies import("../bindings/AssetFilter").AssetFilter,
+      });
       ids.push(...page.items.filter((asset) => !asset.isDirectory).map((asset) => asset.id));
       if (page.items.length < 500) break;
     }
     setSelectedIds(new Set(ids));
     if (ids.length) {
-      const page = await invoke<Page>("get_assets", { filter: { ...filter, offset: 0, limit: 500 } });
+      const page = await invoke<Page>("get_assets", {
+        filter: { ...filter, offset: 0, limit: 500 } satisfies import("../bindings/AssetFilter").AssetFilter,
+      });
       const asset = page.items.find((item) => item.id === ids[0]);
       if (asset) {
         setPrimaryId(asset.id);
@@ -209,7 +191,7 @@ export function useAssetValues({
   const { valueWrites, valueAliases, setValueTokens, setPrimaryValueEdit, valueContext } = assetValueState;
   const { loadRecentChanges, refreshAfterWrite } = listing;
   const applyAssetValues = useCallback(
-    (result: AssetEditValues, changes: Record<string, unknown>) => {
+    (result: AssetValueUpdate, changes: Record<string, unknown>) => {
       const textField: IptcTextField | null = "caption" in changes ? "caption" : "author" in changes ? "author" : null;
       const ratingEdited = "rating" in changes,
         labelEdited = "label" in changes;
@@ -351,12 +333,10 @@ export function useAssetValues({
       }
       if (!ids.length) return false;
       try {
-        const result = await invoke<{
-          changeId: number | null;
-          summary: string;
-          changedCount: number;
-          remappedIds: { oldId: number; newId: number }[];
-        }>("set_asset_categories", { assetIds: ids, categoryId, assign });
+        const result = await invoke<import("../bindings/SetAssetCategoriesResult").SetAssetCategoriesResult>(
+          "set_asset_categories",
+          { assetIds: ids, categoryId, assign },
+        );
         const remap = new Map(result.remappedIds.map((item) => [item.oldId, item.newId]));
         setSelectedIds((previous) => new Set([...previous].map((id) => remap.get(id) ?? id)));
         const nextPrimary = primaryId == null ? null : (remap.get(primaryId) ?? primaryId);
@@ -396,12 +376,10 @@ export function useAssetValues({
       }
       if (!ids.length) return false;
       try {
-        const result = await invoke<{
-          changeId: number | null;
-          summary: string;
-          changedCount: number;
-          remappedIds: { oldId: number; newId: number }[];
-        }>("set_asset_keywords", { assetIds: ids, keywordId, assign });
+        const result = await invoke<import("../bindings/SetAssetKeywordsResult").SetAssetKeywordsResult>(
+          "set_asset_keywords",
+          { assetIds: ids, keywordId, assign },
+        );
         const remap = new Map(result.remappedIds.map((item) => [item.oldId, item.newId]));
         setSelectedIds((previous) => new Set([...previous].map((id) => remap.get(id) ?? id)));
         const nextPrimary = primaryId == null ? null : (remap.get(primaryId) ?? primaryId);
@@ -433,15 +411,10 @@ export function useAssetValues({
       }
       if (!ids.length) return;
       try {
-        const result = await invoke<{
-          changeId: number | null;
-          summary: string;
-          changedCount: number;
-          remappedIds: { oldId: number; newId: number }[];
-          keywordId: number | null;
-          parentId: number | null;
-          ancestorIds: number[];
-        }>("create_and_assign_keyword", { assetIds: ids, parentId, name });
+        const result = await invoke<import("../bindings/SetAssetKeywordsResult").SetAssetKeywordsResult>(
+          "create_and_assign_keyword",
+          { assetIds: ids, parentId, name },
+        );
         const remap = new Map(result.remappedIds.map((item) => [item.oldId, item.newId]));
         setSelectedIds((previous) => new Set([...previous].map((id) => remap.get(id) ?? id)));
         const nextPrimary = primaryId == null ? null : (remap.get(primaryId) ?? primaryId);

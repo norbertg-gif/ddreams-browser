@@ -1,19 +1,7 @@
 import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-type FullImageSource = "original" | "pillow" | "rawFull" | "embedded" | "rawReduced";
-
-type FullImageInfo = {
-  width: number;
-  height: number;
-  originalWidth: number;
-  originalHeight: number;
-  source: FullImageSource;
-  key: string;
-  length: number;
-  contentType: string;
-  chunkSize: number;
-};
+type FullImageInfo = import("../bindings/FullImageInfo").FullImageInfo;
 
 type FullFrame = Pick<FullImageInfo, "width" | "height" | "originalWidth" | "originalHeight" | "source"> & {
   url: string;
@@ -26,20 +14,32 @@ export function createFullImageQueue() {
   return () => {
     const previous = pending;
     let release!: () => void;
-    pending = new Promise<void>(resolve => { release = resolve; });
+    pending = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     return previous.then(() => release);
   };
 }
 
-export function useFullImage(fileKey: string | null, assetId: number | null, ready: boolean, rawDecode: boolean,
-  queue?: ReturnType<typeof createFullImageQueue>) {
+export function useFullImage(
+  fileKey: string | null,
+  assetId: number | null,
+  ready: boolean,
+  rawDecode: boolean,
+  queue?: ReturnType<typeof createFullImageQueue>,
+) {
   const [displayed, setDisplayed] = useState<{ fileKey: string; frame: FullFrame } | null>(null);
   const [pending, setPending] = useState<{ fileKey: string; rawDecode: boolean } | null>(null);
   const displayedUrl = displayed?.frame.url;
-  useEffect(() => () => { if (displayedUrl) URL.revokeObjectURL(displayedUrl); }, [displayedUrl]);
+  useEffect(
+    () => () => {
+      if (displayedUrl) URL.revokeObjectURL(displayedUrl);
+    },
+    [displayedUrl],
+  );
 
   useEffect(() => {
-    setDisplayed(current => current?.fileKey === fileKey ? current : null);
+    setDisplayed((current) => (current?.fileKey === fileKey ? current : null));
     setPending(null);
     if (fileKey === null || assetId === null || !ready) return;
     const request = { fileKey, rawDecode };
@@ -65,7 +65,8 @@ export function useFullImage(fileKey: string | null, assetId: number | null, rea
         for (let offset = 0; offset < info.length;) {
           const bytes = await invoke<ArrayBuffer>("read_full_image_chunk", { ...args, key: info.key, offset });
           if (!active) return;
-          if (bytes.byteLength !== Math.min(info.chunkSize, info.length - offset)) throw new Error("Image file changed");
+          if (bytes.byteLength !== Math.min(info.chunkSize, info.length - offset))
+            throw new Error("Image file changed");
           parts.push(bytes);
           offset += bytes.byteLength;
         }
@@ -76,9 +77,17 @@ export function useFullImage(fileKey: string | null, assetId: number | null, rea
         if (!active) return;
         const { naturalWidth: width, naturalHeight: height } = image;
         const isOriginal = info.source === "original";
-        setDisplayed({ fileKey, frame: { url, width, height, source: info.source,
-          originalWidth: isOriginal ? width : info.originalWidth,
-          originalHeight: isOriginal ? height : info.originalHeight } });
+        setDisplayed({
+          fileKey,
+          frame: {
+            url,
+            width,
+            height,
+            source: info.source,
+            originalWidth: isOriginal ? width : info.originalWidth,
+            originalHeight: isOriginal ? height : info.originalHeight,
+          },
+        });
         url = undefined;
       } catch (error) {
         if (active) console.warn("Plné rozlíšenie sa nepodarilo načítať", error);
@@ -96,7 +105,11 @@ export function useFullImage(fileKey: string | null, assetId: number | null, rea
       if (active) await load();
       else release?.();
     }, settleDelay);
-    return () => { active = false; window.clearTimeout(timer); release?.(); };
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      release?.();
+    };
   }, [fileKey, assetId, ready, rawDecode, queue]);
 
   return {

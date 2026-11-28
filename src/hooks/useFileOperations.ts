@@ -7,22 +7,10 @@ import type { AppInfo, useNavigation, useListingRefresh } from "./useNavigation"
 import type { useGridSelectionState } from "./useAssetValues";
 import type { useViewer, useViewerAssets } from "./useViewer";
 
-export type DeleteInfo = {
-  count: number;
-  names: string[];
-  sidecars: number;
-  permanentCount: number;
-  noBinDrives: string[];
-};
+export type DeleteInfo = import("../bindings/DeleteInfo").DeleteInfo;
 
-type ExclusionImpact = {
-  files: number;
-  withCategories: number;
-  withKeywords: number;
-  withRatingLabelTagged: number;
-  withColorOverrides: number;
-};
-type RemoveCatalogInfo = { assets: number; folders: number; offline: boolean; missing: boolean };
+type ExclusionImpact = import("../bindings/ExclusionImpact").ExclusionImpact;
+type RemoveCatalogInfo = import("../bindings/RemoveCatalogInfo").RemoveCatalogInfo;
 const folderParentPath = (input: string) => {
   const clean = input.replace(/[\\/]+$/g, "");
   if (clean.startsWith("\\\\")) {
@@ -34,7 +22,7 @@ const folderParentPath = (input: string) => {
   const parent = parts.slice(0, -1).join("\\");
   return /^[A-Za-z]:$/.test(parent) ? parent + "\\" : parent;
 };
-type RemoveCatalogResult = { summary: string; removedAssets: number; removedFolders: number; assetIds: number[] };
+type RemoveCatalogResult = import("../bindings/RemoveCatalogResult").RemoveCatalogResult;
 
 type FileOperationsOptions = {
   appInfo: AppInfo | null;
@@ -87,7 +75,7 @@ export function useFileOperations({
   const [moveWarning, setMoveWarning] = useState<{
     ids: number[];
     path: string;
-    conflict: "skip" | "keep_both" | "cancel";
+    conflict: import("../bindings/ConflictPolicy").ConflictPolicy;
     count: number;
   } | null>(null);
   const [cutIds, setCutIds] = useState<number[]>([]);
@@ -96,7 +84,7 @@ export function useFileOperations({
   const [folderRenameOp, setFolderRenameOp] = useState<{ path: string; name: string } | null>(null);
   const [folderDeleteConfirm, setFolderDeleteConfirm] = useState<{
     path: string;
-    info: { files: number; folders: number; catalogued: number; bytes: number; recycleAvailable: boolean };
+    info: import("../bindings/DeleteFolderInfo").DeleteFolderInfo;
   } | null>(null);
   const [operationProgress, setOperationProgress] = useState("");
   const folderActionRef = useRef<((action: "rename" | "delete", path: string) => Promise<void>) | null>(null);
@@ -156,7 +144,7 @@ export function useFileOperations({
       ids: number[],
       mode: "move" | "copy",
       path: string,
-      conflict: "skip" | "keep_both" | "cancel",
+      conflict: import("../bindings/ConflictPolicy").ConflictPolicy,
       confirmed = false,
     ) => {
       try {
@@ -172,11 +160,14 @@ export function useFileOperations({
             return;
           }
         }
-        const result = await invoke<any>(mode === "move" ? "move_files" : "copy_files", {
-          assetIds: ids,
-          targetFolderPath: path,
-          conflict,
-        });
+        const result = await invoke<import("../bindings/FileOperationResult").FileOperationResult>(
+          mode === "move" ? "move_files" : "copy_files",
+          {
+            assetIds: ids,
+            targetFolderPath: path,
+            conflict,
+          },
+        );
         setFileConflict(null);
         setOperationProgress("");
         setToast(result.summary);
@@ -270,13 +261,9 @@ export function useFileOperations({
       }
       if (action === "delete") {
         try {
-          const info = await invoke<{
-            files: number;
-            folders: number;
-            catalogued: number;
-            bytes: number;
-            recycleAvailable: boolean;
-          }>("delete_folder_info", { path });
+          const info = await invoke<import("../bindings/DeleteFolderInfo").DeleteFolderInfo>("delete_folder_info", {
+            path,
+          });
           if (!info.recycleAvailable) {
             setToast("Na tomto disku nie je dostupný Kôš");
             return;
@@ -298,10 +285,13 @@ export function useFileOperations({
       }
       if (action === "paste" && folderClipboard) {
         try {
-          const result = await invoke<any>(folderClipboard.mode === "move" ? "move_folder" : "copy_folder", {
-            path: folderClipboard.path,
-            target: path,
-          });
+          const result = await invoke<import("../bindings/FileOperationResult").FileOperationResult>(
+            folderClipboard.mode === "move" ? "move_folder" : "copy_folder",
+            {
+              path: folderClipboard.path,
+              target: path,
+            },
+          );
           setToast(result.summary);
           if (folderClipboard.mode === "move") {
             const newPath = (result.affectedFolderPaths as string[] | undefined)?.[1];
@@ -326,7 +316,10 @@ export function useFileOperations({
       const { path } = folderRenameOp;
       setFolderRenameOp(null);
       try {
-        const result = await invoke<any>("rename_folder", { path, newName: name });
+        const result = await invoke<import("../bindings/FolderRenameResult").FolderRenameResult>("rename_folder", {
+          path,
+          newName: name,
+        });
         setToast(result.summary);
         const newPath = result.newPath as string | undefined;
         if (newPath)
@@ -361,7 +354,9 @@ export function useFileOperations({
     const { path } = folderDeleteConfirm;
     setFolderDeleteConfirm(null);
     try {
-      const result = await invoke<any>("delete_folder", { path });
+      const result = await invoke<import("../bindings/FileOperationResult").FileOperationResult>("delete_folder", {
+        path,
+      });
       setToast(result.summary);
       refreshAfterWrite(true, result.affectedFolderPaths ?? [path]);
       const current = view.folderPath ?? "";
@@ -390,10 +385,11 @@ export function useFileOperations({
     async (ids: number[], permanent: boolean, confirmedNoBinDrives: string[]) => {
       setDeleteConfirm(null);
       try {
-        const result = await invoke<{ summary: string; affectedIds: number[]; affectedFolderPaths: string[] }>(
-          "delete_files",
-          { assetIds: ids, permanent, confirmedNoBinDrives },
-        );
+        const result = await invoke<import("../bindings/FileOperationResult").FileOperationResult>("delete_files", {
+          assetIds: ids,
+          permanent,
+          confirmedNoBinDrives,
+        });
         setToast(result.summary);
         const removed = new Set(result.affectedIds);
         setSelectedIds((prev) => new Set([...prev].filter((id) => !removed.has(id))));
@@ -423,7 +419,7 @@ export function useFileOperations({
   const submitName = useCallback(
     async (name: string) => {
       if (!nameOp) return;
-      const result = await invoke<any>(
+      const result = await invoke<import("../bindings/FileOperationResult").FileOperationResult>(
         nameOp.kind === "rename" ? "rename_file" : "create_folder",
         nameOp.kind === "rename"
           ? { assetId: nameOp.assetId, newBaseName: name }
@@ -447,7 +443,7 @@ export function useFileOperations({
   );
   useEffect(() => {
     let unlisten: (() => void) | undefined;
-    void listen<{ operation: string; done: number; total: number }>("file-operation-progress", (event) => {
+    void listen<import("../bindings/FileProgress").FileProgress>("file-operation-progress", (event) => {
       if (event.payload.done >= event.payload.total) setOperationProgress("");
       else setOperationProgress(`${event.payload.operation} ${event.payload.done} / ${event.payload.total}…`);
     }).then((fn) => {
