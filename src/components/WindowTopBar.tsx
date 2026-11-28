@@ -2,7 +2,7 @@ import { labelText } from "./AssetGrid";
 import { DockLayoutMenu } from "./Dock";
 import type { ViewFilters } from "../types";
 import { categoryAssignmentLabels, keywordAssignmentLabels } from "./WindowToolbar";
-import type { Dispatch, SetStateAction, RefObject } from "react";
+import { useEffect, useRef, type Dispatch, type SetStateAction, type RefObject } from "react";
 import type { DockLayout } from "../dockLayout";
 import type { useHelpShortcut } from "../hooks/useKeyboardShortcuts";
 import type { AppInfo, useListingRefresh, useNavigation } from "../hooks/useNavigation";
@@ -84,11 +84,7 @@ export function WindowTopBar({
         </nav>
         <span className="count-pill">{slovakItems(total)}</span>
       </div>
-      <label className="search-box">
-        <span>⌕</span>
-        <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Filtrovať v zobrazení…" />
-        <kbd>Ctrl+F</kbd>
-      </label>
+      <SearchBox query={query} setQuery={setQuery} />
       <div className="top-right">
         <DockLayoutMenu layout={dockLayout} setLayout={setDockLayout} />
         <div className="ai-anchor" ref={aiRef}>
@@ -197,5 +193,41 @@ export function WindowTopBar({
         </button>
       </div>
     </header>
+  );
+}
+
+// Filter field in the top bar: Ctrl+F focuses it anywhere in the window, Esc clears it
+// (a second Esc, or Esc on an empty field, returns focus to the page).
+function SearchBox({ query, setQuery }: { query: string; setQuery: Dispatch<SetStateAction<string>> }) {
+  const input = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    const focus = (event: KeyboardEvent) => {
+      if (!event.ctrlKey || event.altKey || event.shiftKey || event.metaKey || event.code !== "KeyF") return;
+      event.preventDefault();
+      event.stopPropagation();
+      input.current?.focus();
+      input.current?.select();
+    };
+    window.addEventListener("keydown", focus, true);
+    return () => window.removeEventListener("keydown", focus, true);
+  }, []);
+  return (
+    <label className="search-box">
+      <span>⌕</span>
+      <input
+        ref={input}
+        value={query}
+        onChange={(e) => setQuery(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key !== "Escape") return;
+          e.preventDefault();
+          e.stopPropagation();
+          if (query) setQuery("");
+          else e.currentTarget.blur();
+        }}
+        placeholder="Filtrovať v zobrazení…"
+      />
+      <kbd>Ctrl+F</kbd>
+    </label>
   );
 }

@@ -99,6 +99,7 @@ export const helpTopics: HelpTopic[] = [
     { type: "note", text: "Skratky závisia od aktívnej oblasti. Pri písaní do polí sa globálne skratky pre prácu s fotografiami nepoužívajú." },
     { type: "shortcuts", rows: [
       ["F1 / Esc", "Otvoriť / zavrieť Pomocníka; Esc zatvára aj ďalšie dialógy a prehliadač."],
+      ["Ctrl+F / Esc", "Prejsť do poľa Filtrovať v zobrazení / vymazať ho; druhé Esc vráti fokus späť."],
       ["Ctrl+1 až 5 / Ctrl+0", "Hodnotenie 1 až 5 / odstrániť hodnotenie."],
       ["Alt+1 až 6 / Alt+0", "Červená, žltá, zelená, modrá, fialová, Na vyradenie / odstrániť štítok."],
       ["U", "Prepnúť stav Na úpravu pre vybrané fotky."],
