@@ -31,8 +31,9 @@ Tauri 2 + Rust + React/TypeScript + SQLite, s Python modulmi pre AI a dekódovan
 - Python 3.14 (python.org, inštalácia do profilu používateľa) – pre AI a RAW
 - NVIDIA GPU s CUDA 12 (vyvíjané na RTX 4060 Ti 16 GB). AI potrebuje ~2–4 GB VRAM a ~4 GB RAM.
   Bez GPU aplikácia funguje, AI funkcie budú nedostupné alebo veľmi pomalé.
-- [ExifTool](https://exiftool.org/) pre Windows (vyvíjané s 13.29) – rozbaliť tak, aby existoval
-  `tools\exiftool\exiftool.exe` a `tools\exiftool\exiftool_files\` (priečinok je v `.gitignore`)
+- [ExifTool](https://exiftool.org/) pre Windows – `publish.ps1` ho pri prvom spustení stiahne sám
+  (`tools\get-exiftool.ps1`: aktuálna verzia, overený kontrolný súčet) do `tools\exiftool\`
+  (priečinok je v `.gitignore`). Vyvíjané s 13.29, otestované aj s 13.64.
 - ~10 GB miesta pre inštaláciu (Python runtime ~4,4 GB, modely ~2 GB, cache)
 
 ## Inštalácia od nuly

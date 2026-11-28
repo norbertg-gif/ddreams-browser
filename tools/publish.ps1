@@ -23,7 +23,10 @@ $InstallExifToolDir = Join-Path $ModulesDir 'exiftool'
 $InstallAiDir = Join-Path $ModulesDir 'ai'
 $InstallExifTool = Join-Path $InstallExifToolDir 'exiftool.exe'
 $SourceExifTool = Join-Path $ExifToolSource 'exiftool.exe'
-if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) { throw "ExifTool source not found: $SourceExifTool" }
+if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) {
+    & (Join-Path $PSScriptRoot 'get-exiftool.ps1') -Target $ExifToolSource
+    if (-not (Test-Path -LiteralPath $SourceExifTool -PathType Leaf)) { throw "ExifTool source not found: $SourceExifTool" }
+}
 $catalogExists = Test-Path -LiteralPath $InstallCatalog -PathType Leaf
 if ($catalogExists -and $Catalog) { throw "Refusing to overwrite existing DDreams catalog: $InstallCatalog" }
 if (-not $catalogExists -and $Catalog -and -not (Test-Path -LiteralPath $Catalog -PathType Leaf)) {
